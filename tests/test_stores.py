@@ -8,6 +8,7 @@ import pytest
 from qdrant_client.models import Distance, Modifier, PayloadSchemaType, SparseVector
 
 from masskb.config import Settings
+from masskb.entities import EntityMention
 from masskb.graph_store import GraphStore, GraphStoreError
 from masskb.ingest import Chunk, Document
 from masskb.vector_store import (
@@ -643,6 +644,8 @@ def test_ensure_schema_runs_once(monkeypatch: pytest.MonkeyPatch) -> None:
     assert combined.count("IF NOT EXISTS") == 3
     assert "FOR (d:Document)" in combined
     assert "FOR (c:Chunk)" in combined
+    assert "Person" not in combined
+    assert "Concept" not in combined
     assert "apoc" not in combined.lower()
 
 
@@ -666,6 +669,10 @@ def test_upsert_document_merges_without_text(monkeypatch: pytest.MonkeyPatch) ->
     assert "NEXT_CHUNK" in query
     assert "DETACH DELETE" in query
     assert "OPTIONAL MATCH" in query
+    assert "MENTIONS" in query
+    assert ":Person" in query
+    assert ":Concept" in query
+    assert "target_id" in query
     assert "apoc" not in query.lower()
     assert "CREATE (" not in query
     assert first.text not in query
@@ -704,6 +711,9 @@ def test_delete_document_detaches_chunks_and_document(monkeypatch: pytest.Monkey
     assert "DETACH DELETE" in query
     assert "Chunk" in query
     assert "Document" in query
+    assert "MENTIONS" in query
+    assert ":Person" in query
+    assert ":Concept" in query
     assert params == {"doc_id": 'doc"1'}
     assert 'doc"1' not in query
 
@@ -749,4 +759,115 @@ def test_neighbor_chunk_ids_empty_does_not_open_driver(monkeypatch: pytest.Monke
     store = GraphStore(Settings())
 
     assert store.neighbor_chunk_ids([]) == {}
+    assert store._driver is None
+
+
+def test_ensure_entity_schema_runs_once_and_stays_out_of_skeleton(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    driver = _GraphDriver()
+    store = _bind_graph(monkeypatch, driver)
+
+    store.ensure_schema()
+    store.ensure_entity_schema()
+    store.ensure_entity_schema()
+
+    assert driver.sessions == 2
+    entity_queries = [query for query, _params in driver.session_obj.queries[3:]]
+    assert len(entity_queries) == 2
+    combined = "\n".join(entity_queries)
+    assert "masskb_person_person_id" in combined
+    assert "masskb_concept_concept_id" in combined
+    assert "FOR (p:Person)" in combined
+    assert "FOR (c:Concept)" in combined
+    assert combined.count("IF NOT EXISTS") == 2
+    assert "apoc" not in combined.lower()
+    skeleton = "\n".join(query for query, _params in driver.session_obj.queries[:3])
+    assert "Person" not in skeleton
+
+
+def test_replace_mentions_merges_and_retires_old_targets(monkeypatch: pytest.MonkeyPatch) -> None:
+    driver = _GraphDriver(rows=[{"old_targets": ["old-person", "pid"]}])
+    store = _bind_graph(monkeypatch, driver)
+    mention = EntityMention(chunk_id="c1", kind="person", name="孔子", entity_id="pid")
+
+    assert store.replace_mentions("doc-1", ["c1", "c1"], [mention]) == (1, 0, 1)
+
+    assert driver.session_obj.write_calls == 1
+    clear_query, clear_params = driver.session_obj.queries[0]
+    merge_query, merge_params = driver.session_obj.queries[1]
+    orphan_query, orphan_params = driver.session_obj.queries[2]
+    assert "DELETE" in clear_query
+    assert "MENTIONS" in clear_query
+    assert clear_params == {"chunk_ids": ["c1"]}
+    assert "MERGE (person:Person" in merge_query
+    assert "MERGE (concept:Concept" in merge_query
+    assert "CREATE (" not in merge_query
+    assert "apoc" not in merge_query.lower()
+    assert "孔子" not in merge_query
+    assert merge_params["mentions"] == [
+        {"chunk_id": "c1", "kind": "person", "entity_id": "pid", "name": "孔子"}
+    ]
+    assert ":Person" in orphan_query
+    assert ":Concept" in orphan_query
+    assert "MENTIONS" in orphan_query
+    assert orphan_params == {"target_ids": ["old-person"]}
+
+
+def test_replace_mentions_empty_list_clears_without_merge(monkeypatch: pytest.MonkeyPatch) -> None:
+    driver = _GraphDriver(rows=[{"old_targets": ["gone"]}])
+    store = _bind_graph(monkeypatch, driver)
+
+    assert store.replace_mentions("doc-1", ["c1"], []) == (0, 0, 0)
+
+    assert len(driver.session_obj.queries) == 2
+    assert "MERGE (person:Person" not in driver.session_obj.queries[0][0]
+    assert driver.session_obj.queries[1][1] == {"target_ids": ["gone"]}
+
+
+def test_replace_mentions_keeps_target_that_is_still_written(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    driver = _GraphDriver(rows=[{"old_targets": ["pid"]}])
+    store = _bind_graph(monkeypatch, driver)
+    mention = EntityMention(chunk_id="c1", kind="concept", name="仁", entity_id="pid")
+
+    assert store.replace_mentions("doc-1", ["c1"], [mention]) == (0, 1, 1)
+
+    assert len(driver.session_obj.queries) == 2
+
+
+def test_replace_mentions_empty_chunks_do_not_open_driver(monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(*_args, **_kwargs):
+        raise AssertionError("不应连接 Neo4j")
+
+    monkeypatch.setattr("masskb.graph_store.GraphDatabase.driver", boom)
+    store = GraphStore(Settings())
+
+    assert store.replace_mentions("doc-1", [], []) == (0, 0, 0)
+    assert store._driver is None
+
+
+def test_replace_mentions_rejects_unknown_chunk_before_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    driver = _GraphDriver()
+    store = _bind_graph(monkeypatch, driver)
+    mention = EntityMention(chunk_id="other", kind="person", name="孔子", entity_id="pid")
+
+    with pytest.raises(ValueError, match="不在本次"):
+        store.replace_mentions("doc-1", ["c1"], [mention])
+
+    assert store._driver is None
+    assert driver.sessions == 0
+
+
+def test_replace_mentions_rejects_unknown_kind(monkeypatch: pytest.MonkeyPatch) -> None:
+    driver = _GraphDriver()
+    store = _bind_graph(monkeypatch, driver)
+    mention = EntityMention(chunk_id="c1", kind="place", name="孔子", entity_id="pid")
+
+    with pytest.raises(ValueError, match="未知实体种类"):
+        store.replace_mentions("doc-1", ["c1"], [mention])
+
     assert store._driver is None

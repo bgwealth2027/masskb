@@ -19,6 +19,12 @@ from masskb.answer import (
 )
 from masskb.config import Settings, get_settings
 from masskb.embeddings import EmbeddingClient
+from masskb.entities import (
+    EntityMention,
+    EntityParseError,
+    build_entity_messages,
+    parse_entity_response,
+)
 from masskb.fusion import RRF_K, FusedHit, candidate_limit, reciprocal_rank_fusion
 from masskb.graph_store import GraphStore
 from masskb.ingest import (
@@ -47,6 +53,10 @@ class DimensionMismatchError(RuntimeError):
 
 class GraphSyncError(RuntimeError):
     """向量已按文档提交，图谱事务未完成。整次 ingest 可重试。"""
+
+
+class EntitySyncError(RuntimeError):
+    """向量和文档骨架已提交，实体事务未完成。整次 ingest 可重试。"""
 
 
 @dataclass(frozen=True)
@@ -123,6 +133,11 @@ class IngestWriteResult:
     graph_documents: int
     graph_chunks: int
     graph_skipped: bool
+    entities_skipped: bool = True
+    graph_persons: int = 0
+    graph_concepts: int = 0
+    graph_mentions: int = 0
+    entities_dropped: int = 0
 
 
 def _validate_search(query: str, top_k: int, doc_id: str | None) -> None:
@@ -301,6 +316,16 @@ def _graph_failure(doc_id: str, exc: Exception) -> GraphSyncError:
     )
 
 
+def _entity_failure(doc_id: str, exc: Exception, *, index: int | None = None) -> EntitySyncError:
+    where = f"文档 {doc_id}"
+    if index is not None:
+        where += f" 分块 {index}"
+    return EntitySyncError(
+        f"{where} 的 Qdrant 与文档骨架已保留，实体未写入，可重试。"
+        f"{type(exc).__name__}: {exc}"
+    )
+
+
 def _payload(chunk: Chunk) -> dict[str, Any]:
     return {
         "doc_id": chunk.doc_id,
@@ -340,16 +365,19 @@ class RetrievalPipeline:
         root: Path | None = None,
         chunk_size: int = DEFAULT_CHUNK_SIZE,
         overlap: int = DEFAULT_CHUNK_OVERLAP,
+        entities: bool = False,
     ) -> IngestWriteResult:
         """切分并写入 Qdrant，再同步这篇文档的 Neo4j 骨架。不做检索。
 
         有分块时先探测一条向量的维度，再确保集合存在。维度或集合配置不符时中止，
         不 upsert，也不删除，也不连接 Neo4j。探测用的那条向量不会写入。
         每个文档的向量 upsert 和过期点删除都成功后，才写该文档的图。
+        `entities` 为真时，骨架成功后才按分块抽取人物和概念，并替换这些分块上的提及。
+        抽取或提及写入失败时不回滚已经写入的向量和骨架。
         """
         report = ingest_path(path, root=root, chunk_size=chunk_size, overlap=overlap)
         if not any(doc.chunks for doc in report.files):
-            return self._clear_docs_if_collection_exists(report)
+            return self._clear_docs_if_collection_exists(report, entities=entities)
 
         probe = self.embeddings.embed_one(_PROBE_TEXT)
         if len(probe) != DEFAULT_VECTOR_SIZE:
@@ -359,6 +387,10 @@ class RetrievalPipeline:
         upserted = 0
         graph_documents = 0
         graph_chunks = 0
+        person_ids: set[str] = set()
+        concept_ids: set[str] = set()
+        graph_mentions = 0
+        entities_dropped = 0
         for doc in report.files:
             if not doc.chunks:
                 self.vector_store.delete_by_doc_id(doc.doc_id)
@@ -374,12 +406,24 @@ class RetrievalPipeline:
             graph_chunks += self._sync_graph_document(doc)
             graph_documents += 1
             upserted += len(ids)
+            if entities:
+                found, dropped = self._extract_mentions(doc)
+                entities_dropped += dropped
+                self._replace_mentions(doc, found)
+                person_ids.update(item.entity_id for item in found if item.kind == "person")
+                concept_ids.update(item.entity_id for item in found if item.kind == "concept")
+                graph_mentions += len(found)
         return self._result(
             report,
             upserted,
             graph_documents=graph_documents,
             graph_chunks=graph_chunks,
             graph_skipped=False,
+            entities_skipped=not entities,
+            graph_persons=len(person_ids),
+            graph_concepts=len(concept_ids),
+            graph_mentions=graph_mentions,
+            entities_dropped=entities_dropped,
         )
 
     def search(
@@ -447,7 +491,12 @@ class RetrievalPipeline:
         self.vector_store.close()
         self.graph_store.close()
 
-    def _clear_docs_if_collection_exists(self, report: IngestReport) -> IngestWriteResult:
+    def _clear_docs_if_collection_exists(
+        self,
+        report: IngestReport,
+        *,
+        entities: bool = False,
+    ) -> IngestWriteResult:
         """没有可写入的分块时不探测、不建集合。集合已在则先删点，再删骨架。"""
         if not self.vector_store.has_collection() or not report.files:
             return self._result(
@@ -456,6 +505,7 @@ class RetrievalPipeline:
                 graph_documents=0,
                 graph_chunks=0,
                 graph_skipped=True,
+                entities_skipped=not entities,
             )
         for doc in report.files:
             self.vector_store.delete_by_doc_id(doc.doc_id)
@@ -466,6 +516,7 @@ class RetrievalPipeline:
             graph_documents=len(report.files),
             graph_chunks=0,
             graph_skipped=False,
+            entities_skipped=not entities,
         )
 
     def _sync_graph_document(self, doc: Document) -> int:
@@ -476,6 +527,46 @@ class RetrievalPipeline:
             raise
         except Exception as exc:  # 图失败不回滚已写入的向量
             raise _graph_failure(doc.doc_id, exc) from exc
+
+    def _extract_mentions(self, doc: Document) -> tuple[tuple[EntityMention, ...], int]:
+        """按分块请求聊天。任一块失败则整篇不写提及。"""
+        found: list[EntityMention] = []
+        dropped = 0
+        for chunk in doc.chunks:
+            try:
+                system, user = build_entity_messages(chunk.chunk_id, chunk.text)
+                raw = self._complete_entities(system, user)
+                mentions, dropped_here = parse_entity_response(
+                    raw,
+                    chunk_id=chunk.chunk_id,
+                    text=chunk.text,
+                )
+            except EntitySyncError:
+                raise
+            except EntityParseError as exc:
+                raise _entity_failure(doc.doc_id, exc, index=chunk.index) from exc
+            except Exception as exc:  # 抽取失败不改已有提及
+                raise _entity_failure(doc.doc_id, exc, index=chunk.index) from exc
+            found.extend(mentions)
+            dropped += dropped_here
+        return tuple(found), dropped
+
+    def _replace_mentions(self, doc: Document, mentions: Sequence[EntityMention]) -> None:
+        """骨架已经写入。失败时不回滚向量和骨架，也不改已有提及（事务未提交）。"""
+        try:
+            self.graph_store.ensure_entity_schema()
+            self.graph_store.replace_mentions(
+                doc.doc_id,
+                [chunk.chunk_id for chunk in doc.chunks],
+                mentions,
+            )
+        except EntitySyncError:
+            raise
+        except Exception as exc:  # 提及写入失败不回滚已提交的骨架
+            raise _entity_failure(doc.doc_id, exc) from exc
+
+    def _complete_entities(self, system: str, user: str) -> str:
+        return ChatClient(self.settings).complete(system, user, max_tokens=256)
 
     def _delete_graph_document(self, doc_id: str) -> None:
         try:
@@ -673,6 +764,11 @@ class RetrievalPipeline:
         graph_documents: int,
         graph_chunks: int,
         graph_skipped: bool,
+        entities_skipped: bool = True,
+        graph_persons: int = 0,
+        graph_concepts: int = 0,
+        graph_mentions: int = 0,
+        entities_dropped: int = 0,
     ) -> IngestWriteResult:
         return IngestWriteResult(
             report=report,
@@ -682,4 +778,9 @@ class RetrievalPipeline:
             graph_documents=graph_documents,
             graph_chunks=graph_chunks,
             graph_skipped=graph_skipped,
+            entities_skipped=entities_skipped,
+            graph_persons=graph_persons,
+            graph_concepts=graph_concepts,
+            graph_mentions=graph_mentions,
+            entities_dropped=entities_dropped,
         )

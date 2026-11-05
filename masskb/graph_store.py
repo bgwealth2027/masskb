@@ -8,6 +8,7 @@ from typing import Any
 from neo4j import Driver, GraphDatabase
 
 from masskb.config import Settings, get_settings
+from masskb.entities import EntityMention
 from masskb.ingest import Document
 
 # 单独的语句，避免和数据写入放在同一个显式事务里。
@@ -23,6 +24,17 @@ _SCHEMA_STATEMENTS = (
     """
     CREATE INDEX masskb_chunk_doc_id IF NOT EXISTS
     FOR (c:Chunk) ON (c.doc_id)
+    """,
+)
+
+_ENTITY_SCHEMA_STATEMENTS = (
+    """
+    CREATE CONSTRAINT masskb_person_person_id IF NOT EXISTS
+    FOR (p:Person) REQUIRE p.person_id IS UNIQUE
+    """,
+    """
+    CREATE CONSTRAINT masskb_concept_concept_id IF NOT EXISTS
+    FOR (c:Concept) REQUIRE c.concept_id IS UNIQUE
     """,
 )
 
@@ -43,8 +55,25 @@ MERGE (d)-[:HAS_CHUNK]->(c)
 WITH DISTINCT d
 OPTIONAL MATCH (stale:Chunk {doc_id: $doc_id})
 WHERE NOT stale.chunk_id IN $keep_ids
-WITH d, collect(DISTINCT stale) AS stale_nodes
+OPTIONAL MATCH (stale)-[mention:MENTIONS]->()
+WITH d,
+     collect(DISTINCT stale) AS stale_nodes,
+     collect(DISTINCT mention.target_id) AS stale_targets
 FOREACH (n IN [node IN stale_nodes WHERE node IS NOT NULL] | DETACH DELETE n)
+WITH d, [target IN stale_targets WHERE target IS NOT NULL] AS stale_targets
+CALL {
+  WITH stale_targets
+  UNWIND (CASE WHEN size(stale_targets) = 0 THEN [null] ELSE stale_targets END) AS eid
+  WITH eid WHERE eid IS NOT NULL
+  OPTIONAL MATCH (person:Person {person_id: eid})
+  WHERE NOT (()-[:MENTIONS]->(person))
+  DETACH DELETE person
+  WITH eid
+  OPTIONAL MATCH (concept:Concept {concept_id: eid})
+  WHERE NOT (()-[:MENTIONS]->(concept))
+  DETACH DELETE concept
+  RETURN count(*) AS removed_orphans
+}
 WITH d
 OPTIONAL MATCH (c:Chunk {doc_id: $doc_id})-[rel:NEXT_CHUNK]-()
 WITH d, collect(DISTINCT rel) AS old_rels
@@ -60,10 +89,67 @@ MERGE (prev)-[:NEXT_CHUNK]->(nxt)
 
 _DELETE_DOCUMENT = """
 OPTIONAL MATCH (c:Chunk {doc_id: $doc_id})
-DETACH DELETE c
-WITH 1 AS ignored
+OPTIONAL MATCH (c)-[mention:MENTIONS]->()
+WITH collect(DISTINCT c) AS chunks, collect(DISTINCT mention.target_id) AS targets
+FOREACH (n IN [node IN chunks WHERE node IS NOT NULL] | DETACH DELETE n)
+WITH [target IN targets WHERE target IS NOT NULL] AS targets
 OPTIONAL MATCH (d:Document {doc_id: $doc_id})
 DETACH DELETE d
+WITH targets
+CALL {
+  WITH targets
+  UNWIND (CASE WHEN size(targets) = 0 THEN [null] ELSE targets END) AS eid
+  WITH eid WHERE eid IS NOT NULL
+  OPTIONAL MATCH (person:Person {person_id: eid})
+  WHERE NOT (()-[:MENTIONS]->(person))
+  DETACH DELETE person
+  WITH eid
+  OPTIONAL MATCH (concept:Concept {concept_id: eid})
+  WHERE NOT (()-[:MENTIONS]->(concept))
+  DETACH DELETE concept
+  RETURN count(*) AS removed_orphans
+}
+"""
+
+# 先收旧 target_id，再删这些 chunk 上的边。空 mentions 也要跑这条，用来清空。
+_CLEAR_MENTIONS = """
+UNWIND $chunk_ids AS cid
+OPTIONAL MATCH (:Chunk {chunk_id: cid})-[old:MENTIONS]->()
+WITH collect(DISTINCT old.target_id) AS raw_targets
+UNWIND $chunk_ids AS cid
+MATCH (c:Chunk {chunk_id: cid})
+OPTIONAL MATCH (c)-[old:MENTIONS]->()
+DELETE old
+WITH DISTINCT raw_targets
+RETURN [target IN raw_targets WHERE target IS NOT NULL] AS old_targets
+"""
+
+_MERGE_MENTIONS = """
+UNWIND $mentions AS row
+MATCH (c:Chunk {chunk_id: row.chunk_id})
+FOREACH (_ IN CASE WHEN row.kind = 'person' THEN [1] ELSE [] END |
+  MERGE (person:Person {person_id: row.entity_id})
+  SET person.name = row.name
+  MERGE (c)-[person_edge:MENTIONS]->(person)
+  SET person_edge.kind = 'person', person_edge.target_id = row.entity_id
+)
+FOREACH (_ IN CASE WHEN row.kind = 'concept' THEN [1] ELSE [] END |
+  MERGE (concept:Concept {concept_id: row.entity_id})
+  SET concept.name = row.name
+  MERGE (c)-[concept_edge:MENTIONS]->(concept)
+  SET concept_edge.kind = 'concept', concept_edge.target_id = row.entity_id
+)
+"""
+
+_DELETE_ORPHANS = """
+UNWIND $target_ids AS eid
+OPTIONAL MATCH (person:Person {person_id: eid})
+WHERE NOT (()-[:MENTIONS]->(person))
+DETACH DELETE person
+WITH eid
+OPTIONAL MATCH (concept:Concept {concept_id: eid})
+WHERE NOT (()-[:MENTIONS]->(concept))
+DETACH DELETE concept
 """
 
 _NEIGHBORS = """
@@ -82,12 +168,13 @@ class GraphStoreError(RuntimeError):
 
 
 class GraphStore:
-    """Neo4j 薄封装：连通性检查，以及文档骨架的写入和一跳邻接读取。"""
+    """Neo4j 薄封装：连通性检查、文档骨架，以及可选的人物/概念提及。"""
 
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()
         self._driver: Driver | None = None
         self._schema_ready = False
+        self._entity_schema_ready = False
 
     @property
     def driver(self) -> Driver:
@@ -129,6 +216,19 @@ class GraphStore:
         with self.driver.session() as session:
             session.execute_write(work)
         self._schema_ready = True
+
+    def ensure_entity_schema(self) -> None:
+        """创建 Person / Concept 唯一约束。同一实例只发一次，不影响骨架语句。"""
+        if self._entity_schema_ready:
+            return
+
+        def work(tx: Any) -> None:
+            for statement in _ENTITY_SCHEMA_STATEMENTS:
+                tx.run(statement).consume()
+
+        with self.driver.session() as session:
+            session.execute_write(work)
+        self._entity_schema_ready = True
 
     def upsert_document(self, doc: Document) -> int:
         """MERGE 一篇文档的骨架，并按 index 重建 NEXT_CHUNK。返回分块数。"""
@@ -202,6 +302,67 @@ class GraphStore:
                 raise GraphStoreError(f"分块 {chunk_id} 的前后邻不唯一")
             found[chunk_id] = (row["prev_chunk_id"], row["next_chunk_id"])
         return found
+
+    def replace_mentions(
+        self,
+        doc_id: str,
+        chunk_ids: Sequence[str],
+        mentions: Sequence[EntityMention],
+    ) -> tuple[int, int, int]:
+        """替换这些 chunk 上的 MENTIONS。返回 (persons, concepts, mentions)。
+
+        计数来自校验后的入参，不回读 Neo4j。`chunk_ids` 为空且没有提及时不打开驱动。
+        提及指向本次列表之外的分块时抛出 ValueError，不写。
+        同一事务内先删旧边，再 MERGE 节点和边，最后只删除本次旧目标里已经没有入边的
+        Person / Concept。`doc_id` 只用于调用方标识这篇文档，语句不按它扫描其他文档。
+        """
+        unique: list[str] = []
+        seen: set[str] = set()
+        for chunk_id in chunk_ids:
+            if chunk_id not in seen:
+                seen.add(chunk_id)
+                unique.append(chunk_id)
+        allowed = set(unique)
+        rows: list[dict[str, str]] = []
+        for mention in mentions:
+            if mention.kind not in {"person", "concept"}:
+                raise ValueError(f"文档 {doc_id} 含有未知实体种类 {mention.kind}")
+            if mention.chunk_id not in allowed:
+                raise ValueError(
+                    f"文档 {doc_id} 的提及分块 {mention.chunk_id} 不在本次文档中"
+                )
+            rows.append(
+                {
+                    "chunk_id": mention.chunk_id,
+                    "kind": mention.kind,
+                    "entity_id": mention.entity_id,
+                    "name": mention.name,
+                }
+            )
+        if not unique:
+            return (0, 0, 0)
+
+        persons = {row["entity_id"] for row in rows if row["kind"] == "person"}
+        concepts = {row["entity_id"] for row in rows if row["kind"] == "concept"}
+        new_ids = persons | concepts
+
+        def work(tx: Any) -> None:
+            record = tx.run(_CLEAR_MENTIONS, chunk_ids=unique).single()
+            old_targets = [] if record is None else list(record["old_targets"] or [])
+            if rows:
+                tx.run(_MERGE_MENTIONS, mentions=rows).consume()
+            retired: list[str] = []
+            retired_seen: set[str] = set()
+            for target_id in old_targets:
+                if target_id and target_id not in new_ids and target_id not in retired_seen:
+                    retired_seen.add(target_id)
+                    retired.append(target_id)
+            if retired:
+                tx.run(_DELETE_ORPHANS, target_ids=retired).consume()
+
+        with self.driver.session() as session:
+            session.execute_write(work)
+        return len(persons), len(concepts), len(rows)
 
     def close(self) -> None:
         if self._driver is not None:

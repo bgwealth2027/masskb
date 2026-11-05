@@ -10,7 +10,12 @@ from qdrant_client.http.exceptions import UnexpectedResponse
 from masskb.config import Settings
 from masskb.fusion import RRF_K, candidate_limit
 from masskb.ingest import ingest_path
-from masskb.pipeline import DimensionMismatchError, GraphSyncError, RetrievalPipeline
+from masskb.pipeline import (
+    DimensionMismatchError,
+    EntitySyncError,
+    GraphSyncError,
+    RetrievalPipeline,
+)
 from masskb.sparse import encode_text
 from masskb.vector_store import CollectionConfigError, point_id_for_chunk
 
@@ -1230,3 +1235,210 @@ def test_search_answer_off_does_not_construct_openai(monkeypatch: pytest.MonkeyP
 
     assert result.answer.skipped is True
     assert "answer" not in calls
+
+
+def test_ingest_without_entities_does_not_call_chat(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "a.txt"
+    path.write_text("孔子讲仁义。\n", encoding="utf-8")
+
+    def boom(*_args, **_kwargs):
+        raise AssertionError("不应创建 OpenAI")
+
+    monkeypatch.setattr("masskb.answer.OpenAI", boom)
+    pipeline = _pipeline(monkeypatch, _Embeddings(), _MemoryVectors())
+
+    def complete(*_args, **_kwargs):
+        raise AssertionError("默认 ingest 不应抽取")
+
+    pipeline._complete_entities = complete
+    result = pipeline.ingest(path, root=tmp_path)
+    pipeline.close()
+
+    assert result.entities_skipped is True
+    assert result.graph_persons == 0
+    assert result.graph_concepts == 0
+    assert result.graph_mentions == 0
+    assert result.entities_dropped == 0
+
+
+def test_ingest_entities_extracts_after_skeleton(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "a.txt"
+    path.write_text("孔子讲仁义。\n\n老子谈道德。\n", encoding="utf-8")
+    pipeline = _pipeline(monkeypatch, _Embeddings(), _MemoryVectors())
+    order: list[str] = []
+    prompts: list[tuple[str, str, int | None]] = []
+    replaced: dict = {}
+
+    def upsert_document(doc):
+        order.append("graph")
+        return pipeline.graph_log.upsert_document(doc)  # type: ignore[attr-defined]
+
+    def complete(_self, system: str, user: str, *, max_tokens: int | None = None) -> str:
+        order.append("chat")
+        prompts.append((system, user, max_tokens))
+        if "孔子" in user:
+            return '{"persons": ["孔子", "编造"], "concepts": ["仁义"]}'
+        return '{"persons": ["老子"], "concepts": ["道德"]}'
+
+    def ensure_entity_schema() -> None:
+        order.append("schema")
+
+    def replace_mentions(doc_id, chunk_ids, mentions):
+        order.append("mentions")
+        replaced["doc_id"] = doc_id
+        replaced["chunk_ids"] = list(chunk_ids)
+        replaced["names"] = [item.name for item in mentions]
+        return (0, 0, len(mentions))
+
+    monkeypatch.setattr("masskb.answer.ChatClient.complete", complete)
+    pipeline.graph_store.upsert_document = upsert_document
+    pipeline.graph_store.ensure_entity_schema = ensure_entity_schema
+    pipeline.graph_store.replace_mentions = replace_mentions
+
+    result = pipeline.ingest(path, root=tmp_path, entities=True)
+    pipeline.close()
+
+    assert order == ["graph", "chat", "chat", "schema", "mentions"]
+    assert prompts[0][2] == 256
+    assert "不可信" in prompts[0][0]
+    assert "孔子" in prompts[0][1]
+    assert "老子" not in prompts[0][1]
+    assert "老子" in prompts[1][1]
+    assert "孔子" not in prompts[1][1]
+    assert replaced["names"] == ["孔子", "仁义", "老子", "道德"]
+    assert replaced["chunk_ids"] == [chunk.chunk_id for chunk in result.report.files[0].chunks]
+    assert result.entities_skipped is False
+    assert result.graph_persons == 2
+    assert result.graph_concepts == 2
+    assert result.graph_mentions == 4
+    assert result.entities_dropped == 1
+
+
+def test_ingest_entities_invalid_json_keeps_points(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "a.txt"
+    path.write_text("孔子讲仁义。\n", encoding="utf-8")
+    store = _MemoryVectors()
+    pipeline = _pipeline(monkeypatch, _Embeddings(), store)
+    called = {"replace": 0}
+
+    def complete(_self, _system: str, _user: str, *, max_tokens: int | None = None) -> str:
+        assert max_tokens == 256
+        return "不是 JSON"
+
+    def replace_mentions(*_args, **_kwargs):
+        called["replace"] += 1
+        raise AssertionError("非法 JSON 不应写入提及")
+
+    monkeypatch.setattr("masskb.answer.ChatClient.complete", complete)
+    pipeline.graph_store.replace_mentions = replace_mentions
+    pipeline.graph_store.ensure_entity_schema = lambda: None
+
+    with pytest.raises(EntitySyncError, match="骨架已保留"):
+        pipeline.ingest(path, root=tmp_path, entities=True)
+
+    assert called["replace"] == 0
+    assert len(store.points) == 1
+    pipeline.close()
+
+
+def test_ingest_entities_empty_list_still_replaces(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "a.txt"
+    path.write_text("孔子讲仁义。\n\n老子谈道德。\n", encoding="utf-8")
+    pipeline = _pipeline(monkeypatch, _Embeddings(), _MemoryVectors())
+    seen: dict = {}
+
+    def complete(_self, _system: str, _user: str, *, max_tokens: int | None = None) -> str:
+        return '{"persons": [], "concepts": []}'
+
+    def replace_mentions(_doc_id, chunk_ids, mentions):
+        seen["chunk_ids"] = list(chunk_ids)
+        seen["mentions"] = mentions
+        return (0, 0, 0)
+
+    monkeypatch.setattr("masskb.answer.ChatClient.complete", complete)
+    pipeline.graph_store.replace_mentions = replace_mentions
+    pipeline.graph_store.ensure_entity_schema = lambda: None
+
+    result = pipeline.ingest(path, root=tmp_path, entities=True)
+    pipeline.close()
+
+    assert seen["mentions"] == ()
+    assert len(seen["chunk_ids"]) == 2
+    assert result.graph_mentions == 0
+    assert result.entities_dropped == 0
+    assert result.entities_skipped is False
+
+
+def test_ingest_entities_second_document_failure_keeps_first(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "a.txt").write_text("孔子讲仁义。\n", encoding="utf-8")
+    (tmp_path / "b.txt").write_text("老子谈道德。\n", encoding="utf-8")
+    store = _MemoryVectors()
+    pipeline = _pipeline(monkeypatch, _Embeddings(), store)
+    replaced: list[str] = []
+
+    def complete(_self, _system: str, user: str, *, max_tokens: int | None = None) -> str:
+        if "孔子" in user:
+            return '{"persons": ["孔子"], "concepts": []}'
+        return "坏 JSON"
+
+    def replace_mentions(doc_id, _chunk_ids, _mentions):
+        replaced.append(doc_id)
+        return (1, 0, 1)
+
+    monkeypatch.setattr("masskb.answer.ChatClient.complete", complete)
+    pipeline.graph_store.replace_mentions = replace_mentions
+    pipeline.graph_store.ensure_entity_schema = lambda: None
+
+    with pytest.raises(EntitySyncError, match="分块 0"):
+        pipeline.ingest(tmp_path, root=tmp_path, entities=True)
+
+    assert len(replaced) == 1
+    assert len(store.points) == 2
+    pipeline.close()
+
+
+def test_ingest_entities_chat_error_and_graph_error_keep_points(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "a.txt"
+    path.write_text("孔子讲仁义。\n", encoding="utf-8")
+    store = _MemoryVectors()
+    pipeline = _pipeline(monkeypatch, _Embeddings(), store)
+
+    def down(_self, _system: str, _user: str, *, max_tokens: int | None = None) -> str:
+        raise RuntimeError("down")
+
+    monkeypatch.setattr("masskb.answer.ChatClient.complete", down)
+    with pytest.raises(EntitySyncError, match="RuntimeError: down"):
+        pipeline.ingest(path, root=tmp_path, entities=True)
+    assert len(store.points) == 1
+
+    def ok(_self, _system: str, _user: str, *, max_tokens: int | None = None) -> str:
+        return '{"persons": ["孔子"], "concepts": []}'
+
+    def replace_mentions(*_args, **_kwargs):
+        raise RuntimeError("bolt")
+
+    monkeypatch.setattr("masskb.answer.ChatClient.complete", ok)
+    pipeline.graph_store.replace_mentions = replace_mentions
+    pipeline.graph_store.ensure_entity_schema = lambda: None
+    with pytest.raises(EntitySyncError, match="骨架已保留"):
+        pipeline.ingest(path, root=tmp_path, entities=True)
+    assert len(store.points) == 1
+    pipeline.close()
