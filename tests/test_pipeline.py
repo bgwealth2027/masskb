@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from masskb.config import Settings
-from masskb.pipeline import RetrievalPipeline
+from masskb.ingest import ingest_path
+from masskb.pipeline import DimensionMismatchError, RetrievalPipeline
+from masskb.vector_store import CollectionConfigError, point_id_for_chunk
 
 
 class _FakeQdrant:
@@ -84,4 +88,329 @@ def test_search_is_not_implemented() -> None:
     pipeline = RetrievalPipeline(Settings())
     with pytest.raises(NotImplementedError, match="检索编排尚未实现"):
         pipeline.search("质量", top_k=3)
+    pipeline.close()
+
+
+_PAYLOAD_KEYS = {"doc_id", "chunk_id", "source", "index", "start", "end", "text"}
+
+
+class _MemoryVectors:
+    def __init__(self) -> None:
+        self.points: dict[str, dict] = {}
+        self.calls: list[str] = []
+        self.present = True
+        self.ensure_error: Exception | None = None
+
+    def has_collection(self, name: str = "masskb_chunks") -> bool:
+        self.calls.append("has_collection")
+        assert name == "masskb_chunks"
+        return self.present
+
+    def ensure_collection(self, name: str = "masskb_chunks", *, vector_size: int = 1536) -> None:
+        self.calls.append("ensure_collection")
+        assert name == "masskb_chunks"
+        assert vector_size == 1536
+        if self.ensure_error is not None:
+            raise self.ensure_error
+
+    def upsert_points(self, ids, vectors, payloads, *, name: str = "masskb_chunks") -> None:
+        self.calls.append("upsert_points")
+        assert name == "masskb_chunks"
+        assert len(ids) == len(vectors) == len(payloads)
+        for point_id, vector, payload in zip(ids, vectors, payloads):
+            self.points[point_id] = {"vector": list(vector), "payload": dict(payload)}
+
+    def delete_by_doc_id(self, doc_id: str, *, keep_ids=(), name: str = "masskb_chunks") -> None:
+        self.calls.append("delete_by_doc_id")
+        assert name == "masskb_chunks"
+        keep = set(keep_ids)
+        for point_id in list(self.points):
+            payload = self.points[point_id]["payload"]
+            if payload.get("doc_id") == doc_id and point_id not in keep:
+                del self.points[point_id]
+
+
+class _Embeddings:
+    def __init__(self, *, dim: int = 1536, chunk_dim: int | None = None) -> None:
+        self.dim = dim
+        self.chunk_dim = dim if chunk_dim is None else chunk_dim
+        self.probes: list[str] = []
+        self.batches: list[list[str]] = []
+
+    def embed_one(self, text: str) -> list[float]:
+        self.probes.append(text)
+        return [0.1] * self.dim
+
+    def embed(self, texts) -> list[list[float]]:
+        self.batches.append(list(texts))
+        return [[0.2] * self.chunk_dim for _ in texts]
+
+
+def _forbid_backends(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    created: list[str] = []
+
+    def qdrant_factory(**kwargs):
+        created.append("qdrant")
+        raise AssertionError("不应创建 QdrantClient")
+
+    def neo4j_factory(*args, **kwargs):
+        created.append("neo4j")
+        raise AssertionError("不应连接 Neo4j")
+
+    def openai_factory(**kwargs):
+        created.append("openai")
+        raise AssertionError("不应创建 OpenAI")
+
+    monkeypatch.setattr("masskb.vector_store.QdrantClient", qdrant_factory)
+    monkeypatch.setattr("masskb.graph_store.GraphDatabase.driver", neo4j_factory)
+    monkeypatch.setattr("masskb.embeddings.OpenAI", openai_factory)
+    return created
+
+
+def _pipeline(
+    monkeypatch: pytest.MonkeyPatch,
+    embeddings: _Embeddings,
+    store: _MemoryVectors,
+) -> RetrievalPipeline:
+    _forbid_backends(monkeypatch)
+    pipeline = RetrievalPipeline(
+        Settings(openai_api_key="sk-live-example", embedding_model="embed-test")
+    )
+    pipeline.embeddings.embed_one = embeddings.embed_one
+    pipeline.embeddings.embed = embeddings.embed
+    pipeline.vector_store.has_collection = store.has_collection
+    pipeline.vector_store.ensure_collection = store.ensure_collection
+    pipeline.vector_store.upsert_points = store.upsert_points
+    pipeline.vector_store.delete_by_doc_id = store.delete_by_doc_id
+    return pipeline
+
+
+def test_ingest_probes_before_write_and_skips_probe_point(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "a.txt"
+    path.write_text("hello\n", encoding="utf-8")
+    embeddings = _Embeddings()
+    store = _MemoryVectors()
+    order: list[str] = []
+
+    def embed_one(text: str) -> list[float]:
+        order.append("probe")
+        return embeddings.embed_one(text)
+
+    def ensure_collection(*args, **kwargs) -> None:
+        order.append("ensure")
+        store.ensure_collection(*args, **kwargs)
+
+    def upsert_points(*args, **kwargs) -> None:
+        order.append("upsert")
+        store.upsert_points(*args, **kwargs)
+
+    def delete_by_doc_id(*args, **kwargs) -> None:
+        order.append("delete")
+        store.delete_by_doc_id(*args, **kwargs)
+
+    pipeline = _pipeline(monkeypatch, embeddings, store)
+    pipeline.embeddings.embed_one = embed_one
+    pipeline.vector_store.ensure_collection = ensure_collection
+    pipeline.vector_store.upsert_points = upsert_points
+    pipeline.vector_store.delete_by_doc_id = delete_by_doc_id
+
+    result = pipeline.ingest(path, root=tmp_path)
+    pipeline.close()
+
+    chunk = result.report.files[0].chunks[0]
+    stored = next(iter(store.points.values()))
+    assert order == ["probe", "ensure", "upsert", "delete"]
+    assert embeddings.probes == ["masskb"]
+    assert embeddings.batches == [["hello"]]
+    assert result.points_upserted == 1
+    assert result.collection == "masskb_chunks"
+    assert result.vector_size == 1536
+    assert len(store.points) == 1
+    assert set(store.points) == {point_id_for_chunk(chunk.chunk_id)}
+    assert set(stored["payload"]) == _PAYLOAD_KEYS
+    assert stored["payload"]["text"] == "hello"
+    assert stored["payload"]["text"] != "masskb"
+    assert "openai_api_key" not in stored["payload"]
+
+
+def test_ingest_aborts_when_probe_dimension_mismatches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "a.txt"
+    path.write_text("hello\n", encoding="utf-8")
+    created = _forbid_backends(monkeypatch)
+    pipeline = RetrievalPipeline(Settings(openai_api_key="sk-live-example", embedding_model="embed-test"))
+    pipeline.embeddings.embed_one = lambda text: [0.1, 0.2]
+
+    with pytest.raises(DimensionMismatchError, match="未创建集合，也未写入"):
+        pipeline.ingest(path, root=tmp_path)
+
+    assert created == []
+    pipeline.close()
+
+
+def test_ingest_missing_api_key_does_not_open_qdrant(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "a.txt"
+    path.write_text("hello\n", encoding="utf-8")
+    created = _forbid_backends(monkeypatch)
+    pipeline = RetrievalPipeline(Settings(openai_api_key="sk-your-api-key-here"))
+
+    with pytest.raises(RuntimeError, match="OPENAI_API_KEY"):
+        pipeline.ingest(path, root=tmp_path)
+
+    assert created == []
+    pipeline.close()
+
+
+def test_ingest_aborts_when_collection_config_mismatches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "a.txt"
+    path.write_text("hello\n", encoding="utf-8")
+    store = _MemoryVectors()
+    store.ensure_error = CollectionConfigError("mismatch")
+    pipeline = _pipeline(monkeypatch, _Embeddings(), store)
+
+    with pytest.raises(CollectionConfigError):
+        pipeline.ingest(path, root=tmp_path)
+
+    assert "upsert_points" not in store.calls
+    assert "delete_by_doc_id" not in store.calls
+    pipeline.close()
+
+
+def test_ingest_embeds_in_batches_of_64(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = tmp_path / "long.txt"
+    path.write_text("测" * 650, encoding="utf-8")
+    embeddings = _Embeddings()
+    store = _MemoryVectors()
+    pipeline = _pipeline(monkeypatch, embeddings, store)
+
+    result = pipeline.ingest(path, root=tmp_path, chunk_size=10, overlap=0)
+    pipeline.close()
+
+    expected = [chunk.text for chunk in ingest_path(path, root=tmp_path, chunk_size=10, overlap=0).files[0].chunks]
+    assert [len(batch) for batch in embeddings.batches] == [64, 1]
+    assert [text for batch in embeddings.batches for text in batch] == expected
+    assert result.points_upserted == 65
+    assert len(store.points) == 65
+
+
+def test_ingest_rerun_overwrites_same_ids_and_drops_stale_windows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "a.txt"
+    path.write_text("hello\n", encoding="utf-8")
+    store = _MemoryVectors()
+    pipeline = _pipeline(monkeypatch, _Embeddings(), store)
+
+    first = pipeline.ingest(path, root=tmp_path)
+    first_ids = set(store.points)
+    path.write_text("world\n", encoding="utf-8")
+    second = pipeline.ingest(path, root=tmp_path)
+
+    assert set(store.points) == first_ids
+    assert len(store.points) == first.points_upserted == second.points_upserted == 1
+    assert next(iter(store.points.values()))["payload"]["text"] == "world"
+
+    path.write_text("abcdefghij" * 4, encoding="utf-8")
+    wide = pipeline.ingest(path, root=tmp_path, chunk_size=20, overlap=0)
+    wide_ids = set(store.points)
+    assert wide_ids.isdisjoint(first_ids)
+    assert len(wide_ids) == wide.points_upserted == 2
+    narrow = pipeline.ingest(path, root=tmp_path, chunk_size=8, overlap=0)
+    assert set(store.points).isdisjoint(wide_ids)
+    assert len(store.points) == narrow.points_upserted == 5
+    pipeline.close()
+
+
+def test_ingest_empty_file_skips_embedding_and_create(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "empty.txt"
+    path.write_text("", encoding="utf-8")
+    embeddings = _Embeddings()
+    store = _MemoryVectors()
+    store.present = False
+    pipeline = _pipeline(monkeypatch, embeddings, store)
+
+    result = pipeline.ingest(path, root=tmp_path)
+    pipeline.close()
+
+    assert result.points_upserted == 0
+    assert store.calls == ["has_collection"]
+    assert embeddings.probes == []
+    assert embeddings.batches == []
+
+
+def test_ingest_empty_file_deletes_existing_doc(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "empty.txt"
+    path.write_text("", encoding="utf-8")
+    doc_id = ingest_path(path, root=tmp_path).files[0].doc_id
+    store = _MemoryVectors()
+    store.points["stale"] = {"vector": [0.0], "payload": {"doc_id": doc_id, "text": "old"}}
+    embeddings = _Embeddings()
+    pipeline = _pipeline(monkeypatch, embeddings, store)
+
+    result = pipeline.ingest(path, root=tmp_path)
+    pipeline.close()
+
+    assert result.points_upserted == 0
+    assert store.points == {}
+    assert "ensure_collection" not in store.calls
+    assert store.calls.count("delete_by_doc_id") == 1
+    assert embeddings.probes == []
+
+
+def test_ingest_mixed_empty_and_text_clears_empty_doc(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "corpus"
+    root.mkdir()
+    (root / "empty.txt").write_text("", encoding="utf-8")
+    (root / "full.txt").write_text("hi\n", encoding="utf-8")
+    empty_id = ingest_path(root / "empty.txt", root=root).files[0].doc_id
+    store = _MemoryVectors()
+    store.points["stale"] = {"vector": [0.0], "payload": {"doc_id": empty_id, "text": "old"}}
+    pipeline = _pipeline(monkeypatch, _Embeddings(), store)
+
+    result = pipeline.ingest(root, root=root)
+    pipeline.close()
+
+    assert result.points_upserted == 1
+    assert "stale" not in store.points
+    assert len(store.points) == 1
+    assert store.calls[0] == "ensure_collection"
+    assert store.calls.count("delete_by_doc_id") == 2
+
+
+def test_ingest_bad_chunk_dimension_does_not_upsert(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "a.txt"
+    path.write_text("hello\n", encoding="utf-8")
+    store = _MemoryVectors()
+    pipeline = _pipeline(monkeypatch, _Embeddings(chunk_dim=3), store)
+
+    with pytest.raises(DimensionMismatchError, match="未写入该文档"):
+        pipeline.ingest(path, root=tmp_path)
+
+    assert "ensure_collection" in store.calls
+    assert "upsert_points" not in store.calls
+    assert "delete_by_doc_id" not in store.calls
     pipeline.close()

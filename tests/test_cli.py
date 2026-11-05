@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from masskb.__main__ import main
+from masskb.pipeline import DimensionMismatchError, IngestWriteResult
 
 _ROOT = Path(__file__).resolve().parents[1]
 
@@ -171,24 +172,97 @@ def test_ingest_dry_run_prints_counts_without_clients(
     assert "未写入向量库" not in out
 
 
-def test_ingest_without_dry_run_still_does_not_create_clients(
+def test_ingest_without_dry_run_writes_and_closes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     path = tmp_path / "a.txt"
     path.write_text("hello\n", encoding="utf-8")
-    created = _forbid_external_clients(monkeypatch)
+    closed: list[str] = []
+
+    class FakePipeline:
+        def ingest(self, source: Path, *, root: Path | None = None, chunk_size: int = 800, overlap: int = 100):
+            from masskb.ingest import ingest_path
+
+            report = ingest_path(source, root=root, chunk_size=chunk_size, overlap=overlap)
+            return IngestWriteResult(
+                report=report,
+                collection="masskb_chunks",
+                vector_size=1536,
+                points_upserted=report.chunk_count,
+            )
+
+        def close(self) -> None:
+            closed.append("closed")
+
+    monkeypatch.setattr("masskb.__main__.RetrievalPipeline", FakePipeline)
 
     assert main(["ingest", str(path), "--root", str(tmp_path)]) == 0
 
-    assert created == []
     out = capsys.readouterr().out
     assert out.startswith("=== MassKB Ingest ===\n")
     assert "files: 1\nchunks: 1\n" in out
     assert "hello" in out
     assert "(dry-run)" not in out
-    assert "[INFO] 未写入向量库：当前版本不会连接 Qdrant、Neo4j 或 OpenAI。" in out
+    assert "collection: masskb_chunks" in out
+    assert "vector_size: 1536" in out
+    assert "upserted: 1" in out
+    assert "[INFO] 已写入 Qdrant 集合 masskb_chunks。未连接 Neo4j，未执行检索。" in out
+    assert closed == ["closed"]
+
+
+def test_ingest_write_failure_exits_and_closes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    path = tmp_path / "a.txt"
+    path.write_text("hello\n", encoding="utf-8")
+    closed: list[str] = []
+
+    class FakePipeline:
+        def ingest(self, *_args, **_kwargs):
+            raise DimensionMismatchError("向量维度不符")
+
+        def close(self) -> None:
+            closed.append("closed")
+
+    monkeypatch.setattr("masskb.__main__.RetrievalPipeline", FakePipeline)
+
+    assert main(["ingest", str(path), "--root", str(tmp_path)]) == 1
+    assert "[FAIL] 向量维度不符" in capsys.readouterr().err
+    assert closed == ["closed"]
+
+
+def test_ingest_bad_input_does_not_construct_pipeline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    created: list[str] = []
+
+    class FakePipeline:
+        def __init__(self) -> None:
+            created.append("init")
+
+        def close(self) -> None:
+            created.append("close")
+
+    monkeypatch.setattr("masskb.__main__.RetrievalPipeline", FakePipeline)
+    py_file = tmp_path / "a.py"
+    py_file.write_text("print(1)\n", encoding="utf-8")
+    assert main(["ingest", str(py_file)]) == 1
+
+    missing = tmp_path / "missing.md"
+    assert main(["ingest", str(missing)]) == 1
+
+    bad = tmp_path / "bad.txt"
+    bad.write_bytes("中文".encode("gbk"))
+    assert main(["ingest", str(bad)]) == 1
+
+    assert created == []
+    assert "[FAIL]" in capsys.readouterr().err
 
 
 def test_ingest_dry_run_doc_id_stable_across_cwd(
