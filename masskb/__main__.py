@@ -95,14 +95,20 @@ def _format_report(
         lines.append(f"collection: {written.collection}")
         lines.append(f"vector_size: {written.vector_size}")
         lines.append(f"upserted: {written.points_upserted}")
-        lines.append(
-            f"[INFO] 已写入 Qdrant 集合 {written.collection}。未连接 Neo4j，未执行检索。"
-        )
+        lines.append(f"graph_documents: {written.graph_documents}")
+        lines.append(f"graph_chunks: {written.graph_chunks}")
+        if written.graph_skipped:
+            lines.append("[INFO] 没有可写入的分块，且集合不存在。未连接 Neo4j，未执行检索。")
+        else:
+            lines.append(
+                f"[INFO] 已写入 Qdrant 集合 {written.collection}，"
+                "并同步 Neo4j 文档骨架。未执行检索。"
+            )
     return "\n".join(lines)
 
 
 def cmd_ingest(args: argparse.Namespace) -> int:
-    """切分本地文本。--dry-run 只预览；否则写入 Qdrant。"""
+    """切分本地文本。--dry-run 只预览；否则写入 Qdrant 并同步文档骨架。"""
     if args.preview < 0:
         print("[FAIL] preview 不能为负", file=sys.stderr)
         return 1
@@ -148,7 +154,7 @@ def cmd_ingest(args: argparse.Namespace) -> int:
 
 
 def cmd_search(args: argparse.Namespace) -> int:
-    """查询向量近邻，并把 JSON 打到 stdout。失败信息只写 stderr。"""
+    """查询向量近邻，并把 JSON 打到 stdout。向量失败只写 stderr。"""
     pipeline = RetrievalPipeline()
     try:
         try:
@@ -171,7 +177,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     ingest = sub.add_parser(
         "ingest",
-        help="切分 UTF-8 的 .txt/.md；默认写入 Qdrant。--dry-run 只预览",
+        help="切分 .txt/.md，写入 Qdrant 并同步 Neo4j 文档骨架。--dry-run 只预览",
+        description="切分 .txt/.md，写入 Qdrant 并同步 Neo4j 文档骨架。--dry-run 只预览",
     )
     ingest.add_argument("path", type=Path, help="要切分的 .txt/.md 文件或目录")
     ingest.add_argument(
@@ -207,7 +214,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     search = sub.add_parser(
         "search",
-        help="用与入库相同的模型做 Qdrant 近邻检索，并把 JSON 打到 stdout",
+        help="用与入库相同的模型做 Qdrant 近邻检索，JSON 中附带相邻 chunk_id",
+        description="用与入库相同的模型做 Qdrant 近邻检索，JSON 中附带相邻 chunk_id",
     )
     search.add_argument("query", help="查询文本")
     search.add_argument(

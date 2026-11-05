@@ -9,7 +9,13 @@ from pathlib import Path
 import pytest
 
 from masskb.__main__ import main
-from masskb.pipeline import DimensionMismatchError, IngestWriteResult, SearchHit, SearchResult
+from masskb.pipeline import (
+    DimensionMismatchError,
+    GraphStatus,
+    IngestWriteResult,
+    SearchHit,
+    SearchResult,
+)
 
 _ROOT = Path(__file__).resolve().parents[1]
 
@@ -193,6 +199,9 @@ def test_ingest_without_dry_run_writes_and_closes(
                 collection="masskb_chunks",
                 vector_size=1536,
                 points_upserted=report.chunk_count,
+                graph_documents=report.file_count,
+                graph_chunks=report.chunk_count,
+                graph_skipped=False,
             )
 
         def close(self) -> None:
@@ -210,7 +219,9 @@ def test_ingest_without_dry_run_writes_and_closes(
     assert "collection: masskb_chunks" in out
     assert "vector_size: 1536" in out
     assert "upserted: 1" in out
-    assert "[INFO] 已写入 Qdrant 集合 masskb_chunks。未连接 Neo4j，未执行检索。" in out
+    assert "graph_documents: 1" in out
+    assert "graph_chunks: 1" in out
+    assert "[INFO] 已写入 Qdrant 集合 masskb_chunks，并同步 Neo4j 文档骨架。未执行检索。" in out
     assert closed == ["closed"]
 
 
@@ -327,6 +338,7 @@ def test_ingest_help(capsys: pytest.CaptureFixture[str]) -> None:
     out = capsys.readouterr().out
     assert "--dry-run" in out
     assert "chunk-size" in out
+    assert "文档骨架" in out
 
 
 def test_search_prints_json_and_closes(
@@ -357,8 +369,11 @@ def test_search_prints_json_and_closes(
                         index=0,
                         start=0,
                         end=2,
+                        prev_chunk_id=None,
+                        next_chunk_id="c-next",
                     ),
                 ),
+                graph=GraphStatus(ok=True, skipped=False),
             )
 
         def close(self) -> None:
@@ -387,8 +402,11 @@ def test_search_prints_json_and_closes(
                 "index": 0,
                 "start": 0,
                 "end": 2,
+                "prev_chunk_id": None,
+                "next_chunk_id": "c-next",
             }
         ],
+        "graph": {"ok": True, "skipped": False, "error": None},
     }
     assert seen == {"query": "质量", "top_k": 3, "doc_id": "abc"}
     assert closed == ["closed"]
@@ -407,6 +425,7 @@ def test_search_empty_hits_exit_zero(
                 embedding_model="text-embedding-3-small",
                 doc_id=doc_id,
                 hits=(),
+                graph=GraphStatus(ok=True, skipped=True),
             )
 
         def close(self) -> None:
@@ -421,6 +440,7 @@ def test_search_empty_hits_exit_zero(
     assert payload["doc_id"] is None
     assert payload["top_k"] == 5
     assert payload["query"] == "质量"
+    assert payload["graph"] == {"ok": True, "skipped": True, "error": None}
 
 
 def test_search_failure_exits_and_closes(
@@ -453,6 +473,7 @@ def test_search_help(capsys: pytest.CaptureFixture[str]) -> None:
     out = capsys.readouterr().out
     assert "--top-k" in out
     assert "--doc-id" in out
+    assert "chunk_id" in out
 
 
 def test_search_missing_query_exits_2() -> None:
