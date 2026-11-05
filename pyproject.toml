@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "masskb"
+version = "0.1.0"
+description = "面向海量知识库的智能检索中间件（向量检索 + 知识图谱 + 智能代理）"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+authors = [{ name = "Black God" }]
+dependencies = [
+    "qdrant-client>=1.9.0",
+    "neo4j>=5.14.0",
+    "openai>=1.40.0",
+    "python-dotenv>=1.0.0",
+    "httpx>=0.27.0",
+    "pydantic>=2.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.6.0",
+]
+
+[project.scripts]
+masskb = "masskb.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["masskb*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

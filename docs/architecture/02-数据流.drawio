@@ -1,0 +1,112 @@
+<mxfile host="app.diagrams.net" modified="2026-11-04T18:45:00.000Z" agent="Grok Bot" version="22.1.0" type="device">
+  <diagram id="data-flow" name="数据流">
+    <mxGraphModel dx="1400" dy="900" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1400" pageHeight="900" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+
+        <!-- 标题 -->
+        <mxCell id="title" value="MassKB-检索 · 数据流" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;fontStyle=1;fontSize=18;" vertex="1" parent="1">
+          <mxGeometry x="480" y="20" width="280" height="30" as="geometry"/>
+        </mxCell>
+
+        <!-- ===== 索引构建路径 ===== -->
+        <mxCell id="sec1" value="索引 / 图谱构建" style="text;html=1;strokeColor=none;fillColor=none;align=left;fontStyle=1;fontSize=14;fontColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="40" y="60" width="160" height="25" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="corpus" value="原始书目&#xa;chinese-classical-corpus&#xa;DaoZang" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="40" y="100" width="180" height="70" as="geometry"/>
+        </mxCell>
+        <mxCell id="clean" value="清洗切分" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="280" y="110" width="120" height="50" as="geometry"/>
+        </mxCell>
+
+        <!-- 向量化分支 -->
+        <mxCell id="embed" value="向量化&#xa;（bge-m3 等）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="470" y="70" width="140" height="50" as="geometry"/>
+        </mxCell>
+        <mxCell id="qdrant" value="Qdrant&#xa;向量索引" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=1;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="680" y="70" width="130" height="50" as="geometry"/>
+        </mxCell>
+
+        <!-- 图谱分支 -->
+        <mxCell id="extract" value="实体关系抽取" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="470" y="150" width="140" height="50" as="geometry"/>
+        </mxCell>
+        <mxCell id="neo4j" value="Neo4j&#xa;知识图谱" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontStyle=1;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="680" y="150" width="130" height="50" as="geometry"/>
+        </mxCell>
+
+        <!-- 索引路径连线 -->
+        <mxCell id="a1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=classic;strokeColor=#666666;" edge="1" parent="1" source="corpus" target="clean">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="a2" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=classic;strokeColor=#82b366;" edge="1" parent="1" source="clean" target="embed">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="a3" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=classic;strokeColor=#82b366;" edge="1" parent="1" source="embed" target="qdrant">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="a4" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=classic;strokeColor=#9673a6;" edge="1" parent="1" source="clean" target="extract">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="a5" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=classic;strokeColor=#9673a6;" edge="1" parent="1" source="extract" target="neo4j">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- ===== 查询路径 ===== -->
+        <mxCell id="sec2" value="查询路径" style="text;html=1;strokeColor=none;fillColor=none;align=left;fontStyle=1;fontSize=14;fontColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="40" y="260" width="100" height="25" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="nl" value="自然语言查询" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="40" y="310" width="140" height="50" as="geometry"/>
+        </mxCell>
+        <mxCell id="llm" value="LLM 理解&#xa;查询改写 / 意图" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="230" y="310" width="140" height="50" as="geometry"/>
+        </mxCell>
+        <mxCell id="vec-search" value="向量检索&#xa;（Qdrant）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="430" y="280" width="130" height="50" as="geometry"/>
+        </mxCell>
+        <mxCell id="graph-q" value="图谱查询&#xa;（Neo4j）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="430" y="350" width="130" height="50" as="geometry"/>
+        </mxCell>
+        <mxCell id="fusion" value="融合重排" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontStyle=1;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="620" y="310" width="120" height="50" as="geometry"/>
+        </mxCell>
+        <mxCell id="result" value="返回结果&#xa;+ 可视化路径" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontStyle=1;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="800" y="310" width="140" height="50" as="geometry"/>
+        </mxCell>
+
+        <!-- 查询路径连线 -->
+        <mxCell id="b1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=classic;strokeColor=#666666;" edge="1" parent="1" source="nl" target="llm">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="b2" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=classic;strokeColor=#82b366;" edge="1" parent="1" source="llm" target="vec-search">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="b3" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=classic;strokeColor=#9673a6;" edge="1" parent="1" source="llm" target="graph-q">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="b4" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=classic;strokeColor=#d6b656;" edge="1" parent="1" source="vec-search" target="fusion">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="b5" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=classic;strokeColor=#d6b656;" edge="1" parent="1" source="graph-q" target="fusion">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="b6" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=classic;strokeColor=#6c8ebf;" edge="1" parent="1" source="fusion" target="result">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- 存储到查询的虚线引用 -->
+        <mxCell id="c1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=classic;dashed=1;strokeColor=#82b366;opacity=50;" edge="1" parent="1" source="qdrant" target="vec-search">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="c2" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=classic;dashed=1;strokeColor=#9673a6;opacity=50;" edge="1" parent="1" source="neo4j" target="graph-q">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

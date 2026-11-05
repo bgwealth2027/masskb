@@ -16,8 +16,12 @@ htmlcov/
 
 # Virtual environments
 .venv/
+.venv-*.bak
 venv/
 env/
+
+# Local handoff notes (keep on disk, never push)
+.handoff
 
 # Node
 node_modules/
