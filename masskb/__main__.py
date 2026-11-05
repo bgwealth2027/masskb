@@ -189,7 +189,7 @@ def _listen_port(value: str) -> int:
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
-    """启动只读 HTTP。FastAPI 与 uvicorn 在这里才导入。"""
+    """启动 HTTP。FastAPI 与 uvicorn 在这里才导入。"""
     try:
         import uvicorn
 
@@ -387,10 +387,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     serve = sub.add_parser(
         "serve",
-        help='启动只读 HTTP（需要 pip install -e ".[api]"）',
+        help='启动 HTTP（需要 pip install -e ".[api]"）',
         description=(
-            "启动只读 HTTP：GET /health、POST /search 与 POST /ask。"
-            "入库仍使用 ingest 子命令。"
+            "启动 HTTP：GET /health、POST /search、POST /ask 与 POST /ingest。"
+            "CLI 入库仍可使用 ingest 子命令。"
             '需要 pip install -e ".[api]"。'
         ),
     )
