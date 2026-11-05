@@ -18,6 +18,7 @@ from masskb.pipeline import (
     GraphStatus,
     IngestWriteResult,
     RerankStatus,
+    RewriteStatus,
     SearchHit,
     SearchResult,
 )
@@ -377,6 +378,7 @@ def test_search_prints_json_and_closes(
             hybrid: bool = False,
             answer: bool = False,
             rerank: bool = False,
+            rewrite: bool = False,
         ) -> SearchResult:
             seen["query"] = query
             seen["top_k"] = top_k
@@ -384,6 +386,7 @@ def test_search_prints_json_and_closes(
             seen["hybrid"] = hybrid
             seen["answer"] = answer
             seen["rerank"] = rerank
+            seen["rewrite"] = rewrite
             return SearchResult(
                 query=query,
                 top_k=top_k,
@@ -465,6 +468,13 @@ def test_search_prints_json_and_closes(
             "error": None,
             "model": None,
         },
+        "rewrite": {
+            "ok": True,
+            "skipped": True,
+            "text": None,
+            "model": None,
+            "error": None,
+        },
     }
     assert seen == {
         "query": "质量",
@@ -473,6 +483,7 @@ def test_search_prints_json_and_closes(
         "hybrid": False,
         "answer": False,
         "rerank": False,
+        "rewrite": False,
     }
     assert closed == ["closed"]
 
@@ -491,6 +502,7 @@ def test_search_empty_hits_exit_zero(
             hybrid: bool = False,
             answer: bool = False,
             rerank: bool = False,
+            rewrite: bool = False,
         ) -> SearchResult:
             return SearchResult(
                 query=query,
@@ -550,6 +562,7 @@ def test_search_help(capsys: pytest.CaptureFixture[str]) -> None:
     assert "--hybrid" in out
     assert "--answer" in out
     assert "--rerank" in out
+    assert "--rewrite" in out
     assert "chunk_id" in out
 
 
@@ -685,6 +698,92 @@ def test_search_rerank_failure_prints_json_and_exits_zero(
     assert payload["score_kind"] == "cosine"
     assert payload["rerank"]["ok"] is False
     assert payload["rerank"]["error"] == "invalid_json"
+
+
+def test_search_rewrite_flag_is_forwarded(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    seen: dict = {}
+
+    class FakePipeline:
+        def search(self, query: str, **kwargs) -> SearchResult:
+            seen["query"] = query
+            seen.update(kwargs)
+            return SearchResult(
+                query=query,
+                top_k=kwargs["top_k"],
+                collection="masskb_chunks",
+                embedding_model="embed-test",
+                doc_id=None,
+                hits=(),
+                graph=GraphStatus(ok=True, skipped=True),
+            )
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr("masskb.__main__.RetrievalPipeline", FakePipeline)
+
+    assert main(["search", "质量", "--rewrite"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert seen["rewrite"] is True
+    assert seen["hybrid"] is False
+    assert seen["rerank"] is False
+    assert seen["answer"] is False
+    assert payload["rewrite"]["skipped"] is True
+    assert payload["rewrite"]["text"] is None
+    assert payload["hits"] == []
+
+
+def test_search_rewrite_failure_prints_json_and_exits_zero(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class FakePipeline:
+        def search(self, *_args, **_kwargs) -> SearchResult:
+            return SearchResult(
+                query="质量",
+                top_k=5,
+                collection="masskb_chunks",
+                embedding_model="embed-test",
+                doc_id=None,
+                hits=(
+                    SearchHit(
+                        score=0.4,
+                        text="原文",
+                        source="a.md",
+                        chunk_id="c",
+                        doc_id="d",
+                        index=0,
+                        start=0,
+                        end=2,
+                        prev_chunk_id=None,
+                        next_chunk_id=None,
+                    ),
+                ),
+                graph=GraphStatus(ok=True, skipped=False),
+                rewrite=RewriteStatus(
+                    ok=False,
+                    skipped=False,
+                    text=None,
+                    model="gpt-4o-mini",
+                    error="invalid_json",
+                ),
+            )
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr("masskb.__main__.RetrievalPipeline", FakePipeline)
+
+    assert main(["search", "质量", "--rewrite"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["query"] == "质量"
+    assert payload["hits"][0]["chunk_id"] == "c"
+    assert payload["rewrite"]["ok"] is False
+    assert payload["rewrite"]["error"] == "invalid_json"
+    assert payload["rewrite"]["text"] is None
 
 
 def test_ingest_entities_prints_counts(

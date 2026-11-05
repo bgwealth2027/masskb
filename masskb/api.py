@@ -36,6 +36,7 @@ class SearchRequest(BaseModel):
     hybrid: bool = False
     answer: bool = False
     rerank: bool = False
+    rewrite: bool = False
 
     @field_validator("query")
     @classmethod
@@ -93,6 +94,7 @@ def create_app(pipeline: RetrievalPipeline | None = None) -> FastAPI:
                     hybrid=body.hybrid,
                     answer=body.answer,
                     rerank=body.rerank,
+                    rewrite=body.rewrite,
                 )
         except ValueError as exc:
             return UTF8JSONResponse({"detail": str(exc)}, status_code=422)

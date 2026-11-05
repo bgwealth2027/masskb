@@ -8,7 +8,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](pyproject.toml)
 
-MassKB 是一层检索中间件，目标是把向量检索、知识图谱和智能代理放在同一条调用链上。当前版本是 **0.1.0**。仓库里已有可安装的 Python 包、Qdrant 与 Neo4j 的 Docker Compose、离线单元测试，以及在 `main` 上运行的 GitHub Actions。UTF-8 的 `.txt` / `.md` 可以在本地切成稳定分块。`masskb ingest` 把这些分块写入 Qdrant，并在向量写成功后同步 Neo4j 文档骨架；`--dry-run` 只做预览。`masskb search` 默认用同一套 Embedding 模型做近邻检索，把命中的原文打成 JSON，并附上前后分块 id。加上 `--hybrid` 时，把稠密名次和 Qdrant 稀疏向量 `bm25` 的名次在进程内融合；加上 `--rerank` 时，用 `LLM_MODEL` 对已经截断的命中做 listwise 重排；加上 `--answer` 时，用 `LLM_MODEL` 根据命中分块生成回答，引用只能来自这些命中的 `chunk_id`。三个开关默认关闭。`ingest --entities` 可以把人物和概念提及写入 Neo4j，默认关闭。只读 HTTP 是可选额外依赖：安装 `.[api]` 后，`masskb serve` 提供 `GET /health` 与 `POST /search`。查询改写和 Agent 仍未做。
+MassKB 是一层检索中间件，目标是把向量检索、知识图谱和智能代理放在同一条调用链上。当前版本是 **0.1.0**。仓库里已有可安装的 Python 包、Qdrant 与 Neo4j 的 Docker Compose、离线单元测试，以及在 `main` 上运行的 GitHub Actions。UTF-8 的 `.txt` / `.md` 可以在本地切成稳定分块。`masskb ingest` 把这些分块写入 Qdrant，并在向量写成功后同步 Neo4j 文档骨架；`--dry-run` 只做预览。`masskb search` 默认用同一套 Embedding 模型做近邻检索，把命中的原文打成 JSON，并附上前后分块 id。加上 `--hybrid` 时，把稠密名次和 Qdrant 稀疏向量 `bm25` 的名次在进程内融合；加上 `--rewrite` 时，用 `LLM_MODEL` 在检索前把查询改写成一条检索文本；加上 `--rerank` 时，用 `LLM_MODEL` 对已经截断的命中做 listwise 重排；加上 `--answer` 时，用 `LLM_MODEL` 根据命中分块生成回答，引用只能来自这些命中的 `chunk_id`。四个开关默认关闭。`ingest --entities` 可以把人物和概念提及写入 Neo4j，默认关闭。只读 HTTP 是可选额外依赖：安装 `.[api]` 后，`masskb serve` 提供 `GET /health` 与 `POST /search`。Agent 仍未做。
 
 ## 目录
 
@@ -29,7 +29,7 @@ MassKB 是一层检索中间件，目标是把向量检索、知识图谱和智�
 |----------|----------|----------------|
 | 向量检索 | 对文本做语义相似度查找，并可选地融合关键字名次、再用大模型重排 | `VectorStore` 连接 Qdrant。入库写入 `masskb_chunks` 的未命名余弦向量，以及名为 `bm25` 的稀疏向量。默认 `search` 仍是余弦近邻；`--hybrid` 在进程内做倒数排名融合。`--rerank` 在截断之后用 `LLM_MODEL` 做 listwise 重排，默认关闭，不增加依赖 |
 | 知识图谱 | 保存文档与分块的骨架，并读取前后邻；可选地记下人物和概念提及 | `GraphStore` 连接 Neo4j。健康检查只做 Bolt 连通性；入库 MERGE `Document` / `Chunk`，检索读取一跳 `NEXT_CHUNK`。`ingest --entities` 再 MERGE `Person` / `Concept` 和 `MENTIONS` |
-| 带引用的回答 | 用大模型根据命中分块组织回答 | `search --answer` 调用 `LLM_MODEL`。引用必须是本次命中的 `chunk_id`。默认关闭，也不改写查询。没有工具调用循环 |
+| 带引用的回答 | 用大模型根据命中分块组织回答 | `search --answer` 调用 `LLM_MODEL`。引用必须是本次命中的 `chunk_id`。默认关闭。提示词仍使用用户原文。没有工具调用循环 |
 | 只读 HTTP | 把健康检查和检索暴露到本机 | 可选 extra `[api]`。`masskb serve` 默认监听 `127.0.0.1:8080`，调用现有的 `healthcheck()` 与 `search()`。核心安装不含 FastAPI。没有鉴权，也没有入库接口 |
 
 向量由 OpenAI 兼容的 Embedding API 生成。核心依赖是 `qdrant-client`、`neo4j`、`openai`、`python-dotenv`、`httpx`、`pydantic`。可选 extra `[api]` 才安装 `fastapi` 与 `uvicorn`。安装清单里没有 `sentence-transformers` 或 `torch`。本地切分不使用这些客户端。
@@ -38,7 +38,7 @@ MassKB 是一层检索中间件，目标是把向量检索、知识图谱和智�
 
 ### 当前运行时
 
-Docker Compose 只启动 Qdrant 和 Neo4j。Python 包跑在宿主机的虚拟环境里，直接访问本机端口。Embedding 请求发往 `LLM_BASE_URL`（默认 `https://api.openai.com/v1`）。健康检查不调用 Embedding API。`ingest --dry-run` 只在进程内切分本地文件，不访问外部服务。不带 `--dry-run` 的 `ingest` 会请求 Embedding API，把稠密向量和稀疏向量写入同一个 Qdrant 点，再把该文档的骨架写入 Neo4j。加上 `--entities` 时，骨架成功后再按分块请求 `LLM_MODEL`，把人物和概念提及写入 Neo4j。`search` 会先请求 Embedding API，再在 Qdrant 里做近邻查询，然后按命中的 `chunk_id` 读取前后邻。检索不读取人物和概念。`--hybrid` 会再查一次稀疏向量，并在补邻之前于进程内融合。`--rerank` 在截成 `top_k` 之后、补邻之前，用 `LLM_MODEL` 做 listwise 重排。`--answer` 在补邻之后才请求聊天补全。Neo4j、稀疏腿、重排或回答失败时，已经拿到的命中仍然输出。检索不写入 Qdrant。`masskb serve` 在同一进程里提供 `GET /health` 和 `POST /search`，默认只绑 `127.0.0.1:8080`。这两条路由复用上面的健康检查和检索，不写入 Qdrant，也没有入库接口。
+Docker Compose 只启动 Qdrant 和 Neo4j。Python 包跑在宿主机的虚拟环境里，直接访问本机端口。Embedding 请求发往 `LLM_BASE_URL`（默认 `https://api.openai.com/v1`）。健康检查不调用 Embedding API。`ingest --dry-run` 只在进程内切分本地文件，不访问外部服务。不带 `--dry-run` 的 `ingest` 会请求 Embedding API，把稠密向量和稀疏向量写入同一个 Qdrant 点，再把该文档的骨架写入 Neo4j。加上 `--entities` 时，骨架成功后再按分块请求 `LLM_MODEL`，把人物和概念提及写入 Neo4j。`search` 默认先请求 Embedding API。加上 `--rewrite` 时，先用 `LLM_MODEL` 把查询改写成一条检索文本，再对该文本请求 Embedding；改写失败则仍用原文。然后在 Qdrant 里做近邻查询，并按命中的 `chunk_id` 读取前后邻。检索不读取人物和概念。`--hybrid` 会再查一次稀疏向量，编码用的是同一条检索文本，并在补邻之前于进程内融合。`--rerank` 在截成 `top_k` 之后、补邻之前，用 `LLM_MODEL` 做 listwise 重排，提示词仍是用户原文。`--answer` 在补邻之后才请求聊天补全，提示词也仍是用户原文。改写失败时改用原文继续检索。Neo4j、稀疏腿、重排或回答失败时，已经拿到的命中仍然输出。检索不写入 Qdrant。`masskb serve` 在同一进程里提供 `GET /health` 和 `POST /search`，默认只绑 `127.0.0.1:8080`。这两条路由复用上面的健康检查和检索，不写入 Qdrant，也没有入库接口。
 
 ```mermaid
 flowchart LR
@@ -56,6 +56,7 @@ flowchart LR
   pkg -->|"ingest 骨架"| neo4j
   pkg -->|"search 邻接"| neo4j
   pkg -->|"EmbeddingClient"| api
+  pkg -->|"search --rewrite"| api
   pkg -->|"search --rerank"| api
   pkg -->|"search --answer"| api
 ```
@@ -64,10 +65,10 @@ flowchart LR
 |------|------|------|
 | Qdrant | `qdrant/qdrant:latest` | HTTP `6333`，gRPC `6334`；容器名 `masskb-qdrant` |
 | Neo4j 5 | `neo4j:5` | Browser `7474`，Bolt `7687`；容器名 `masskb-neo4j`；Compose 会安装 APOC，业务代码尚未调用 |
-| Embedding / LLM | OpenAI 兼容 HTTP API | `EmbeddingClient` 请求 embeddings。`LLM_MODEL` 用于 `search --answer`、`search --rerank` 和 `ingest --entities` |
+| Embedding / LLM | OpenAI 兼容 HTTP API | `EmbeddingClient` 请求 embeddings。`LLM_MODEL` 用于 `search --rewrite`、`search --answer`、`search --rerank` 和 `ingest --entities` |
 | 本地切分 | `masskb.ingest` | 空行分段，超长段按字符窗口切开。`ingest` 默认把分块写入 Qdrant；`--dry-run` 只预览 |
 | 稀疏编码 | `masskb.sparse` | 进程内把正文编成 `bm25` 稀疏向量。中文用二字组，不另起检索引擎 |
-| 编排 | `RetrievalPipeline` | `ingest()` 先写稠密和稀疏向量，再同步文档骨架；`search()` 默认做近邻检索并补前后邻，可选融合、重排和回答；`healthcheck()` 汇总两个数据库的状态 |
+| 编排 | `RetrievalPipeline` | `ingest()` 先写稠密和稀疏向量，再同步文档骨架；`search()` 默认做近邻检索并补前后邻，可选改写、融合、重排和回答；`healthcheck()` 汇总两个数据库的状态 |
 | 只读 HTTP | `masskb serve` | 可选 extra `[api]`（FastAPI 与 uvicorn）。默认 `127.0.0.1:8080`。进程内一把锁串行调用 `healthcheck()` 和 `search()` |
 | 部署 | `docker-compose.yml` | 数据卷：`qdrant_data`、`neo4j_data`、`neo4j_logs`。没有应用容器 |
 
@@ -84,7 +85,7 @@ flowchart LR
 
 ## 当前状态
 
-仓库里已有核心包、本地文本切分、Qdrant 稠密与稀疏入库、可选的混合检索、重排和带引用回答、Neo4j 文档骨架、可选的人物与概念提及、可选的只读 HTTP、离线测试和 CI。查询改写和 Agent 仍未做，下表只统计当前代码。
+仓库里已有核心包、本地文本切分、Qdrant 稠密与稀疏入库、可选的混合检索、查询改写、重排和带引用回答、Neo4j 文档骨架、可选的人物与概念提及、可选的只读 HTTP、离线测试和 CI。Agent 仍未做，下表只统计当前代码。
 
 | 能力 | 状态 | 说明 |
 |------|------|------|
@@ -98,12 +99,13 @@ flowchart LR
 | 离线测试与 CI | 已实现 | `tests/` 不连接真实服务；`.github/workflows/ci.yml` 在 `main` 推送和 Pull Request 上运行 |
 | 向量检索 | 已实现 | `RetrievalPipeline.search` 与 `masskb search`。默认返回余弦分数、原文、路径、`chunk_id`、字符偏移，以及 `prev_chunk_id` / `next_chunk_id`。集合不存在或没有命中时得到空列表 |
 | 混合检索 | 已实现 | `search --hybrid`。稠密与 `bm25` 各取一列名次，在进程内按 RRF（k=60）融合。默认关闭，因此默认的 `score` 仍是余弦相似度 |
-| 带引用回答 | 已实现 | `search --answer`。只把命中的 `chunk_id` 和正文送给 `LLM_MODEL`。引用必须是这些 id 的子集。默认关闭，不改写查询 |
+| 带引用回答 | 已实现 | `search --answer`。只把命中的 `chunk_id` 和正文送给 `LLM_MODEL`。引用必须是这些 id 的子集。默认关闭。提示词使用用户原文 |
 | 文档骨架 | 已实现 | `Document`、`Chunk`、`HAS_CHUNK`、`NEXT_CHUNK`。重复运行使用 MERGE。图中不存正文和向量。架构图里的 Content 对应这里的 `Document` |
 | 人物与概念提及 | 已实现 | `ingest --entities` 默认关闭。每个文档的向量和骨架成功后，按分块调用 `LLM_MODEL`。名称必须是该分块正文的子串。`Person.person_id` 与 `Concept.concept_id` 用 MERGE，边是 `MENTIONS`。重复运行替换该文档当前分块上的提及。检索不读取这些节点，也不据此重排 |
-| 重排 | 已实现 | `search --rerank` 默认关闭。在稠密或 RRF 截成 `top_k` 之后、补邻和回答之前，用 `LLM_MODEL` 做 listwise 重排。成功时 `score_kind` 为 `rerank`，`score` 为 `1/名次`。不新增依赖，也不重排融合前的候选 |
+| 重排 | 已实现 | `search --rerank` 默认关闭。在稠密或 RRF 截成 `top_k` 之后、补邻和回答之前，用 `LLM_MODEL` 做 listwise 重排。成功时 `score_kind` 为 `rerank`，`score` 为 `1/名次`。不新增依赖，也不重排融合前的候选。提示词使用用户原文 |
+| 查询改写 | 已实现 | `search --rewrite` 与 `POST /search` 的 `rewrite` 默认关闭。检索前用 `LLM_MODEL` 把查询改写成一条文本，供 embedding 和 bm25 使用。失败则用原文检索，退出码仍为 0。JSON 里的 `query` 始终是用户原文。重排和回答的提示词也使用原文 |
 | 只读 HTTP | 已实现 | 可选 extra `[api]`。`masskb serve` 提供 `GET /health` 与 `POST /search`，响应与 CLI 的健康检查字典和 `search` JSON 一致。默认只绑 `127.0.0.1`，无鉴权。不提供 ingest |
-| Agent | 未实现 | 只出现在 `docs/architecture/` 的设计图中。本阶段不做查询改写、多跳推理、别名合并或工具循环 |
+| Agent | 未实现 | 只出现在 `docs/architecture/` 的设计图中。本阶段不做多跳推理、别名合并或工具循环 |
 
 ## 安装与运行
 
@@ -211,16 +213,18 @@ python -m masskb ingest path/to/file.md --entities
 python -m masskb search "质量"
 python -m masskb search "质量" --top-k 3 --doc-id <doc_id>
 python -m masskb search "质量" --hybrid
+python -m masskb search "质量" --rewrite
 python -m masskb search "质量" --hybrid --rerank
 python -m masskb search "质量" --hybrid --answer
 ```
 
 - 默认返回 5 条。`--top-k` 必须是正整数。
 - `--doc-id` 可选，只使用入库时已经建好的 `doc_id` 关键字索引。不传则搜索整个集合。
-- `--hybrid`、`--rerank` 和 `--answer` 默认都关闭。查询原文会原样用于向量、稀疏编码和提示词，没有查询改写。
+- `--hybrid`、`--rerank`、`--answer` 和 `--rewrite` 默认都关闭。关闭改写时，查询原文会原样用于向量、稀疏编码和提示词。
 - 每条命中包含 `score`、`text`、`source`、`chunk_id`、`doc_id`、`index`、`start`、`end`、`prev_chunk_id`、`next_chunk_id`，以及 `dense_score`、`sparse_score`、`dense_rank`、`sparse_rank`。默认检索时 `score_kind` 是 `cosine`，`score` 是 Qdrant 的余弦相似度，越大越近；四个稀疏相关字段为 `null`。`chunk_id` 是入库 payload 里的十六进制 id，不是 Qdrant 的 point id。首块、末块，或图里还没有这块时，对应邻接字段为 `null`。结果里不带邻块正文。
 - `--hybrid` 成功时 `mode` 为 `hybrid`，`score_kind` 为 `rrf`，`score` 是进程内 RRF。每一腿先取 `max(top_k, 20)` 条，再截断到 `top_k`。`hybrid.rrf_k` 为 60。集合没有 `bm25` 槽或稀疏查询失败时，仍返回稠密命中，`score_kind` 保持 `cosine`，`hybrid.ok` 为 `false`，进程退出码为 0。查询分词结果为空时同样返回稠密命中，此时 `hybrid.ok` 为 `true`。
-- `--rerank` 作用在已经截成 `top_k` 的命中上，发生在补邻和 `--answer` 之前。提示词只含查询和这些命中的 `chunk_id` 与正文。成功时 `mode` 不变，`score_kind` 为 `rerank`，`score` 改为 `1/名次`（第 1 条是 `1.0`，第 2 条是 `0.5`），`dense_score`、`sparse_score`、`dense_rank`、`sparse_rank` 保留重排前的值。纯稠密路径这四项仍是 `null`，原来的余弦不再留在 `score` 里。未知 `chunk_id` 会丢掉，没被点到的 id 按原顺序接在后面。没有可排序的命中时不调用模型，`rerank.error` 为 `no_hits`。JSON 非法或聊天失败时保持原顺序和原分数，`rerank.ok` 为 `false`，进程退出码为 0。关闭该开关时 `rerank.skipped` 为 `true`，不会创建聊天客户端。
+- `--rewrite` 发生在 embedding 和稀疏编码之前。成功时这两处使用 `rewrite.text`（已去掉首尾空白，最长 500 字），`query` 仍是用户原文。重排和回答的提示词仍用 `query`。JSON 非法、结果为空或超长、或聊天失败时，`rewrite.ok` 为 `false`，检索改用原文，进程退出码为 0。关闭时 `rewrite.skipped` 为 `true`，不会创建聊天客户端。
+- `--rerank` 作用在已经截成 `top_k` 的命中上，发生在补邻和 `--answer` 之前。提示词只含用户原文和这些命中的 `chunk_id` 与正文。成功时 `mode` 不变，`score_kind` 为 `rerank`，`score` 改为 `1/名次`（第 1 条是 `1.0`，第 2 条是 `0.5`），`dense_score`、`sparse_score`、`dense_rank`、`sparse_rank` 保留重排前的值。纯稠密路径这四项仍是 `null`，原来的余弦不再留在 `score` 里。未知 `chunk_id` 会丢掉，没被点到的 id 按原顺序接在后面。没有可排序的命中时不调用模型，`rerank.error` 为 `no_hits`。JSON 非法或聊天失败时保持原顺序和原分数，`rerank.ok` 为 `false`，进程退出码为 0。关闭该开关时 `rerank.skipped` 为 `true`，不会创建聊天客户端。
 - 结果里有 `graph`，包含 `ok`、`skipped` 和 `error`。没有命中时不连接 Neo4j，也不发稀疏查询，`graph.skipped` 为 `true`。Neo4j 补邻接失败时，`hits` 仍在，邻接字段为 `null`，`graph.ok` 为 `false`，进程退出码为 0。
 - `--answer` 成功时，`answer.text` 是回答，`answer.citations` 是本次命中 `chunk_id` 的子集，`answer.model` 是 `LLM_MODEL`。没有命中、模型输出不是合法 JSON，或引用都被丢掉时，`answer.text` 为 `null`，命中列表仍然保留，进程退出码为 0。关闭该开关时 `answer.skipped` 为 `true`，不会创建聊天客户端。
 - 查询使用当前的 `EMBEDDING_MODEL`，需要和入库时是同一个 1536 维模型。
@@ -242,11 +246,11 @@ masskb serve
 curl -sS http://127.0.0.1:8080/health
 curl -sS -X POST http://127.0.0.1:8080/search \
   -H 'content-type: application/json' \
-  -d '{"query":"质量","top_k":3,"doc_id":"<doc_id>","hybrid":false,"answer":false,"rerank":false}'
+  -d '{"query":"质量","top_k":3,"doc_id":"<doc_id>","hybrid":false,"answer":false,"rerank":false,"rewrite":false}'
 ```
 
 - `GET /health` 返回 `healthcheck()` 的字典。`ok` 为 true 时 HTTP 200，否则 503，正文仍是该字典。检查过程不调用 Embedding。
-- `POST /search` 的字段对应 CLI：`query`（必填）、`top_k`（默认 5）、`doc_id`（默认 null）、`hybrid`、`answer`、`rerank`（默认 false）。成功和软失败都是 200，正文等于 `dataclasses.asdict(SearchResult)`，中文不转义。图、稀疏、重排或回答失败时命中仍在。
+- `POST /search` 的字段对应 CLI：`query`（必填）、`top_k`（默认 5）、`doc_id`（默认 null）、`hybrid`、`answer`、`rerank`、`rewrite`（默认 false）。成功和软失败都是 200，正文等于 `dataclasses.asdict(SearchResult)`，中文不转义。图、稀疏、改写、重排或回答失败时命中仍在。改写失败时检索改用原文。
 - 请求不合法（缺 `query`、空白查询、`top_k` 不是正整数、空白 `doc_id`、未知字段）为 422。缺 Key、维度不符、集合配置不符或 Qdrant 连不上为 503，正文是 `{"detail": "<错误文本>"}`。
 - 没有 `POST /ingest`，也没有鉴权。同一进程里健康检查和检索串行执行。改 `.env` 后需要重启进程。`--host 0.0.0.0` 会把命中正文暴露到网卡上。
 - `/docs` 只是本机生成的说明。
@@ -273,9 +277,9 @@ python -m pytest
 | `OPENAI_API_KEY` | 空字符串 | 以 `sk-your-` 开头的占位值视为未配置 |
 | `LLM_BASE_URL` | `https://api.openai.com/v1` | OpenAI 兼容网关。Embedding、`search --answer` 和 `search --rerank` 的聊天补全都使用它 |
 | `EMBEDDING_MODEL` | `text-embedding-3-small` | `.env.example` 中为注释项 |
-| `LLM_MODEL` | `gpt-4o-mini` | 用于 `search --answer`、`search --rerank` 和 `ingest --entities`。不改写查询，也没有代理循环 |
+| `LLM_MODEL` | `gpt-4o-mini` | 用于 `search --rewrite`、`search --answer`、`search --rerank` 和 `ingest --entities`。没有代理循环 |
 
-向量入库和检索使用代码常量：集合名 `masskb_chunks`，未命名余弦向量维度 1536，稀疏向量名 `bm25`。文档骨架、混合检索、重排、回答和只读 HTTP 都不新增环境变量。`masskb serve` 的地址只来自 `--host` 与 `--port`。把 `EMBEDDING_MODEL` 换成非 1536 维的模型时，本次 ingest 会在写入前中止，`search` 也会在查询前中止。
+向量入库和检索使用代码常量：集合名 `masskb_chunks`，未命名余弦向量维度 1536，稀疏向量名 `bm25`。文档骨架、混合检索、查询改写、重排、回答和只读 HTTP 都不新增环境变量。`masskb serve` 的地址只来自 `--host` 与 `--port`。把 `EMBEDDING_MODEL` 换成非 1536 维的模型时，本次 ingest 会在写入前中止，`search` 也会在查询前中止。
 
 ## 项目结构
 
@@ -298,10 +302,11 @@ masskb/
 │   ├── fusion.py               # 进程内 RRF
 │   ├── answer.py               # 带 chunk_id 引用的可选回答
 │   ├── rerank.py               # 已截断命中的 listwise 重排；不创建外部客户端
+│   ├── rewrite.py              # 检索前的单次查询改写；不创建外部客户端
 │   ├── entities.py             # 人物与概念名称的过滤；不创建外部客户端
 │   ├── vector_store.py         # Qdrant：稠密与稀疏写入、近邻查询
 │   ├── graph_store.py          # Neo4j：健康检查、文档骨架与可选提及
-│   └── pipeline.py             # 编排；ingest 先向量后骨架，search 可混合、可重排、可回答
+│   └── pipeline.py             # 编排；ingest 先向量后骨架，search 可改写、可混合、可重排、可回答
 ├── scripts/healthcheck.py      # 可在未安装包时运行
 ├── tests/                      # 离线单元测试
 ├── docs/architecture/          # 目标架构图（drawio）及说明
@@ -322,10 +327,11 @@ masskb/
 | `masskb/fusion.py` | 按两列名次计算 RRF，k 为 60 |
 | `masskb/answer.py` | 组装提示词、校验引用，并在 `--answer` 时调用聊天补全。`complete` 可以附带 `max_tokens` |
 | `masskb/rerank.py` | 组装重排提示词，解析 `order`，丢掉未知 id 并补上漏掉的 id。不创建外部客户端 |
+| `masskb/rewrite.py` | 组装改写提示词，解析一条 `query`。空串和超过 500 字失败。不创建外部客户端 |
 | `masskb/entities.py` | 规范化名称、丢掉不在正文里的结果，并组装实体提示词。不创建外部客户端 |
 | `masskb/vector_store.py` | 懒加载 `QdrantClient`（`prefer_grpc=False`）；建集合、批量 upsert、按 `doc_id` 删除、稠密与稀疏查询 |
 | `masskb/graph_store.py` | 懒加载 Bolt 驱动。健康检查只跑 `RETURN 1`；骨架写入使用 MERGE，检索读取一跳前后邻。`--entities` 时 MERGE 人物、概念和 `MENTIONS` |
-| `masskb/pipeline.py` | 组装向量、图谱与 Embedding 客户端；`ingest` 在同一点写入两种向量后再同步骨架，可选抽取人物和概念，`search` 补前后邻，并可选融合、重排与回答 |
+| `masskb/pipeline.py` | 组装向量、图谱与 Embedding 客户端；`ingest` 在同一点写入两种向量后再同步骨架，可选抽取人物和概念，`search` 补前后邻，并可选改写、融合、重排与回答 |
 | `masskb/api.py` | 可选的只读 HTTP。进程内一个 `RetrievalPipeline`，退出时 `close()`。不提供入库路由 |
 | `masskb/ingest.py` | 本地切分；计算与工作目录无关的 `doc_id` / `chunk_id`。不创建外部客户端 |
 | `masskb/__main__.py` | `masskb` 控制台脚本的入口：`healthcheck`、`ingest`、`search` 与 `serve`。未安装 `[api]` 时前三个子命令仍可用 |
@@ -339,13 +345,14 @@ masskb/
 | `tests/test_sparse.py` | 中文二字组、英文小写、空文本、crc32 冲突时词频相加。不创建外部客户端 |
 | `tests/test_fusion.py` | 单腿、重叠、RRF 手算值、`top_k` 截断、`chunk_id` 决胜 |
 | `tests/test_answer.py` | 提示词只含命中正文和 `chunk_id`；未知引用被丢弃；弃权、无引用和非法 JSON；聊天请求使用 `LLM_MODEL`。未传 `max_tokens` 时请求里不带这个字段 |
+| `tests/test_rewrite.py` | 改写提示词只含用户问题；解析一条 `query`，去掉首尾空白；空串、超长、非法 JSON 与错误形状。不创建外部客户端 |
 | `tests/test_rerank.py` | 重排提示词只含命中正文和 `chunk_id`；未知 id 丢弃，缺失 id 按原顺序补上；非法 JSON 与错误形状。不创建外部客户端 |
 | `tests/test_entities.py` | 名称规范化、子串过滤、停用词、每类 8 条、稳定 `entity_id`、非法 JSON。不创建外部客户端 |
 | `tests/test_stores.py` | 两个存储的健康检查成功、失败和 `close`；集合创建含 `bm25`、缺槽或 modifier 不符时不删除、分批 upsert、同一点的稠密与稀疏、按 `doc_id` 删除、近邻与稀疏查询；骨架约束、MERGE、删除和前后邻。人物与概念约束单独创建；提及替换使用 MERGE，并只清理失去入边的旧目标 |
-| `tests/test_pipeline.py` | 离线健康检查、任一侧失败；向量写入的探测、稀疏编码、维度中止、分批、重复写入与空文件；检索的空集合、过滤、维度与缺 Key；混合融合与稀疏失败；重排在截断之后、补邻之前，失败保持原顺序；回答引用、无命中不调用模型；向量成功后再写图，图失败不回滚 Qdrant，邻接失败仍返回命中。`--entities` 在骨架之后抽取；失败不改已有提及 |
+| `tests/test_pipeline.py` | 离线健康检查、任一侧失败；向量写入的探测、稀疏编码、维度中止、分批、重复写入与空文件；检索的空集合、过滤、维度与缺 Key；混合融合与稀疏失败；改写在 embedding 之前，失败改用原文；重排在截断之后、补邻之前，失败保持原顺序；回答引用、无命中不调用模型；向量成功后再写图，图失败不回滚 Qdrant，邻接失败仍返回命中。`--entities` 在骨架之后抽取；失败不改已有提及 |
 | `tests/test_ingest.py` | 空文件、短文件、超长段、重叠、Markdown 标题、同一路径重复切分 id 不变 |
-| `tests/test_api.py` | `GET /health` 与 `POST /search` 的状态码、`asdict` 正文、校验失败、软失败和 `close()`。不绑定端口 |
-| `tests/test_cli.py` | CLI 退出码、默认子命令、帮助文本、`scripts/healthcheck.py`，dry-run 不创建外部客户端，不带 `--dry-run` 时的写入输出，以及 `search` 的 JSON（含前后 `chunk_id`、`graph`、`hybrid`、`answer` 和 `rerank`）。`--entities` 只在打开时多打印计数。`serve` 懒加载 uvicorn，缺依赖时退出码为 1 |
+| `tests/test_api.py` | `GET /health` 与 `POST /search` 的状态码、`asdict` 正文、校验失败、软失败和 `close()`。不绑定端口。`rewrite` 默认 false |
+| `tests/test_cli.py` | CLI 退出码、默认子命令、帮助文本、`scripts/healthcheck.py`，dry-run 不创建外部客户端，不带 `--dry-run` 时的写入输出，以及 `search` 的 JSON（含前后 `chunk_id`、`graph`、`hybrid`、`answer`、`rerank` 和 `rewrite`）。`--entities` 只在打开时多打印计数。`serve` 懒加载 uvicorn，缺依赖时退出码为 1 |
 
 工作流文件是 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)。触发条件：
 

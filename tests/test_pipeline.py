@@ -157,6 +157,10 @@ def _search_pipeline(
         calls.append("rerank")
         raise AssertionError("默认检索不应请求重排")
 
+    def complete_rewrite(_system: str, _user: str) -> str:
+        calls.append("rewrite")
+        raise AssertionError("默认检索不应改写查询")
+
     neighbor_calls: list[list[str]] = []
 
     def neighbor_chunk_ids(chunk_ids):
@@ -174,6 +178,7 @@ def _search_pipeline(
     pipeline.vector_store.delete_by_doc_id = delete_by_doc_id
     pipeline._complete_answer = complete_answer
     pipeline._complete_rerank = complete_rerank
+    pipeline._complete_rewrite = complete_rewrite
     pipeline.graph_store.neighbor_chunk_ids = neighbor_chunk_ids
     pipeline.neighbor_calls = neighbor_calls  # type: ignore[attr-defined]
     return pipeline, calls
@@ -253,11 +258,15 @@ def test_search_embeds_query_and_maps_hits(monkeypatch: pytest.MonkeyPatch) -> N
     assert result.answer.text is None
     assert result.rerank.skipped is True
     assert result.rerank.ok is True
+    assert result.rewrite.skipped is True
+    assert result.rewrite.ok is True
+    assert result.rewrite.text is None
     assert result.hits[0].dense_score is None
     assert result.hits[0].sparse_rank is None
     assert "search_sparse" not in calls
     assert "answer" not in calls
     assert "rerank" not in calls
+    assert "rewrite" not in calls
 
 
 def test_search_missing_collection_returns_empty_after_embed(
@@ -356,7 +365,7 @@ def test_search_rejects_blank_input_before_embed(monkeypatch: pytest.MonkeyPatch
 
     for query in ("", "   "):
         with pytest.raises(ValueError, match="查询不能为空"):
-            pipeline.search(query)
+            pipeline.search(query, rewrite=True)
     for top_k in (0, -1, True):
         with pytest.raises(ValueError, match="top_k 必须为正整数"):
             pipeline.search("质量", top_k=top_k)
@@ -1062,8 +1071,11 @@ def test_search_hybrid_fuses_ranks_and_forwards_doc_id(monkeypatch: pytest.Monke
     assert result.hits[2].sparse_rank == 2
     assert result.answer.skipped is True
     assert result.rerank.skipped is True
+    assert result.rewrite.skipped is True
+    assert result.rewrite.text is None
     assert "answer" not in calls
     assert "rerank" not in calls
+    assert "rewrite" not in calls
 
 
 def test_search_hybrid_sparse_failure_keeps_dense_hits(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1630,6 +1642,218 @@ def test_search_rerank_off_does_not_construct_openai(monkeypatch: pytest.MonkeyP
     assert result.score_kind == "cosine"
     assert result.hits[0].score == 0.4
     assert "rerank" not in calls
+
+
+def test_search_rewrite_uses_text_for_retrieval_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    embeddings = _Embeddings()
+    seen: dict = {}
+    sparse_seen: dict = {}
+    raw = [
+        {"score": 0.9, "payload": {"text": "甲", "chunk_id": "a", "source": "a.md"}},
+        {"score": 0.5, "payload": {"text": "乙", "chunk_id": "b", "source": "b.md"}},
+    ]
+    pipeline, calls = _search_pipeline(monkeypatch, embeddings, raw=raw, seen=seen)
+    prompts: dict[str, str] = {}
+
+    def rewrite(_system: str, _user: str) -> str:
+        calls.append("rewrite")
+        return '{"query": "product quality"}'
+
+    def rerank(_system: str, user: str) -> str:
+        calls.append("rerank")
+        prompts["rerank"] = user
+        return '{"order": ["b", "a"]}'
+
+    def answer(_system: str, user: str) -> str:
+        calls.append("answer")
+        prompts["answer"] = user
+        return '{"abstain": false, "answer": "乙在前", "citations": ["b"]}'
+
+    def sparse_ready() -> bool:
+        calls.append("sparse_ready")
+        return True
+
+    def search_sparse(indices, values, *, top_k: int = 5, doc_id: str | None = None, name: str = "masskb_chunks"):
+        calls.append("search_sparse")
+        assert name == "masskb_chunks"
+        sparse_seen["indices"] = list(indices)
+        sparse_seen["top_k"] = top_k
+        sparse_seen["doc_id"] = doc_id
+        return [{"score": 3.0, "payload": {"text": "乙", "chunk_id": "b", "source": "b.md"}}]
+
+    pipeline._complete_rewrite = rewrite
+    pipeline._complete_rerank = rerank
+    pipeline._complete_answer = answer
+    pipeline.vector_store.sparse_ready = sparse_ready
+    pipeline.vector_store.search_sparse = search_sparse
+
+    result = pipeline.search("质量", hybrid=True, rewrite=True, rerank=True, answer=True)
+    pipeline.close()
+
+    assert embeddings.probes == ["product quality"]
+    assert sparse_seen["indices"] == list(encode_text("product quality")[0])
+    assert result.query == "质量"
+    assert result.rewrite.ok is True
+    assert result.rewrite.skipped is False
+    assert result.rewrite.text == "product quality"
+    assert result.rewrite.error is None
+    assert result.rewrite.model == pipeline.settings.llm_model
+    assert calls[0] == "rewrite"
+    assert calls.index("search") < calls.index("rerank") < calls.index("answer")
+    assert calls[-2:] == ["rerank", "answer"]
+    assert "问题：质量" in prompts["rerank"]
+    assert "product quality" not in prompts["rerank"]
+    assert "问题：质量" in prompts["answer"]
+    assert "product quality" not in prompts["answer"]
+    assert seen["vector"] == [0.1] * 1536
+
+
+def test_search_rewrite_chat_failure_searches_original(monkeypatch: pytest.MonkeyPatch) -> None:
+    raw = [{"score": 0.4, "payload": {"text": "原文", "chunk_id": "c"}}]
+    embeddings = _Embeddings()
+    pipeline, calls = _search_pipeline(monkeypatch, embeddings, raw=raw)
+    prompts: dict[str, str] = {}
+
+    def rewrite(_system: str, _user: str) -> str:
+        calls.append("rewrite")
+        raise RuntimeError("timeout")
+
+    def rerank(_system: str, user: str) -> str:
+        calls.append("rerank")
+        prompts["rerank"] = user
+        return '{"order": ["c"]}'
+
+    def answer(_system: str, user: str) -> str:
+        calls.append("answer")
+        prompts["answer"] = user
+        return '{"abstain": false, "answer": "有", "citations": ["c"]}'
+
+    pipeline._complete_rewrite = rewrite
+    pipeline._complete_rerank = rerank
+    pipeline._complete_answer = answer
+
+    result = pipeline.search("质量", rewrite=True, rerank=True, answer=True)
+    pipeline.close()
+
+    assert embeddings.probes == ["质量"]
+    assert result.query == "质量"
+    assert result.rewrite.ok is False
+    assert result.rewrite.skipped is False
+    assert result.rewrite.text is None
+    assert result.rewrite.model == pipeline.settings.llm_model
+    assert result.rewrite.error == "RuntimeError: timeout"
+    assert result.hits[0].chunk_id == "c"
+    assert result.hits[0].text == "原文"
+    assert calls[0] == "rewrite"
+    assert calls[-2:] == ["rerank", "answer"]
+    assert "问题：质量" in prompts["rerank"]
+    assert "问题：质量" in prompts["answer"]
+
+
+@pytest.mark.parametrize(
+    ("raw_reply", "error"),
+    [
+        ("不是 JSON", "invalid_json"),
+        ('{"query": "   "}', "empty"),
+        ('{"query": "' + ("x" * 501) + '"}', "too_long"),
+    ],
+)
+def test_search_rewrite_bad_output_embeds_original(
+    monkeypatch: pytest.MonkeyPatch,
+    raw_reply: str,
+    error: str,
+) -> None:
+    raw = [{"score": 0.4, "payload": {"text": "原文", "chunk_id": "c"}}]
+    embeddings = _Embeddings()
+    pipeline, _calls = _search_pipeline(monkeypatch, embeddings, raw=raw)
+    pipeline._complete_rewrite = lambda _system, _user: raw_reply
+
+    result = pipeline.search("质量", rewrite=True)
+    pipeline.close()
+
+    assert embeddings.probes == ["质量"]
+    assert result.query == "质量"
+    assert result.rewrite.ok is False
+    assert result.rewrite.text is None
+    assert result.rewrite.error == error
+    assert result.rewrite.model == pipeline.settings.llm_model
+    assert result.hits[0].text == "原文"
+
+
+def test_search_rewrite_missing_collection_keeps_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    embeddings = _Embeddings()
+    pipeline, calls = _search_pipeline(monkeypatch, embeddings, present=False)
+
+    def rewrite(_system: str, _user: str) -> str:
+        calls.append("rewrite")
+        return '{"query": "product quality"}'
+
+    pipeline._complete_rewrite = rewrite
+    result = pipeline.search("质量", rewrite=True)
+    pipeline.close()
+
+    assert calls == ["rewrite", "has_collection"]
+    assert embeddings.probes == ["product quality"]
+    assert result.hits == ()
+    assert result.query == "质量"
+    assert result.rewrite.ok is True
+    assert result.rewrite.text == "product quality"
+    assert result.graph.skipped is True
+
+
+def test_search_rewrite_dimension_mismatch_still_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    embeddings = _Embeddings(dim=2)
+    pipeline, calls = _search_pipeline(monkeypatch, embeddings)
+    pipeline._complete_rewrite = lambda _system, _user: '{"query": "product quality"}'
+
+    with pytest.raises(DimensionMismatchError, match="未执行检索"):
+        pipeline.search("质量", rewrite=True)
+
+    assert embeddings.probes == ["product quality"]
+    assert calls == []
+    pipeline.close()
+
+
+def test_search_rewrite_missing_api_key_fails_on_embed(monkeypatch: pytest.MonkeyPatch) -> None:
+    created = _forbid_backends(monkeypatch)
+
+    def boom(**_kwargs):
+        created.append("chat")
+        raise AssertionError("不应创建 OpenAI")
+
+    monkeypatch.setattr("masskb.answer.OpenAI", boom)
+    pipeline = RetrievalPipeline(Settings(openai_api_key="sk-your-api-key-here"))
+
+    with pytest.raises(RuntimeError, match="OPENAI_API_KEY"):
+        pipeline.search("质量", rewrite=True)
+
+    assert created == []
+    pipeline.close()
+
+
+def test_complete_rewrite_forwards_max_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: dict = {}
+
+    def complete(_self, system: str, user: str, *, max_tokens: int | None = None) -> str:
+        seen["system"] = system
+        seen["user"] = user
+        seen["max_tokens"] = max_tokens
+        return '{"query": "product quality"}'
+
+    monkeypatch.setattr("masskb.answer.ChatClient.complete", complete)
+    created = _forbid_backends(monkeypatch)
+    pipeline = RetrievalPipeline(
+        Settings(openai_api_key="sk-live-example", embedding_model="embed-test")
+    )
+
+    assert pipeline._complete_rewrite("系统", "问题：质量") == '{"query": "product quality"}'
+    pipeline.close()
+
+    assert created == []
+
+    assert seen["max_tokens"] == 256
+    assert seen["system"] == "系统"
+    assert seen["user"] == "问题：质量"
 
 
 def test_ingest_without_entities_does_not_call_chat(
