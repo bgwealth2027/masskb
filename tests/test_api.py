@@ -1,18 +1,21 @@
-"""只读 HTTP：不连接 Qdrant、Neo4j 或 OpenAI，也不绑定端口。"""
+"""本机 HTTP：不连接 Qdrant、Neo4j 或 OpenAI，也不绑定端口。"""
 
 from __future__ import annotations
 
 import json
 from dataclasses import asdict
+from pathlib import Path
 
 from fastapi.testclient import TestClient
 
 from masskb.answer import AnswerStatus
 from masskb.api import create_app
+from masskb.ingest import IngestError, ingest_path
 from masskb.pipeline import (
     AgentStep,
     AskResult,
     GraphStatus,
+    IngestWriteResult,
     RerankStatus,
     RewriteStatus,
     SearchHit,
@@ -64,6 +67,8 @@ class _Pipeline:
         self.health_error: Exception | None = None
         self.search_error: Exception | None = None
         self.ask_error: Exception | None = None
+        self.ingest_error: Exception | None = None
+        self.ingest_result: IngestWriteResult | None = None
         self.ask_result = _ask_result()
 
     def healthcheck(self) -> dict[str, object]:
@@ -85,6 +90,14 @@ class _Pipeline:
         if self.ask_error is not None:
             raise self.ask_error
         return self.ask_result
+
+    def ingest(self, path: Path, **kwargs: object) -> IngestWriteResult:
+        self.calls.append("ingest")
+        self.seen = {"path": path, **kwargs}
+        if self.ingest_error is not None:
+            raise self.ingest_error
+        assert self.ingest_result is not None
+        return self.ingest_result
 
     def close(self) -> None:
         self.closed.append("closed")
@@ -295,19 +308,171 @@ def test_health_exception_is_503() -> None:
     assert response.json() == {"detail": "neo4j down"}
 
 
-def test_no_ingest_route_and_method_mismatch() -> None:
+def test_ingest_route_methods_and_openapi() -> None:
     pipeline = _Pipeline()
     with TestClient(create_app(pipeline)) as client:  # type: ignore[arg-type]
-        assert client.post("/ingest").status_code == 404
+        assert client.get("/ingest").status_code == 405
+        assert client.post("/ingest").status_code == 422
         assert client.get("/search").status_code == 405
         assert client.post("/health").status_code == 405
         schema = client.get("/openapi.json").json()
 
-    assert "/ingest" not in schema["paths"]
+    assert {"post"} == set(schema["paths"]["/ingest"].keys())
     assert {"get"} == set(schema["paths"]["/health"].keys())
     assert {"post"} == set(schema["paths"]["/search"].keys())
     assert {"post"} == set(schema["paths"]["/ask"].keys())
     assert pipeline.calls == []
+
+
+def _written(report: object) -> IngestWriteResult:
+    return IngestWriteResult(
+        report=report,  # type: ignore[arg-type]
+        collection="masskb_chunks",
+        vector_size=1536,
+        points_upserted=1,
+        graph_documents=1,
+        graph_chunks=1,
+        graph_skipped=False,
+        entities_skipped=True,
+    )
+
+
+def test_post_ingest_write_matches_asdict(tmp_path: Path) -> None:
+    target = tmp_path / "笔记.md"
+    target.write_text("质量", encoding="utf-8")
+    report = ingest_path(target, root=tmp_path)
+    result = _written(report)
+    pipeline = _Pipeline()
+    pipeline.ingest_result = result
+    with TestClient(create_app(pipeline)) as client:  # type: ignore[arg-type]
+        response = client.post("/ingest", json={"path": str(target), "root": str(tmp_path)})
+
+    assert response.status_code == 200
+    assert response.content == json.dumps(asdict(result), ensure_ascii=False).encode("utf-8")
+    assert "质量".encode() in response.content
+    assert b"\\u8d28" not in response.content
+    assert "dry_run" not in response.json()
+    assert pipeline.calls == ["ingest"]
+    assert pipeline.seen == {
+        "path": Path(str(target)).expanduser(),
+        "root": Path(str(tmp_path)).expanduser(),
+        "chunk_size": 800,
+        "overlap": 100,
+        "entities": False,
+    }
+
+
+def test_post_ingest_forwards_flags(tmp_path: Path) -> None:
+    target = tmp_path / "a.md"
+    target.write_text("正文", encoding="utf-8")
+    pipeline = _Pipeline()
+    pipeline.ingest_result = _written(ingest_path(target, root=tmp_path, chunk_size=40, overlap=5))
+    body = {
+        "path": str(target),
+        "root": str(tmp_path),
+        "chunk_size": 40,
+        "overlap": 5,
+        "dry_run": False,
+        "entities": True,
+    }
+    with TestClient(create_app(pipeline)) as client:  # type: ignore[arg-type]
+        response = client.post("/ingest", json=body)
+
+    assert response.status_code == 200
+    assert pipeline.calls == ["ingest"]
+    assert pipeline.seen == {
+        "path": Path(str(target)).expanduser(),
+        "root": Path(str(tmp_path)).expanduser(),
+        "chunk_size": 40,
+        "overlap": 5,
+        "entities": True,
+    }
+
+
+def test_post_ingest_dry_run_does_not_call_pipeline(tmp_path: Path) -> None:
+    target = tmp_path / "笔记.md"
+    target.write_text("质量\n", encoding="utf-8")
+    pipeline = _Pipeline()
+    body = {
+        "path": str(target),
+        "root": str(tmp_path),
+        "dry_run": True,
+        "entities": True,
+    }
+    with TestClient(create_app(pipeline)) as client:  # type: ignore[arg-type]
+        response = client.post("/ingest", json=body)
+
+    report = ingest_path(target, root=tmp_path)
+    expected = {"dry_run": True, "entities": True, "report": asdict(report)}
+    assert response.status_code == 200
+    assert response.content == json.dumps(expected, ensure_ascii=False).encode("utf-8")
+    assert "质量".encode() in response.content
+    assert b"\\u8d28" not in response.content
+    assert "collection" not in response.json()
+    assert pipeline.calls == []
+
+
+def test_ingest_dry_run_error_is_422_without_pipeline(tmp_path: Path) -> None:
+    pipeline = _Pipeline()
+    missing = tmp_path / "missing.md"
+    bad = tmp_path / "a.py"
+    bad.write_text("x", encoding="utf-8")
+    ok = tmp_path / "ok.md"
+    ok.write_text("质量", encoding="utf-8")
+    bodies = [
+        {"path": str(missing), "dry_run": True},
+        {"path": str(bad), "dry_run": True, "entities": True},
+        {"path": str(ok), "dry_run": True, "chunk_size": 8, "overlap": 8},
+    ]
+    with TestClient(create_app(pipeline)) as client:  # type: ignore[arg-type]
+        statuses = [client.post("/ingest", json=body).status_code for body in bodies]
+
+    assert statuses == [422, 422, 422]
+    assert pipeline.calls == []
+
+
+def test_ingest_validation_does_not_call_pipeline() -> None:
+    pipeline = _Pipeline()
+    bodies = [
+        {},
+        {"path": ""},
+        {"path": "   "},
+        {"path": "a.md", "chunk_size": 0},
+        {"path": "a.md", "chunk_size": True},
+        {"path": "a.md", "overlap": -1},
+        {"path": "a.md", "overlap": True},
+        {"path": "a.md", "root": ""},
+        {"path": "a.md", "root": "   "},
+        {"path": "a.md", "preview": 3},
+        {"path": "a.md", "agent": True},
+    ]
+    with TestClient(create_app(pipeline)) as client:  # type: ignore[arg-type]
+        statuses = [client.post("/ingest", json=body).status_code for body in bodies]
+
+    assert statuses == [422] * len(bodies)
+    assert pipeline.calls == []
+
+
+def test_ingest_value_error_is_422() -> None:
+    pipeline = _Pipeline()
+    pipeline.ingest_error = IngestError("路径不存在: a.md")
+    with TestClient(create_app(pipeline)) as client:  # type: ignore[arg-type]
+        response = client.post("/ingest", json={"path": "a.md"})
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": "路径不存在: a.md"}
+
+
+def test_ingest_hard_failure_is_503_and_releases_lock() -> None:
+    pipeline = _Pipeline()
+    pipeline.ingest_error = RuntimeError("缺少真实 OPENAI_API_KEY")
+    with TestClient(create_app(pipeline)) as client:  # type: ignore[arg-type]
+        response = client.post("/ingest", json={"path": "a.md"})
+        assert response.status_code == 503
+        assert response.json() == {"detail": "缺少真实 OPENAI_API_KEY"}
+        health = client.get("/health")
+        assert health.status_code == 200
+    assert pipeline.closed == ["closed"]
 
 
 def test_module_app_lifespan_constructs_and_closes(monkeypatch) -> None:

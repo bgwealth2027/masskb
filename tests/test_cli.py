@@ -904,6 +904,7 @@ def test_serve_help(capsys: pytest.CaptureFixture[str]) -> None:
     assert "--host" in out
     assert "--port" in out
     assert "[api]" in out
+    assert "/ingest" in out
 
 
 def test_serve_rejects_port_out_of_range() -> None:

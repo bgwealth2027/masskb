@@ -8,12 +8,15 @@ import sys
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import asdict, is_dataclass
+from pathlib import Path
 
 import httpx
 import pytest
 from anyio.from_thread import start_blocking_portal
 
 from masskb.client import (
+    IngestPreview,
+    IngestWrite,
     MassKB,
     MassKBConnectionError,
     MassKBParseError,
@@ -21,6 +24,7 @@ from masskb.client import (
     MassKBServiceError,
     MassKBValidationError,
 )
+from masskb.ingest import DEFAULT_CHUNK_OVERLAP, DEFAULT_CHUNK_SIZE
 
 _Handler = Callable[[httpx.Request], httpx.Response]
 
@@ -529,13 +533,161 @@ class _SyncASGITransport(httpx.BaseTransport):
             self._portal_cm.__exit__(None, None, None)
 
 
-def test_asgi_round_trip_matches_server_json() -> None:
+def _ingest_chunk() -> dict[str, object]:
+    return {
+        "doc_id": "d",
+        "chunk_id": "c",
+        "source": "笔记.md",
+        "index": 0,
+        "start": 0,
+        "end": 2,
+        "text": "质量",
+    }
+
+
+def _ingest_report() -> dict[str, object]:
+    return {"files": [{"source": "笔记.md", "doc_id": "d", "chunks": [_ingest_chunk()]}]}
+
+
+def _ingest_preview_body() -> dict[str, object]:
+    return {"dry_run": True, "entities": True, "report": _ingest_report()}
+
+
+def _ingest_write_body() -> dict[str, object]:
+    return {
+        "report": _ingest_report(),
+        "collection": "masskb_chunks",
+        "vector_size": 1536,
+        "points_upserted": 1,
+        "graph_documents": 1,
+        "graph_chunks": 1,
+        "graph_skipped": False,
+        "entities_skipped": True,
+        "graph_persons": 0,
+        "graph_concepts": 0,
+        "graph_mentions": 0,
+        "entities_dropped": 0,
+    }
+
+
+def test_ingest_request_and_parsed_results() -> None:
+    seen: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode())
+        seen.append(body)
+        if body["dry_run"] is True:
+            assert "笔记".encode() in request.content
+            assert b"\\u7b14" not in request.content
+            return httpx.Response(200, json=_ingest_preview_body())
+        return httpx.Response(200, json=_ingest_write_body())
+
+    with _mock(handler) as kb:
+        preview = kb.ingest("笔记.md", root="data", dry_run=True, entities=True)
+        written = kb.ingest("a.md")
+
+    keys = {"path", "root", "chunk_size", "overlap", "dry_run", "entities"}
+    assert set(seen[0]) == keys
+    assert seen[0] == {
+        "path": "笔记.md",
+        "root": "data",
+        "chunk_size": DEFAULT_CHUNK_SIZE,
+        "overlap": DEFAULT_CHUNK_OVERLAP,
+        "dry_run": True,
+        "entities": True,
+    }
+    assert DEFAULT_CHUNK_SIZE == 800
+    assert DEFAULT_CHUNK_OVERLAP == 100
+    assert isinstance(preview, IngestPreview)
+    assert preview.dry_run is True
+    assert preview.entities is True
+    assert preview.report.files[0].chunks[0].text == "质量"
+    assert set(seen[1]) == keys
+    assert seen[1]["dry_run"] is False
+    assert seen[1]["root"] is None
+    assert seen[1]["entities"] is False
+    assert isinstance(written, IngestWrite)
+    assert written.collection == "masskb_chunks"
+    assert written.points_upserted == 1
+    assert written.entities_skipped is True
+    assert written.report.files[0].source == "笔记.md"
+
+
+def test_ingest_parse_errors() -> None:
+    missing = _ingest_write_body()
+    del missing["collection"]
+
+    def missing_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=missing)
+
+    with _mock(missing_handler) as kb, pytest.raises(MassKBParseError) as missing_exc:
+        kb.ingest("a.md")
+
+    assert missing_exc.value.path == "collection"
+
+    def false_dry_run(request: httpx.Request) -> httpx.Response:
+        body = _ingest_write_body()
+        body["dry_run"] = False
+        return httpx.Response(200, json=body)
+
+    with _mock(false_dry_run) as kb, pytest.raises(MassKBParseError) as dry_exc:
+        kb.ingest("a.md")
+
+    assert dry_exc.value.path == "dry_run"
+
+    def bad_chunk(request: httpx.Request) -> httpx.Response:
+        body = _ingest_preview_body()
+        report = body["report"]
+        assert isinstance(report, dict)
+        files = report["files"]
+        assert isinstance(files, list)
+        first = files[0]
+        assert isinstance(first, dict)
+        chunks = first["chunks"]
+        assert isinstance(chunks, list)
+        chunk = chunks[0]
+        assert isinstance(chunk, dict)
+        chunk["index"] = True
+        return httpx.Response(200, json=body)
+
+    with _mock(bad_chunk) as kb, pytest.raises(MassKBParseError) as index_exc:
+        kb.ingest("a.md", dry_run=True)
+
+    assert index_exc.value.path == "report.files[0].chunks[0].index"
+
+
+def test_ingest_validation_and_service_errors() -> None:
+    cases = [
+        (422, {"detail": "path 不能为空"}, MassKBValidationError),
+        (503, {"detail": "缺少真实 OPENAI_API_KEY"}, MassKBServiceError),
+    ]
+    for status, body, exc_type in cases:
+
+        def handler(
+            request: httpx.Request,
+            *,
+            _status: int = status,
+            _body: dict[str, object] = body,
+        ) -> httpx.Response:
+            return httpx.Response(_status, json=_body)
+
+        with _mock(handler) as kb, pytest.raises(exc_type) as raised:
+            kb.ingest("a.md")
+
+        assert raised.value.status_code == status
+        assert raised.value.detail == body["detail"]
+        assert raised.value.body == body
+
+
+def test_asgi_round_trip_matches_server_json(tmp_path: Path) -> None:
     from masskb.answer import AnswerStatus
     from masskb.api import create_app
+    from masskb.ingest import Chunk, Document, IngestReport, ingest_path
     from masskb.pipeline import (
         AgentStep,
         AskResult,
         GraphStatus,
+        IngestWriteResult,
         SearchHit,
         SearchResult,
     )
@@ -609,11 +761,33 @@ def test_asgi_round_trip_matches_server_json() -> None:
         "openai_key_configured": False,
     }
 
+    note = tmp_path / "笔记.md"
+    note.write_text("质量\n", encoding="utf-8")
+    chunk = Chunk(
+        doc_id="d",
+        chunk_id="c",
+        source="笔记.md",
+        index=0,
+        start=0,
+        end=2,
+        text="质量",
+    )
+    written = IngestWriteResult(
+        report=IngestReport(files=(Document(source="笔记.md", doc_id="d", chunks=(chunk,)),)),
+        collection="masskb_chunks",
+        vector_size=1536,
+        points_upserted=1,
+        graph_documents=1,
+        graph_chunks=1,
+        graph_skipped=False,
+    )
+
     class Pipeline:
         def __init__(self) -> None:
             self.health_payload = healthy
             self.seen_search: dict[str, object] = {}
             self.seen_ask: dict[str, object] = {}
+            self.seen_ingest: dict[str, object] = {}
             self.closed: list[str] = []
 
         def healthcheck(self) -> dict[str, object]:
@@ -626,6 +800,10 @@ def test_asgi_round_trip_matches_server_json() -> None:
         def ask(self, query: str, **kwargs: object) -> AskResult:
             self.seen_ask = {"query": query, **kwargs}
             return ask
+
+        def ingest(self, path: Path, **kwargs: object) -> IngestWriteResult:
+            self.seen_ingest = {"path": path, **kwargs}
+            return written
 
         def close(self) -> None:
             self.closed.append("closed")
@@ -649,6 +827,14 @@ def test_asgi_round_trip_matches_server_json() -> None:
             )
             pipeline.health_payload = degraded
             failed = kb.health()
+            ingested = kb.ingest(
+                "notes/a.md",
+                root="/data",
+                chunk_size=40,
+                overlap=5,
+                entities=True,
+            )
+            preview = kb.ingest(str(note), root=str(tmp_path), dry_run=True, entities=True)
     finally:
         http.close()
 
@@ -680,6 +866,20 @@ def test_asgi_round_trip_matches_server_json() -> None:
         "max_steps": 2,
     }
     assert "answer" not in pipeline.seen_ask
+    assert isinstance(ingested, IngestWrite)
+    assert _json_ready(ingested) == json.loads(json.dumps(asdict(written)))
+    assert pipeline.seen_ingest == {
+        "path": Path("notes/a.md"),
+        "root": Path("/data"),
+        "chunk_size": 40,
+        "overlap": 5,
+        "entities": True,
+    }
+    preview_report = ingest_path(note, root=tmp_path)
+    assert isinstance(preview, IngestPreview)
+    assert preview.dry_run is True
+    assert preview.entities is True
+    assert _json_ready(preview.report) == json.loads(json.dumps(asdict(preview_report)))
     assert pipeline.closed == ["closed"]
 
 
@@ -690,7 +890,13 @@ from masskb import MassKB, __version__
 import masskb.client
 assert __version__ == "0.1.0"
 assert MassKB is masskb.client.MassKB
-forbidden = ("masskb.pipeline", "masskb.api", "masskb.config", "masskb.agent")
+forbidden = (
+    "masskb.pipeline",
+    "masskb.api",
+    "masskb.config",
+    "masskb.agent",
+    "masskb.ingest",
+)
 loaded = [name for name in forbidden if name in sys.modules]
 if loaded:
     raise SystemExit("loaded " + ",".join(loaded))

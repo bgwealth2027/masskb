@@ -1,4 +1,4 @@
-"""只读 HTTP 的同步客户端。
+"""本机 HTTP 的同步客户端。
 
 调用已经启动的 ``masskb serve``。
 不导入检索管线，不读取配置，也不启动服务。
@@ -196,6 +196,62 @@ class AskResult:
     hybrid: bool
     rewrite: bool
     rerank: bool
+
+
+@dataclass(frozen=True)
+class IngestChunk:
+    """入库响应里的一个分块。字段与切分结果的 JSON 一致。"""
+
+    doc_id: str
+    chunk_id: str
+    source: str
+    index: int
+    start: int
+    end: int
+    text: str
+
+
+@dataclass(frozen=True)
+class IngestDocument:
+    """入库响应里的一个源文件。"""
+
+    source: str
+    doc_id: str
+    chunks: tuple[IngestChunk, ...]
+
+
+@dataclass(frozen=True)
+class IngestReportView:
+    """``report`` 对象。不含 ``file_count`` / ``chunk_count``。"""
+
+    files: tuple[IngestDocument, ...]
+
+
+@dataclass(frozen=True)
+class IngestPreview:
+    """``POST /ingest`` 在 ``dry_run`` 为 true 时的正文。"""
+
+    dry_run: bool
+    entities: bool
+    report: IngestReportView
+
+
+@dataclass(frozen=True)
+class IngestWrite:
+    """``POST /ingest`` 写入成功的正文。这不是管线里的 dataclass。"""
+
+    report: IngestReportView
+    collection: str
+    vector_size: int
+    points_upserted: int
+    graph_documents: int
+    graph_chunks: int
+    graph_skipped: bool
+    entities_skipped: bool
+    graph_persons: int
+    graph_concepts: int
+    graph_mentions: int
+    entities_dropped: int
 
 
 def _where(path: str) -> str:
@@ -484,6 +540,79 @@ def _parse_ask(value: object) -> AskResult:
     )
 
 
+def _parse_ingest_chunk(value: object, path: str) -> IngestChunk:
+    raw = _expect_dict(value, path)
+    return IngestChunk(
+        doc_id=_required_str(raw, "doc_id", path),
+        chunk_id=_required_str(raw, "chunk_id", path),
+        source=_required_str(raw, "source", path),
+        index=_required_int(raw, "index", path),
+        start=_required_int(raw, "start", path),
+        end=_required_int(raw, "end", path),
+        text=_required_str(raw, "text", path),
+    )
+
+
+def _parse_ingest_report(value: object, path: str) -> IngestReportView:
+    raw = _expect_dict(value, path)
+    files_path = _join(path, "files")
+    files = _expect_list(_require(raw, "files", path), files_path)
+    documents: list[IngestDocument] = []
+    for index, item in enumerate(files):
+        doc_path = f"{files_path}[{index}]"
+        doc = _expect_dict(item, doc_path)
+        chunks_path = f"{doc_path}.chunks"
+        chunks = _expect_list(_require(doc, "chunks", doc_path), chunks_path)
+        documents.append(
+            IngestDocument(
+                source=_required_str(doc, "source", doc_path),
+                doc_id=_required_str(doc, "doc_id", doc_path),
+                chunks=tuple(
+                    _parse_ingest_chunk(chunk, f"{chunks_path}[{chunk_index}]")
+                    for chunk_index, chunk in enumerate(chunks)
+                ),
+            )
+        )
+    return IngestReportView(files=tuple(documents))
+
+
+def _parse_ingest_preview(raw: dict[str, object]) -> IngestPreview:
+    flag = _require(raw, "dry_run", "")
+    if flag is not True:
+        raise _fail("dry_run", "dry_run 必须是 true")
+    return IngestPreview(
+        dry_run=True,
+        entities=_required_bool(raw, "entities", ""),
+        report=_parse_ingest_report(_require(raw, "report", ""), "report"),
+    )
+
+
+def _parse_ingest_write(raw: dict[str, object]) -> IngestWrite:
+    return IngestWrite(
+        report=_parse_ingest_report(_require(raw, "report", ""), "report"),
+        collection=_required_str(raw, "collection", ""),
+        vector_size=_required_int(raw, "vector_size", ""),
+        points_upserted=_required_int(raw, "points_upserted", ""),
+        graph_documents=_required_int(raw, "graph_documents", ""),
+        graph_chunks=_required_int(raw, "graph_chunks", ""),
+        graph_skipped=_required_bool(raw, "graph_skipped", ""),
+        entities_skipped=_required_bool(raw, "entities_skipped", ""),
+        graph_persons=_required_int(raw, "graph_persons", ""),
+        graph_concepts=_required_int(raw, "graph_concepts", ""),
+        graph_mentions=_required_int(raw, "graph_mentions", ""),
+        entities_dropped=_required_int(raw, "entities_dropped", ""),
+    )
+
+
+def _parse_ingest(value: object) -> IngestPreview | IngestWrite:
+    raw = _expect_dict(value, "")
+    if "dry_run" in raw:
+        if raw["dry_run"] is True:
+            return _parse_ingest_preview(raw)
+        raise _fail("dry_run", "写入结果不能包含 dry_run")
+    return _parse_ingest_write(raw)
+
+
 def _detail_text(body: object) -> str:
     if isinstance(body, dict) and "detail" in body:
         detail = body["detail"]
@@ -529,7 +658,7 @@ def _raise_for_status(response: httpx.Response, body: object, *, health: bool) -
 
 
 class MassKB:
-    """同步调用 ``GET /health``、``POST /search`` 和 ``POST /ask``。"""
+    """同步调用 ``GET /health``、``POST /search``、``POST /ask`` 和 ``POST /ingest``。"""
 
     def __init__(
         self,
@@ -632,6 +761,34 @@ class MassKB:
         body = _read_body(response)
         _raise_for_status(response, body, health=False)
         return _parse_ask(body)
+
+    def ingest(
+        self,
+        path: str,
+        *,
+        root: str | None = None,
+        chunk_size: int = 800,
+        overlap: int = 100,
+        dry_run: bool = False,
+        entities: bool = False,
+    ) -> IngestPreview | IngestWrite:
+        """``POST /ingest``。字段与 CLI 的写入参数相同，不含 ``preview``。
+
+        ``dry_run`` 为真时返回预览，服务端不调用 ``pipeline.ingest``。
+        否则返回写入结果。路径原样发送。默认 ``chunk_size`` 为 800，``overlap`` 为 100。
+        """
+        payload = {
+            "path": path,
+            "root": root,
+            "chunk_size": chunk_size,
+            "overlap": overlap,
+            "dry_run": dry_run,
+            "entities": entities,
+        }
+        response = self._send("POST", "/ingest", payload)
+        body = _read_body(response)
+        _raise_for_status(response, body, health=False)
+        return _parse_ingest(body)
 
     def _send(self, method: str, path: str, payload: dict[str, object] | None) -> httpx.Response:
         try:
