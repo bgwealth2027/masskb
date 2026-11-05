@@ -188,6 +188,7 @@ def cmd_search(args: argparse.Namespace) -> int:
                 doc_id=args.doc_id,
                 hybrid=args.hybrid,
                 answer=args.answer,
+                rerank=args.rerank,
             )
         except Exception as exc:  # noqa: BLE001 — CLI 把检索失败转成退出码
             print(f"[FAIL] {exc}", file=sys.stderr)
@@ -273,6 +274,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--answer",
         action="store_true",
         help="用 LLM_MODEL 根据命中分块生成带 chunk_id 引用的回答；默认关闭",
+    )
+    search.add_argument(
+        "--rerank",
+        action="store_true",
+        help="用 LLM_MODEL 对已截断的 top_k 做 listwise 重排；默认关闭",
     )
     search.set_defaults(func=cmd_search)
 

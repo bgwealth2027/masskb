@@ -1,4 +1,4 @@
-"""检索编排：向量与稀疏写入、文档骨架，以及可选的混合检索和引用回答。"""
+"""检索编排：向量与稀疏写入、文档骨架，以及可选的混合检索、重排和引用回答。"""
 
 from __future__ import annotations
 
@@ -35,6 +35,7 @@ from masskb.ingest import (
     IngestReport,
     ingest_path,
 )
+from masskb.rerank import build_rerank_messages, parse_rerank_order
 from masskb.sparse import encode_text
 from masskb.vector_store import (
     DEFAULT_COLLECTION,
@@ -61,7 +62,10 @@ class EntitySyncError(RuntimeError):
 
 @dataclass(frozen=True)
 class SearchHit:
-    """一条近邻命中。`score` 来自 Qdrant，正文来自 payload，前后 id 来自图。"""
+    """一条近邻命中。默认的 `score` 来自 Qdrant，正文来自 payload，前后 id 来自图。
+
+    重排成功后 `score` 改为 `1/名次`。`dense_score` 与 `sparse_score` 仍是重排前的值。
+    """
 
     score: float
     text: str | None
@@ -100,6 +104,16 @@ class HybridStatus:
 
 
 @dataclass(frozen=True)
+class RerankStatus:
+    """这次有没有做 listwise 重排。`skipped` 表示没有请求模型。"""
+
+    ok: bool
+    skipped: bool
+    error: str | None = None
+    model: str | None = None
+
+
+@dataclass(frozen=True)
 class SearchResult:
     """一次向量检索。`doc_id` 是过滤条件，未过滤时为 None。"""
 
@@ -114,12 +128,15 @@ class SearchResult:
     score_kind: str = "cosine"
     hybrid: HybridStatus | None = None
     answer: AnswerStatus | None = None
+    rerank: RerankStatus | None = None
 
     def __post_init__(self) -> None:
         if self.hybrid is None:
             object.__setattr__(self, "hybrid", _skipped_hybrid())
         if self.answer is None:
             object.__setattr__(self, "answer", skipped_answer())
+        if self.rerank is None:
+            object.__setattr__(self, "rerank", _skipped_rerank())
 
 
 @dataclass(frozen=True)
@@ -161,6 +178,7 @@ def _search_result(
     score_kind: str = "cosine",
     hybrid: HybridStatus | None = None,
     answer: AnswerStatus | None = None,
+    rerank: RerankStatus | None = None,
 ) -> SearchResult:
     return SearchResult(
         query=query,
@@ -174,6 +192,7 @@ def _search_result(
         score_kind=score_kind,
         hybrid=hybrid,
         answer=answer,
+        rerank=rerank,
     )
 
 
@@ -183,6 +202,14 @@ def _skipped_graph() -> GraphStatus:
 
 def _skipped_hybrid() -> HybridStatus:
     return HybridStatus(ok=True, skipped=True, error=None, rrf_k=None, candidate_k=None)
+
+
+def _skipped_rerank() -> RerankStatus:
+    return RerankStatus(ok=True, skipped=True, error=None, model=None)
+
+
+def _no_hits_rerank() -> RerankStatus:
+    return RerankStatus(ok=True, skipped=False, error="no_hits", model=None)
 
 
 def _hybrid_error(exc: Exception) -> HybridStatus:
@@ -201,6 +228,8 @@ def _copy_result(
     hits: tuple[SearchHit, ...] | None = None,
     graph: GraphStatus | None = None,
     answer: AnswerStatus | None = None,
+    score_kind: str | None = None,
+    rerank: RerankStatus | None = None,
 ) -> SearchResult:
     return SearchResult(
         query=result.query,
@@ -211,9 +240,10 @@ def _copy_result(
         hits=result.hits if hits is None else hits,
         graph=result.graph if graph is None else graph,
         mode=result.mode,
-        score_kind=result.score_kind,
+        score_kind=result.score_kind if score_kind is None else score_kind,
         hybrid=result.hybrid,
         answer=result.answer if answer is None else answer,
+        rerank=result.rerank if rerank is None else rerank,
     )
 
 
@@ -283,6 +313,25 @@ def _search_hit(raw: dict[str, Any]) -> SearchHit:
         sparse_score=None,
         dense_rank=None,
         sparse_rank=None,
+    )
+
+
+def _hit_with_score(hit: SearchHit, score: float) -> SearchHit:
+    return SearchHit(
+        score=score,
+        text=hit.text,
+        source=hit.source,
+        chunk_id=hit.chunk_id,
+        doc_id=hit.doc_id,
+        index=hit.index,
+        start=hit.start,
+        end=hit.end,
+        prev_chunk_id=hit.prev_chunk_id,
+        next_chunk_id=hit.next_chunk_id,
+        dense_score=hit.dense_score,
+        sparse_score=hit.sparse_score,
+        dense_rank=hit.dense_rank,
+        sparse_rank=hit.sparse_rank,
     )
 
 
@@ -434,14 +483,16 @@ class RetrievalPipeline:
         doc_id: str | None = None,
         hybrid: bool = False,
         answer: bool = False,
+        rerank: bool = False,
     ) -> SearchResult:
         """用与入库相同的模型做近邻检索，再按 chunk_id 补前后邻。
 
         先生成查询向量，再看集合是否存在。集合不存在、没有点或过滤后没有命中时，
         返回空的 `hits`，并且不连接 Neo4j。缺 Key、维度不符、集合配置不符或 Qdrant
         连不上时抛错。Neo4j 补邻接失败时仍返回向量命中。
-        `hybrid` 为真时，在补邻之前用进程内 RRF 融合 bm25。`answer` 为真时，
-        补邻之后才请求聊天，且只引用本次命中的 chunk_id。两个开关默认关闭。
+        `hybrid` 为真时，在补邻之前用进程内 RRF 融合 bm25。`rerank` 为真时，
+        在已经截成 `top_k` 之后、补邻之前做 listwise 重排。`answer` 为真时，
+        补邻之后才请求聊天，且只引用本次命中的 chunk_id。三个开关默认关闭。
         """
         _validate_search(query, top_k, doc_id)
         vector = self.embeddings.embed_one(query)
@@ -462,7 +513,10 @@ class RetrievalPipeline:
                 mode=mode,
                 hybrid=_skipped_hybrid(),
             )
-            return self._maybe_answer(result, enabled=answer)
+            return self._maybe_answer(
+                self._maybe_rerank(result, enabled=rerank),
+                enabled=answer,
+            )
         self.vector_store.require_compatible_collection()
         limit = candidate_limit(top_k) if hybrid else top_k
         try:
@@ -485,7 +539,10 @@ class RetrievalPipeline:
                 mode="dense",
                 hybrid=_skipped_hybrid(),
             )
-        return self._maybe_answer(self._attach_neighbors(result), enabled=answer)
+        return self._maybe_answer(
+            self._attach_neighbors(self._maybe_rerank(result, enabled=rerank)),
+            enabled=answer,
+        )
 
     def close(self) -> None:
         self.vector_store.close()
@@ -707,6 +764,66 @@ class RetrievalPipeline:
             score_kind="cosine",
             hybrid=hybrid,
         )
+
+    def _maybe_rerank(self, result: SearchResult, *, enabled: bool) -> SearchResult:
+        """在补邻之前重排已经截断的命中。关闭或没有可排序命中时不创建聊天客户端。"""
+        if not enabled:
+            return _copy_result(result, rerank=_skipped_rerank())
+        eligible: list[int] = []
+        allowed: list[str] = []
+        seen: set[str] = set()
+        for index, hit in enumerate(result.hits):
+            if hit.chunk_id and hit.text and hit.chunk_id not in seen:
+                seen.add(hit.chunk_id)
+                allowed.append(hit.chunk_id)
+                eligible.append(index)
+        if not allowed:
+            return _copy_result(result, rerank=_no_hits_rerank())
+        try:
+            system, user = build_rerank_messages(
+                result.query,
+                tuple(result.hits[index] for index in eligible),
+            )
+            raw = self._complete_rerank(system, user)
+            parsed = parse_rerank_order(raw, allowed)
+        except Exception as exc:  # noqa: BLE001 — 重排失败仍返回原顺序
+            status = RerankStatus(
+                ok=False,
+                skipped=False,
+                error=f"{type(exc).__name__}: {exc}",
+                model=self.settings.llm_model,
+            )
+            return _copy_result(result, rerank=status)
+        if not parsed.ok:
+            status = RerankStatus(
+                ok=False,
+                skipped=False,
+                error=parsed.error,
+                model=self.settings.llm_model,
+            )
+            return _copy_result(result, rerank=status)
+        by_id = {result.hits[index].chunk_id: result.hits[index] for index in eligible}
+        chosen = set(eligible)
+        ranked = [by_id[chunk_id] for chunk_id in parsed.ids]
+        tail = [hit for index, hit in enumerate(result.hits) if index not in chosen]
+        ordered = [*ranked, *tail]
+        scored = tuple(
+            _hit_with_score(hit, 1.0 / rank) for rank, hit in enumerate(ordered, start=1)
+        )
+        return _copy_result(
+            result,
+            hits=scored,
+            score_kind="rerank",
+            rerank=RerankStatus(
+                ok=True,
+                skipped=False,
+                error=None,
+                model=self.settings.llm_model,
+            ),
+        )
+
+    def _complete_rerank(self, system: str, user: str) -> str:
+        return ChatClient(self.settings).complete(system, user)
 
     def _maybe_answer(self, result: SearchResult, *, enabled: bool) -> SearchResult:
         if not enabled:
