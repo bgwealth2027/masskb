@@ -69,7 +69,18 @@ pip install -e .           # 或: pip install -r requirements.txt
 
 成功时会打印 Qdrant / Neo4j 的 `[OK]`；若缺少真实 API Key，会提示 embedding 暂不可用（不阻塞）。
 
-### 5. Node（可选）
+### 5. 测试
+
+单元测试不连接 Qdrant、Neo4j，也不会调用 OpenAI（客户端均已 mock）：
+
+```bash
+pip install -e ".[dev]"
+python -m pytest
+```
+
+推送到 `main` 或打开 Pull Request 时，GitHub Actions（`.github/workflows/ci.yml`）会安装本包并运行同一套测试。
+
+### 6. Node（可选）
 
 本机需 Node.js v18+（推荐 v22）。
 
@@ -98,9 +109,11 @@ MassKB-检索/
 │   └── pipeline.py         # 检索编排占位
 ├── scripts/
 │   └── healthcheck.py      # 连通性检查脚本
+├── tests/                  # 离线单元测试
 ├── docs/
 │   └── architecture/       # 架构图（drawio）
 ├── .github/
+│   ├── workflows/ci.yml    # 安装包并运行 pytest
 │   ├── CODEOWNERS
 │   ├── PULL_REQUEST_TEMPLATE.md
 │   └── ISSUE_TEMPLATE/
