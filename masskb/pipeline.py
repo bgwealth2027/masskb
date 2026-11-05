@@ -1,4 +1,4 @@
-"""检索编排：向量与稀疏写入、文档骨架，以及可选的查询改写、混合检索、重排和引用回答。"""
+"""检索编排：向量与稀疏写入、文档骨架，以及可选的查询改写、混合检索、重排、引用回答和有界工具循环。"""
 
 from __future__ import annotations
 
@@ -9,6 +9,14 @@ from typing import Any
 
 from qdrant_client.http.exceptions import UnexpectedResponse
 
+from masskb.agent import (
+    MAX_AGENT_STEPS,
+    build_agent_messages,
+    format_health_observation,
+    format_invalid_observation,
+    format_search_observation,
+    parse_agent_action,
+)
 from masskb.answer import (
     AnswerStatus,
     ChatClient,
@@ -159,6 +167,36 @@ class SearchResult:
 
 
 @dataclass(frozen=True)
+class AgentStep:
+    """工具循环里的一步。`search` 里嵌的是一次完整检索结果。"""
+
+    index: int
+    action: str
+    ok: bool
+    error: str | None = None
+    query: str | None = None
+    search: SearchResult | None = None
+    health: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class AskResult:
+    """一次工具循环。`query` 是用户原文。`answer` 是收束后的回答。"""
+
+    query: str
+    max_steps: int
+    model: str | None
+    stopped: str
+    steps: tuple[AgentStep, ...]
+    answer: AnswerStatus
+    top_k: int
+    doc_id: str | None
+    hybrid: bool
+    rewrite: bool
+    rerank: bool
+
+
+@dataclass(frozen=True)
 class IngestWriteResult:
     """一次写入的结果。`points_upserted` 是本次 upsert 的点数。"""
 
@@ -183,6 +221,41 @@ def _validate_search(query: str, top_k: int, doc_id: str | None) -> None:
         raise ValueError(f"top_k 必须为正整数，收到 {top_k!r}")
     if doc_id is not None and (not isinstance(doc_id, str) or doc_id.strip() == ""):
         raise ValueError("doc_id 不能为空")
+
+
+def _validate_max_steps(max_steps: int) -> None:
+    allowed = range(1, MAX_AGENT_STEPS + 1)
+    if isinstance(max_steps, bool) or not isinstance(max_steps, int) or max_steps not in allowed:
+        raise ValueError(f"max_steps 必须是 1 到 {MAX_AGENT_STEPS} 的整数，收到 {max_steps!r}")
+
+
+def _ask_result(
+    query: str,
+    max_steps: int,
+    model: str | None,
+    stopped: str,
+    steps: tuple[AgentStep, ...],
+    answer: AnswerStatus,
+    *,
+    top_k: int,
+    doc_id: str | None,
+    hybrid: bool,
+    rewrite: bool,
+    rerank: bool,
+) -> AskResult:
+    return AskResult(
+        query=query,
+        max_steps=max_steps,
+        model=model,
+        stopped=stopped,
+        steps=steps,
+        answer=answer,
+        top_k=top_k,
+        doc_id=doc_id,
+        hybrid=hybrid,
+        rewrite=rewrite,
+        rerank=rerank,
+    )
 
 
 def _search_result(
@@ -415,7 +488,10 @@ def _payload(chunk: Chunk) -> dict[str, Any]:
 
 
 class RetrievalPipeline:
-    """组装向量、图谱与 Embedding。`ingest` 先写 Qdrant 再同步骨架。"""
+    """组装向量、图谱与 Embedding。`ingest` 先写 Qdrant 再同步骨架。
+
+    `ask` 在有界步数内调用现有的 `search` 与 `healthcheck`。
+    """
 
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()
@@ -586,6 +662,130 @@ class RetrievalPipeline:
             self._attach_neighbors(self._maybe_rerank(result, enabled=rerank)),
             enabled=answer,
         )
+
+    def ask(
+        self,
+        query: str,
+        *,
+        top_k: int = 5,
+        doc_id: str | None = None,
+        hybrid: bool = False,
+        rewrite: bool = False,
+        rerank: bool = False,
+        max_steps: int = MAX_AGENT_STEPS,
+    ) -> AskResult:
+        """用有界工具循环回答问题。默认不由 `search` 进入。
+
+        每一步只接受一个 JSON 动作：`search`、`healthcheck` 或 `finish`。
+        `search` 转发调用方的 `top_k`、`doc_id`、`hybrid`、`rewrite`、`rerank`，
+        并固定 `answer=False`。引用只能来自本轮带正文的命中。
+        空白问题、非法 `top_k`、`doc_id` 或 `max_steps` 在第一次聊天前抛出 `ValueError`。
+        缺 Key、聊天失败，以及 `search` 的硬错误会继续抛出。
+        走满步数仍未 `finish` 时返回 `stopped="max_steps"`，不抛错。
+        """
+        _validate_search(query, top_k, doc_id)
+        _validate_max_steps(max_steps)
+        observations: list[str] = []
+        steps: list[AgentStep] = []
+        seen_ids: set[str] = set()
+        model = self.settings.llm_model
+        for index in range(1, max_steps + 1):
+            system, user = build_agent_messages(
+                query,
+                observations,
+                top_k=top_k,
+                doc_id=doc_id,
+                hybrid=hybrid,
+                rewrite=rewrite,
+                rerank=rerank,
+            )
+            raw = self._complete_agent(system, user)
+            action = parse_agent_action(raw)
+            if not action.ok or action.kind is None:
+                error = action.error or "invalid_shape"
+                steps.append(AgentStep(index=index, action="invalid", ok=False, error=error))
+                observations.append(format_invalid_observation(error))
+                continue
+            if action.kind == "finish":
+                parsed = _with_model(parse_answer(action.raw or "", seen_ids), model)
+                steps.append(
+                    AgentStep(
+                        index=index,
+                        action="finish",
+                        ok=parsed.ok,
+                        error=parsed.error,
+                    )
+                )
+                return _ask_result(
+                    query,
+                    max_steps,
+                    model,
+                    "finish",
+                    tuple(steps),
+                    parsed,
+                    top_k=top_k,
+                    doc_id=doc_id,
+                    hybrid=hybrid,
+                    rewrite=rewrite,
+                    rerank=rerank,
+                )
+            if action.kind == "healthcheck":
+                payload = self.healthcheck()
+                steps.append(AgentStep(index=index, action="healthcheck", ok=True, health=payload))
+                observations.append(format_health_observation(payload))
+                continue
+            tool_query = action.query
+            if tool_query is None:
+                steps.append(
+                    AgentStep(index=index, action="invalid", ok=False, error="invalid_shape")
+                )
+                observations.append(format_invalid_observation("invalid_shape"))
+                continue
+            result = self.search(
+                tool_query,
+                top_k=top_k,
+                doc_id=doc_id,
+                hybrid=hybrid,
+                answer=False,
+                rerank=rerank,
+                rewrite=rewrite,
+            )
+            for hit in result.hits:
+                if hit.chunk_id and hit.text:
+                    seen_ids.add(hit.chunk_id)
+            steps.append(
+                AgentStep(
+                    index=index,
+                    action="search",
+                    ok=True,
+                    query=tool_query,
+                    search=result,
+                )
+            )
+            observations.append(format_search_observation(tool_query, result))
+        return _ask_result(
+            query,
+            max_steps,
+            model,
+            "max_steps",
+            tuple(steps),
+            AnswerStatus(
+                ok=False,
+                skipped=False,
+                text=None,
+                citations=(),
+                model=model,
+                error="max_steps",
+            ),
+            top_k=top_k,
+            doc_id=doc_id,
+            hybrid=hybrid,
+            rewrite=rewrite,
+            rerank=rerank,
+        )
+
+    def _complete_agent(self, system: str, user: str) -> str:
+        return ChatClient(self.settings).complete(system, user, max_tokens=512)
 
     def close(self) -> None:
         self.vector_store.close()

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -13,8 +14,12 @@ from masskb.ingest import ingest_path
 from masskb.pipeline import (
     DimensionMismatchError,
     EntitySyncError,
+    GraphStatus,
     GraphSyncError,
     RetrievalPipeline,
+    RewriteStatus,
+    SearchHit,
+    SearchResult,
 )
 from masskb.sparse import encode_text
 from masskb.vector_store import CollectionConfigError, point_id_for_chunk
@@ -2060,4 +2065,437 @@ def test_ingest_entities_chat_error_and_graph_error_keep_points(
     with pytest.raises(EntitySyncError, match="骨架已保留"):
         pipeline.ingest(path, root=tmp_path, entities=True)
     assert len(store.points) == 1
+    pipeline.close()
+
+
+def _ask_pipeline() -> RetrievalPipeline:
+    return RetrievalPipeline(Settings(llm_model="gpt-test"))
+
+
+def _ask_hit(chunk_id: str = "keep", text: str | None = "命中正文") -> SearchHit:
+    return SearchHit(
+        score=0.5,
+        text=text,
+        source="a.md",
+        chunk_id=chunk_id,
+        doc_id="d",
+        index=0,
+        start=0,
+        end=4,
+        prev_chunk_id="prev-id",
+        next_chunk_id="next-id",
+    )
+
+
+def _ask_search_result(
+    query: str,
+    hits: tuple[SearchHit, ...],
+    **overrides: object,
+) -> SearchResult:
+    payload: dict[str, object] = {
+        "query": query,
+        "top_k": 5,
+        "collection": "masskb_chunks",
+        "embedding_model": "embed-test",
+        "doc_id": None,
+        "hits": hits,
+        "graph": GraphStatus(ok=True, skipped=False),
+    }
+    payload.update(overrides)
+    return SearchResult(**payload)  # type: ignore[arg-type]
+
+
+def _script(payloads: list[str], seen: list[str]):
+    def complete(_system: str, user: str) -> str:
+        seen.append(user)
+        return payloads[len(seen) - 1]
+
+    return complete
+
+
+def test_ask_search_then_finish_forwards_defaults_and_filters_citations() -> None:
+    pipeline = _ask_pipeline()
+    messages: list[str] = []
+    searches: list[tuple[str, dict[str, object]]] = []
+
+    def fake_search(query: str, **kwargs: object) -> SearchResult:
+        searches.append((query, kwargs))
+        return _ask_search_result(
+            query,
+            (_ask_hit("keep", "命中正文"), _ask_hit("notext", None)),
+        )
+
+    pipeline._complete_agent = _script(  # type: ignore[method-assign]
+        [
+            json.dumps({"action": "search", "query": "  质量检索  "}),
+            json.dumps(
+                {
+                    "action": "finish",
+                    "abstain": False,
+                    "answer": "是质量",
+                    "citations": ["keep", "notext", "missing"],
+                }
+            ),
+        ],
+        messages,
+    )
+    pipeline.search = fake_search  # type: ignore[method-assign]
+    pipeline.healthcheck = lambda: (_ for _ in ()).throw(AssertionError("health"))  # type: ignore[method-assign]
+
+    result = pipeline.ask("质量问题")
+
+    assert searches == [
+        (
+            "质量检索",
+            {
+                "top_k": 5,
+                "doc_id": None,
+                "hybrid": False,
+                "answer": False,
+                "rerank": False,
+                "rewrite": False,
+            },
+        )
+    ]
+    assert "质量问题" in messages[0]
+    assert "命中正文" not in messages[0]
+    assert "命中正文" in messages[1]
+    assert "keep" in messages[1]
+    assert "prev_chunk_id" not in messages[1]
+    assert "prev-id" not in messages[1]
+    assert "next-id" not in messages[1]
+    assert result.query == "质量问题"
+    assert result.stopped == "finish"
+    assert result.model == "gpt-test"
+    assert result.answer.text == "是质量"
+    assert result.answer.citations == ("keep",)
+    assert result.steps[0].action == "search"
+    assert result.steps[0].search is not None
+    assert result.steps[0].search.answer.skipped is True
+    assert result.steps[1].action == "finish"
+    pipeline.close()
+
+
+def test_ask_forwards_caller_flags() -> None:
+    pipeline = _ask_pipeline()
+    seen: dict[str, object] = {}
+
+    def fake_search(query: str, **kwargs: object) -> SearchResult:
+        seen["query"] = query
+        seen["kwargs"] = kwargs
+        return _ask_search_result(query, (_ask_hit(),))
+
+    pipeline._complete_agent = _script(  # type: ignore[method-assign]
+        [
+            json.dumps({"action": "search", "query": "质量"}),
+            json.dumps(
+                {"action": "finish", "abstain": False, "answer": "答", "citations": ["keep"]}
+            ),
+        ],
+        [],
+    )
+    pipeline.search = fake_search  # type: ignore[method-assign]
+
+    result = pipeline.ask(
+        "质量",
+        top_k=3,
+        doc_id="doc",
+        hybrid=True,
+        rewrite=True,
+        rerank=True,
+        max_steps=2,
+    )
+
+    assert result.stopped == "finish"
+    assert seen["kwargs"] == {
+        "top_k": 3,
+        "doc_id": "doc",
+        "hybrid": True,
+        "answer": False,
+        "rerank": True,
+        "rewrite": True,
+    }
+    pipeline.close()
+
+
+def test_ask_healthcheck_then_finish_does_not_search() -> None:
+    pipeline = _ask_pipeline()
+    health_calls: list[str] = []
+
+    def fake_health() -> dict[str, object]:
+        health_calls.append("health")
+        return {"ok": True, "qdrant": {"ok": True}, "neo4j": {"ok": True}}
+
+    pipeline._complete_agent = _script(  # type: ignore[method-assign]
+        [
+            '{"action":"healthcheck"}',
+            '{"action":"finish","abstain":true,"answer":null,"citations":[]}',
+        ],
+        [],
+    )
+    pipeline.healthcheck = fake_health  # type: ignore[method-assign]
+    pipeline.search = lambda *_args, **_kwargs: (_ for _ in ()).throw(  # type: ignore[method-assign]
+        AssertionError("search")
+    )
+
+    result = pipeline.ask("质量")
+
+    assert health_calls == ["health"]
+    assert result.stopped == "finish"
+    assert result.answer.ok is True
+    assert result.answer.text is None
+    assert result.answer.citations == ()
+    assert result.steps[0].action == "healthcheck"
+    assert result.steps[0].health == {
+        "ok": True,
+        "qdrant": {"ok": True},
+        "neo4j": {"ok": True},
+    }
+    pipeline.close()
+
+
+def test_ask_abstain_on_first_step_calls_no_tools() -> None:
+    pipeline = _ask_pipeline()
+    pipeline._complete_agent = _script(  # type: ignore[method-assign]
+        ['{"action":"finish","abstain":true,"answer":null,"citations":[]}'],
+        [],
+    )
+    pipeline.search = lambda *_args, **_kwargs: (_ for _ in ()).throw(  # type: ignore[method-assign]
+        AssertionError("search")
+    )
+    pipeline.healthcheck = lambda: (_ for _ in ()).throw(AssertionError("health"))  # type: ignore[method-assign]
+
+    result = pipeline.ask("质量")
+
+    assert result.stopped == "finish"
+    assert result.answer.text is None
+    assert result.steps[0].action == "finish"
+    pipeline.close()
+
+
+def test_ask_invalid_finish_shape_stops() -> None:
+    pipeline = _ask_pipeline()
+    messages: list[str] = []
+    pipeline._complete_agent = _script(  # type: ignore[method-assign]
+        ['{"action":"finish","abstain":false,"answer":null,"citations":[]}'],
+        messages,
+    )
+
+    result = pipeline.ask("质量", max_steps=3)
+
+    assert len(messages) == 1
+    assert result.stopped == "finish"
+    assert result.answer.error == "invalid_shape"
+    assert result.answer.text is None
+    pipeline.close()
+
+
+def test_ask_three_invalid_actions_stop_at_max_steps() -> None:
+    pipeline = _ask_pipeline()
+    messages: list[str] = []
+    pipeline._complete_agent = _script(  # type: ignore[method-assign]
+        [
+            "不是 JSON",
+            '{"action":"ingest"}',
+            '{"action":"search","query":"质量","top_k":1}',
+        ],
+        messages,
+    )
+    pipeline.search = lambda *_args, **_kwargs: (_ for _ in ()).throw(  # type: ignore[method-assign]
+        AssertionError("search")
+    )
+
+    result = pipeline.ask("质量")
+
+    assert len(messages) == 3
+    assert result.stopped == "max_steps"
+    assert result.answer.ok is False
+    assert result.answer.error == "max_steps"
+    assert result.answer.text is None
+    assert [step.action for step in result.steps] == ["invalid", "invalid", "invalid"]
+    assert [step.error for step in result.steps] == [
+        "invalid_json",
+        "unknown_action",
+        "invalid_shape",
+    ]
+    pipeline.close()
+
+
+def test_ask_max_steps_one_stops_after_search() -> None:
+    pipeline = _ask_pipeline()
+    messages: list[str] = []
+    searches: list[str] = []
+
+    def fake_search(query: str, **_kwargs: object) -> SearchResult:
+        searches.append(query)
+        return _ask_search_result(query, (_ask_hit(),))
+
+    pipeline._complete_agent = _script(  # type: ignore[method-assign]
+        [json.dumps({"action": "search", "query": "再查"})],
+        messages,
+    )
+    pipeline.search = fake_search  # type: ignore[method-assign]
+
+    result = pipeline.ask("质量", max_steps=1)
+
+    assert len(messages) == 1
+    assert searches == ["再查"]
+    assert result.stopped == "max_steps"
+    assert result.answer.error == "max_steps"
+    assert result.steps[0].action == "search"
+    pipeline.close()
+
+
+def test_ask_uncited_finish_keeps_hits_in_the_trace() -> None:
+    pipeline = _ask_pipeline()
+
+    def fake_search(query: str, **_kwargs: object) -> SearchResult:
+        return _ask_search_result(query, (_ask_hit(),))
+
+    pipeline._complete_agent = _script(  # type: ignore[method-assign]
+        [
+            json.dumps({"action": "search", "query": "质量"}),
+            json.dumps(
+                {
+                    "action": "finish",
+                    "abstain": False,
+                    "answer": "猜的",
+                    "citations": ["missing"],
+                }
+            ),
+        ],
+        [],
+    )
+    pipeline.search = fake_search  # type: ignore[method-assign]
+
+    result = pipeline.ask("质量")
+
+    assert result.stopped == "finish"
+    assert result.answer.ok is False
+    assert result.answer.error == "uncited"
+    assert result.answer.text is None
+    assert result.steps[0].search is not None
+    assert result.steps[0].search.hits[0].chunk_id == "keep"
+    pipeline.close()
+
+
+def test_ask_can_cite_hits_when_graph_or_rewrite_failed() -> None:
+    pipeline = _ask_pipeline()
+    messages: list[str] = []
+    calls = {"n": 0}
+
+    def fake_search(query: str, **_kwargs: object) -> SearchResult:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _ask_search_result(
+                query,
+                (_ask_hit("from-graph"),),
+                graph=GraphStatus(ok=False, skipped=False, error="Neo4j: down"),
+            )
+        return _ask_search_result(
+            query,
+            (_ask_hit("from-rewrite"),),
+            rewrite=RewriteStatus(
+                ok=False,
+                skipped=False,
+                text=None,
+                model="gpt-test",
+                error="invalid_json",
+            ),
+        )
+
+    pipeline._complete_agent = _script(  # type: ignore[method-assign]
+        [
+            json.dumps({"action": "search", "query": "一次"}),
+            json.dumps({"action": "search", "query": "二次"}),
+            json.dumps(
+                {
+                    "action": "finish",
+                    "abstain": False,
+                    "answer": "两边都有",
+                    "citations": ["from-graph", "from-rewrite"],
+                }
+            ),
+        ],
+        messages,
+    )
+    pipeline.search = fake_search  # type: ignore[method-assign]
+
+    result = pipeline.ask("质量", max_steps=3)
+
+    assert "Neo4j: down" in messages[1]
+    assert "invalid_json" in messages[2]
+    assert result.stopped == "finish"
+    assert result.answer.citations == ("from-graph", "from-rewrite")
+    pipeline.close()
+
+
+def test_ask_rejects_blank_query_and_bad_max_steps_before_complete() -> None:
+    pipeline = _ask_pipeline()
+
+    def complete(_system: str, _user: str) -> str:
+        raise AssertionError("不应补全")
+
+    pipeline._complete_agent = complete  # type: ignore[method-assign]
+
+    with pytest.raises(ValueError, match="查询不能为空"):
+        pipeline.ask("   ")
+    with pytest.raises(ValueError, match="max_steps"):
+        pipeline.ask("质量", max_steps=0)
+    with pytest.raises(ValueError, match="max_steps"):
+        pipeline.ask("质量", max_steps=4)
+    with pytest.raises(ValueError, match="max_steps"):
+        pipeline.ask("质量", max_steps=True)  # type: ignore[arg-type]
+    pipeline.close()
+
+
+def test_ask_propagates_complete_and_search_errors() -> None:
+    pipeline = _ask_pipeline()
+    searches: list[str] = []
+
+    def explode(_system: str, _user: str) -> str:
+        raise RuntimeError("缺少真实 OPENAI_API_KEY")
+
+    pipeline._complete_agent = explode  # type: ignore[method-assign]
+    pipeline.search = lambda *_args, **_kwargs: searches.append("search")  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match="OPENAI_API_KEY"):
+        pipeline.ask("质量")
+    assert searches == []
+
+    def fake_search(*_args: object, **_kwargs: object) -> SearchResult:
+        raise DimensionMismatchError("维度不符")
+
+    pipeline._complete_agent = _script(  # type: ignore[method-assign]
+        [json.dumps({"action": "search", "query": "质量"})],
+        [],
+    )
+    pipeline.search = fake_search  # type: ignore[method-assign]
+    with pytest.raises(DimensionMismatchError, match="维度不符"):
+        pipeline.ask("质量")
+    pipeline.close()
+
+
+def test_complete_agent_sets_max_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: dict[str, object] = {}
+
+    class FakeChat:
+        def __init__(self, settings: Settings) -> None:
+            seen["model"] = settings.llm_model
+
+        def complete(self, system: str, user: str, *, max_tokens: int | None = None) -> str:
+            seen["system"] = system
+            seen["user"] = user
+            seen["max_tokens"] = max_tokens
+            return "ok"
+
+    monkeypatch.setattr("masskb.pipeline.ChatClient", FakeChat)
+    pipeline = RetrievalPipeline(Settings(llm_model="gpt-test"))
+    assert pipeline._complete_agent("系统", "用户") == "ok"
+    assert seen == {
+        "model": "gpt-test",
+        "system": "系统",
+        "user": "用户",
+        "max_tokens": 512,
+    }
     pipeline.close()

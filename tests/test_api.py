@@ -9,7 +9,15 @@ from fastapi.testclient import TestClient
 
 from masskb.answer import AnswerStatus
 from masskb.api import create_app
-from masskb.pipeline import GraphStatus, RerankStatus, RewriteStatus, SearchHit, SearchResult
+from masskb.pipeline import (
+    AgentStep,
+    AskResult,
+    GraphStatus,
+    RerankStatus,
+    RewriteStatus,
+    SearchHit,
+    SearchResult,
+)
 
 
 def _hit() -> SearchHit:
@@ -55,6 +63,8 @@ class _Pipeline:
         }
         self.health_error: Exception | None = None
         self.search_error: Exception | None = None
+        self.ask_error: Exception | None = None
+        self.ask_result = _ask_result()
 
     def healthcheck(self) -> dict[str, object]:
         self.calls.append("health")
@@ -69,8 +79,39 @@ class _Pipeline:
             raise self.search_error
         return self.result
 
+    def ask(self, query: str, **kwargs: object) -> AskResult:
+        self.calls.append("ask")
+        self.seen = {"query": query, **kwargs}
+        if self.ask_error is not None:
+            raise self.ask_error
+        return self.ask_result
+
     def close(self) -> None:
         self.closed.append("closed")
+
+
+def _ask_result(**overrides: object) -> AskResult:
+    payload: dict[str, object] = {
+        "query": "质量",
+        "max_steps": 3,
+        "model": "gpt-test",
+        "stopped": "finish",
+        "steps": (AgentStep(index=1, action="finish", ok=True),),
+        "answer": AnswerStatus(
+            ok=True,
+            skipped=False,
+            text="回答",
+            citations=("c",),
+            model="gpt-test",
+        ),
+        "top_k": 5,
+        "doc_id": None,
+        "hybrid": False,
+        "rewrite": False,
+        "rerank": False,
+    }
+    payload.update(overrides)
+    return AskResult(**payload)  # type: ignore[arg-type]
 
 
 def test_post_search_matches_cli_json() -> None:
@@ -92,6 +133,8 @@ def test_post_search_matches_cli_json() -> None:
         "rerank": False,
         "rewrite": False,
     }
+    assert "steps" not in response.json()
+    assert "stopped" not in response.json()
 
 
 def test_post_search_forwards_flags_without_trimming_query() -> None:
@@ -189,11 +232,12 @@ def test_search_validation_does_not_call_pipeline() -> None:
         {"query": "质量", "doc_id": ""},
         {"query": "质量", "doc_id": "   "},
         {"query": "质量", "entities": True},
+        {"query": "质量", "agent": True},
     ]
     with TestClient(create_app(pipeline)) as client:  # type: ignore[arg-type]
         statuses = [client.post("/search", json=body).status_code for body in bodies]
 
-    assert statuses == [422, 422, 422, 422, 422, 422, 422]
+    assert statuses == [422, 422, 422, 422, 422, 422, 422, 422]
     assert pipeline.calls == []
 
 
@@ -262,6 +306,7 @@ def test_no_ingest_route_and_method_mismatch() -> None:
     assert "/ingest" not in schema["paths"]
     assert {"get"} == set(schema["paths"]["/health"].keys())
     assert {"post"} == set(schema["paths"]["/search"].keys())
+    assert {"post"} == set(schema["paths"]["/ask"].keys())
     assert pipeline.calls == []
 
 
@@ -292,3 +337,115 @@ def test_module_app_lifespan_constructs_and_closes(monkeypatch) -> None:
         assert client.get("/health").status_code == 200
         assert created == ["init"]
     assert closed == ["closed"]
+
+
+def test_post_ask_matches_cli_json_and_defaults() -> None:
+    result = _ask_result()
+    pipeline = _Pipeline()
+    pipeline.ask_result = result
+    with TestClient(create_app(pipeline)) as client:  # type: ignore[arg-type]
+        response = client.post("/ask", json={"query": "质量"})
+
+    assert response.status_code == 200
+    assert response.content == json.dumps(asdict(result), ensure_ascii=False).encode("utf-8")
+    assert "回答".encode() in response.content
+    assert b"\\u56de" not in response.content
+    assert pipeline.calls == ["ask"]
+    assert pipeline.seen == {
+        "query": "质量",
+        "top_k": 5,
+        "doc_id": None,
+        "hybrid": False,
+        "rewrite": False,
+        "rerank": False,
+        "max_steps": 3,
+    }
+
+
+def test_post_ask_forwards_flags() -> None:
+    pipeline = _Pipeline()
+    body = {
+        "query": " 质量 ",
+        "top_k": 3,
+        "doc_id": "abc",
+        "hybrid": True,
+        "rewrite": True,
+        "rerank": True,
+        "max_steps": 2,
+    }
+    with TestClient(create_app(pipeline)) as client:  # type: ignore[arg-type]
+        response = client.post("/ask", json=body)
+
+    assert response.status_code == 200
+    assert pipeline.seen == {
+        "query": " 质量 ",
+        "top_k": 3,
+        "doc_id": "abc",
+        "hybrid": True,
+        "rewrite": True,
+        "rerank": True,
+        "max_steps": 2,
+    }
+    assert "answer" not in pipeline.seen
+
+
+def test_post_ask_soft_failure_stays_200() -> None:
+    pipeline = _Pipeline()
+    pipeline.ask_result = _ask_result(
+        stopped="max_steps",
+        answer=AnswerStatus(
+            ok=False,
+            skipped=False,
+            text=None,
+            citations=(),
+            model="gpt-test",
+            error="max_steps",
+        ),
+    )
+    with TestClient(create_app(pipeline)) as client:  # type: ignore[arg-type]
+        response = client.post("/ask", json={"query": "质量"})
+
+    assert response.status_code == 200
+    assert response.json()["stopped"] == "max_steps"
+    assert response.json()["answer"]["error"] == "max_steps"
+    assert response.json()["answer"]["text"] is None
+
+
+def test_ask_validation_does_not_call_pipeline() -> None:
+    pipeline = _Pipeline()
+    bodies = [
+        {},
+        {"query": "   "},
+        {"query": "质量", "top_k": True},
+        {"query": "质量", "doc_id": "   "},
+        {"query": "质量", "max_steps": 4},
+        {"query": "质量", "max_steps": 0},
+        {"query": "质量", "max_steps": True},
+        {"query": "质量", "answer": True},
+        {"query": "质量", "agent": True},
+    ]
+    with TestClient(create_app(pipeline)) as client:  # type: ignore[arg-type]
+        statuses = [client.post("/ask", json=body).status_code for body in bodies]
+
+    assert statuses == [422, 422, 422, 422, 422, 422, 422, 422, 422]
+    assert pipeline.calls == []
+
+
+def test_ask_value_error_is_422() -> None:
+    pipeline = _Pipeline()
+    pipeline.ask_error = ValueError("max_steps 必须是 1 到 3 的整数，收到 4")
+    with TestClient(create_app(pipeline)) as client:  # type: ignore[arg-type]
+        response = client.post("/ask", json={"query": "质量"})
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": "max_steps 必须是 1 到 3 的整数，收到 4"}
+
+
+def test_ask_hard_failure_is_503_and_closes_once() -> None:
+    pipeline = _Pipeline()
+    pipeline.ask_error = RuntimeError("缺少真实 OPENAI_API_KEY")
+    with TestClient(create_app(pipeline)) as client:  # type: ignore[arg-type]
+        response = client.post("/ask", json={"query": "质量"})
+        assert response.status_code == 503
+        assert response.json() == {"detail": "缺少真实 OPENAI_API_KEY"}
+    assert pipeline.closed == ["closed"]

@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import sys
+from dataclasses import asdict
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,8 @@ import pytest
 from masskb.__main__ import main
 from masskb.answer import AnswerStatus
 from masskb.pipeline import (
+    AgentStep,
+    AskResult,
     DimensionMismatchError,
     GraphStatus,
     IngestWriteResult,
@@ -563,6 +566,7 @@ def test_search_help(capsys: pytest.CaptureFixture[str]) -> None:
     assert "--answer" in out
     assert "--rerank" in out
     assert "--rewrite" in out
+    assert "--max-steps" not in out
     assert "chunk_id" in out
 
 
@@ -982,3 +986,259 @@ def test_script_entrypoint(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert module.main() == 0
     assert closed == ["closed"]
+
+
+def _ask_hit() -> SearchHit:
+    return SearchHit(
+        score=0.5,
+        text="原文",
+        source="a.md",
+        chunk_id="c",
+        doc_id="d",
+        index=0,
+        start=0,
+        end=2,
+        prev_chunk_id=None,
+        next_chunk_id="c-next",
+    )
+
+
+def _ask_result() -> AskResult:
+    hit = _ask_hit()
+    search = SearchResult(
+        query="质量",
+        top_k=5,
+        collection="masskb_chunks",
+        embedding_model="embed-test",
+        doc_id=None,
+        hits=(hit,),
+        graph=GraphStatus(ok=True, skipped=False),
+    )
+    return AskResult(
+        query="质量",
+        max_steps=3,
+        model="gpt-test",
+        stopped="finish",
+        steps=(
+            AgentStep(index=1, action="search", ok=True, query="质量", search=search),
+            AgentStep(index=2, action="finish", ok=True),
+        ),
+        answer=AnswerStatus(
+            ok=True,
+            skipped=False,
+            text="回答",
+            citations=("c",),
+            model="gpt-test",
+        ),
+        top_k=5,
+        doc_id=None,
+        hybrid=False,
+        rewrite=False,
+        rerank=False,
+    )
+
+
+def test_ask_prints_json_and_closes(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    closed: list[str] = []
+    seen: dict[str, object] = {}
+    expected = _ask_result()
+
+    class FakePipeline:
+        def ask(
+            self,
+            query: str,
+            *,
+            top_k: int = 5,
+            doc_id: str | None = None,
+            hybrid: bool = False,
+            rewrite: bool = False,
+            rerank: bool = False,
+            max_steps: int = 3,
+        ) -> AskResult:
+            seen["query"] = query
+            seen["top_k"] = top_k
+            seen["doc_id"] = doc_id
+            seen["hybrid"] = hybrid
+            seen["rewrite"] = rewrite
+            seen["rerank"] = rerank
+            seen["max_steps"] = max_steps
+            return expected
+
+        def close(self) -> None:
+            closed.append("closed")
+
+    monkeypatch.setattr("masskb.__main__.RetrievalPipeline", FakePipeline)
+
+    assert main(["ask", "质量"]) == 0
+
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert "回答" in captured.out
+    assert "\\u56de" not in captured.out
+    payload = json.loads(captured.out)
+    assert payload == json.loads(json.dumps(asdict(expected), ensure_ascii=False))
+    assert payload["steps"][0]["search"]["answer"]["skipped"] is True
+    assert payload["query"] == "质量"
+    assert seen == {
+        "query": "质量",
+        "top_k": 5,
+        "doc_id": None,
+        "hybrid": False,
+        "rewrite": False,
+        "rerank": False,
+        "max_steps": 3,
+    }
+    assert closed == ["closed"]
+
+
+def test_ask_forwards_flags(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    seen: dict[str, object] = {}
+
+    class FakePipeline:
+        def ask(self, query: str, **kwargs: object) -> AskResult:
+            seen["query"] = query
+            seen["kwargs"] = kwargs
+            return _ask_result()
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr("masskb.__main__.RetrievalPipeline", FakePipeline)
+
+    assert (
+        main(
+            [
+                "ask",
+                "质量",
+                "--top-k",
+                "3",
+                "--doc-id",
+                "abc",
+                "--hybrid",
+                "--rewrite",
+                "--rerank",
+                "--max-steps",
+                "2",
+            ]
+        )
+        == 0
+    )
+    assert seen["query"] == "质量"
+    assert seen["kwargs"] == {
+        "top_k": 3,
+        "doc_id": "abc",
+        "hybrid": True,
+        "rewrite": True,
+        "rerank": True,
+        "max_steps": 2,
+    }
+    assert capsys.readouterr().err == ""
+
+
+def test_ask_max_steps_soft_failure_exits_zero(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class FakePipeline:
+        def ask(self, *_args: object, **_kwargs: object) -> AskResult:
+            result = _ask_result()
+            return AskResult(
+                query=result.query,
+                max_steps=result.max_steps,
+                model=result.model,
+                stopped="max_steps",
+                steps=result.steps,
+                answer=AnswerStatus(
+                    ok=False,
+                    skipped=False,
+                    text=None,
+                    citations=(),
+                    model="gpt-test",
+                    error="max_steps",
+                ),
+                top_k=result.top_k,
+                doc_id=result.doc_id,
+                hybrid=False,
+                rewrite=False,
+                rerank=False,
+            )
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr("masskb.__main__.RetrievalPipeline", FakePipeline)
+
+    assert main(["ask", "质量"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["stopped"] == "max_steps"
+    assert payload["answer"]["error"] == "max_steps"
+    assert payload["answer"]["text"] is None
+
+
+def test_ask_failure_exits_and_closes(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    closed: list[str] = []
+
+    class FakePipeline:
+        def ask(self, *_args: object, **_kwargs: object) -> AskResult:
+            raise RuntimeError("缺少真实 OPENAI_API_KEY")
+
+        def close(self) -> None:
+            closed.append("closed")
+
+    monkeypatch.setattr("masskb.__main__.RetrievalPipeline", FakePipeline)
+
+    assert main(["ask", "质量"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "[FAIL] 缺少真实 OPENAI_API_KEY" in captured.err
+    assert closed == ["closed"]
+
+
+def test_ask_rejects_out_of_range_steps(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class FakePipeline:
+        def ask(self, *_args: object, **kwargs: object) -> AskResult:
+            raise ValueError(f"max_steps 必须是 1 到 3 的整数，收到 {kwargs['max_steps']!r}")
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr("masskb.__main__.RetrievalPipeline", FakePipeline)
+
+    assert main(["ask", "质量", "--max-steps", "4"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "max_steps" in captured.err
+
+
+def test_ask_help_and_rejected_flags(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as exc:
+        main(["ask", "--help"])
+    assert exc.value.code == 0
+    out = capsys.readouterr().out
+    assert "--top-k" in out
+    assert "--doc-id" in out
+    assert "--hybrid" in out
+    assert "--rewrite" in out
+    assert "--rerank" in out
+    assert "--max-steps" in out
+    assert "--answer" not in out
+
+    with pytest.raises(SystemExit) as missing:
+        main(["ask"])
+    assert missing.value.code == 2
+
+    with pytest.raises(SystemExit) as answer:
+        main(["ask", "质量", "--answer"])
+    assert answer.value.code == 2

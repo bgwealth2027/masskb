@@ -8,6 +8,7 @@ import sys
 from dataclasses import asdict
 from pathlib import Path
 
+from masskb.agent import MAX_AGENT_STEPS
 from masskb.ingest import (
     DEFAULT_CHUNK_OVERLAP,
     DEFAULT_CHUNK_SIZE,
@@ -230,6 +231,29 @@ def cmd_search(args: argparse.Namespace) -> int:
         pipeline.close()
 
 
+def cmd_ask(args: argparse.Namespace) -> int:
+    """按有界工具循环回答问题，并把 JSON 打到 stdout。硬失败只写 stderr。"""
+    pipeline = RetrievalPipeline()
+    try:
+        try:
+            result = pipeline.ask(
+                args.query,
+                top_k=args.top_k,
+                doc_id=args.doc_id,
+                hybrid=args.hybrid,
+                rewrite=args.rewrite,
+                rerank=args.rerank,
+                max_steps=args.max_steps,
+            )
+        except Exception as exc:  # noqa: BLE001 — CLI 把失败转成退出码
+            print(f"[FAIL] {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(asdict(result), ensure_ascii=False, indent=2))
+        return 0
+    finally:
+        pipeline.close()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="masskb", description="MassKB 检索中间件 CLI")
     sub = parser.add_subparsers(dest="command")
@@ -318,11 +342,55 @@ def build_parser() -> argparse.ArgumentParser:
     )
     search.set_defaults(func=cmd_search)
 
+    ask = sub.add_parser(
+        "ask",
+        help="用最多 3 步调用检索和健康检查，再给出带引用的回答",
+        description=(
+            "用最多 3 步调用现有检索和健康检查，再按本轮命中的 chunk_id 收束回答。"
+            "默认不进入 search。"
+        ),
+    )
+    ask.add_argument("query", help="问题文本")
+    ask.add_argument(
+        "--top-k",
+        type=int,
+        default=5,
+        help="每次 search 返回的命中条数（默认 5）",
+    )
+    ask.add_argument(
+        "--doc-id",
+        default=None,
+        help="每次 search 只检索该 doc_id；不传则搜索整个集合",
+    )
+    ask.add_argument(
+        "--hybrid",
+        action="store_true",
+        help="每次 search 融合稠密近邻与 bm25 稀疏名次；默认关闭",
+    )
+    ask.add_argument(
+        "--rewrite",
+        action="store_true",
+        help="每次 search 在检索前把查询改写成一条检索文本；默认关闭",
+    )
+    ask.add_argument(
+        "--rerank",
+        action="store_true",
+        help="每次 search 对已截断的 top_k 做 listwise 重排；默认关闭",
+    )
+    ask.add_argument(
+        "--max-steps",
+        type=int,
+        default=MAX_AGENT_STEPS,
+        help=f"代理步数，1 到 {MAX_AGENT_STEPS}（默认 {MAX_AGENT_STEPS}）",
+    )
+    ask.set_defaults(func=cmd_ask)
+
     serve = sub.add_parser(
         "serve",
         help='启动只读 HTTP（需要 pip install -e ".[api]"）',
         description=(
-            "启动只读 HTTP：GET /health 与 POST /search。入库仍使用 ingest 子命令。"
+            "启动只读 HTTP：GET /health、POST /search 与 POST /ask。"
+            "入库仍使用 ingest 子命令。"
             '需要 pip install -e ".[api]"。'
         ),
     )
