@@ -1,4 +1,4 @@
-"""检索编排：向量入库与文档骨架同步，以及同一模型上的近邻检索。"""
+"""检索编排：向量与稀疏写入、文档骨架，以及可选的混合检索和引用回答。"""
 
 from __future__ import annotations
 
@@ -9,8 +9,17 @@ from typing import Any
 
 from qdrant_client.http.exceptions import UnexpectedResponse
 
+from masskb.answer import (
+    AnswerStatus,
+    ChatClient,
+    build_answer_messages,
+    no_hits_answer,
+    parse_answer,
+    skipped_answer,
+)
 from masskb.config import Settings, get_settings
 from masskb.embeddings import EmbeddingClient
+from masskb.fusion import RRF_K, FusedHit, candidate_limit, reciprocal_rank_fusion
 from masskb.graph_store import GraphStore
 from masskb.ingest import (
     DEFAULT_CHUNK_OVERLAP,
@@ -20,6 +29,7 @@ from masskb.ingest import (
     IngestReport,
     ingest_path,
 )
+from masskb.sparse import encode_text
 from masskb.vector_store import (
     DEFAULT_COLLECTION,
     DEFAULT_VECTOR_SIZE,
@@ -53,6 +63,10 @@ class SearchHit:
     end: int | None
     prev_chunk_id: str | None
     next_chunk_id: str | None
+    dense_score: float | None = None
+    sparse_score: float | None = None
+    dense_rank: int | None = None
+    sparse_rank: int | None = None
 
 
 @dataclass(frozen=True)
@@ -62,6 +76,17 @@ class GraphStatus:
     ok: bool
     skipped: bool
     error: str | None = None
+
+
+@dataclass(frozen=True)
+class HybridStatus:
+    """这次有没有做稀疏腿。`skipped` 表示没有去查 bm25。"""
+
+    ok: bool
+    skipped: bool
+    error: str | None = None
+    rrf_k: int | None = None
+    candidate_k: int | None = None
 
 
 @dataclass(frozen=True)
@@ -75,6 +100,16 @@ class SearchResult:
     doc_id: str | None
     hits: tuple[SearchHit, ...]
     graph: GraphStatus
+    mode: str = "dense"
+    score_kind: str = "cosine"
+    hybrid: HybridStatus | None = None
+    answer: AnswerStatus | None = None
+
+    def __post_init__(self) -> None:
+        if self.hybrid is None:
+            object.__setattr__(self, "hybrid", _skipped_hybrid())
+        if self.answer is None:
+            object.__setattr__(self, "answer", skipped_answer())
 
 
 @dataclass(frozen=True)
@@ -106,6 +141,11 @@ def _search_result(
     doc_id: str | None,
     hits: tuple[SearchHit, ...],
     graph: GraphStatus,
+    *,
+    mode: str = "dense",
+    score_kind: str = "cosine",
+    hybrid: HybridStatus | None = None,
+    answer: AnswerStatus | None = None,
 ) -> SearchResult:
     return SearchResult(
         query=query,
@@ -115,11 +155,100 @@ def _search_result(
         doc_id=doc_id,
         hits=hits,
         graph=graph,
+        mode=mode,
+        score_kind=score_kind,
+        hybrid=hybrid,
+        answer=answer,
     )
 
 
 def _skipped_graph() -> GraphStatus:
     return GraphStatus(ok=True, skipped=True, error=None)
+
+
+def _skipped_hybrid() -> HybridStatus:
+    return HybridStatus(ok=True, skipped=True, error=None, rrf_k=None, candidate_k=None)
+
+
+def _hybrid_error(exc: Exception) -> HybridStatus:
+    return HybridStatus(
+        ok=False,
+        skipped=False,
+        error=f"{type(exc).__name__}: {exc}",
+        rrf_k=None,
+        candidate_k=None,
+    )
+
+
+def _copy_result(
+    result: SearchResult,
+    *,
+    hits: tuple[SearchHit, ...] | None = None,
+    graph: GraphStatus | None = None,
+    answer: AnswerStatus | None = None,
+) -> SearchResult:
+    return SearchResult(
+        query=result.query,
+        top_k=result.top_k,
+        collection=result.collection,
+        embedding_model=result.embedding_model,
+        doc_id=result.doc_id,
+        hits=result.hits if hits is None else hits,
+        graph=result.graph if graph is None else graph,
+        mode=result.mode,
+        score_kind=result.score_kind,
+        hybrid=result.hybrid,
+        answer=result.answer if answer is None else answer,
+    )
+
+
+def _ranked_pairs(hits: tuple[SearchHit, ...]) -> list[tuple[str, float]]:
+    pairs: list[tuple[str, float]] = []
+    seen: set[str] = set()
+    for hit in hits:
+        if hit.chunk_id and hit.chunk_id not in seen:
+            seen.add(hit.chunk_id)
+            pairs.append((hit.chunk_id, hit.score))
+    return pairs
+
+
+def _hits_by_chunk_id(*groups: tuple[SearchHit, ...]) -> dict[str, SearchHit]:
+    found: dict[str, SearchHit] = {}
+    for group in groups:
+        for hit in group:
+            if hit.chunk_id and hit.chunk_id not in found:
+                found[hit.chunk_id] = hit
+    return found
+
+
+def _fused_hit(hit: SearchHit, fused: FusedHit) -> SearchHit:
+    return SearchHit(
+        score=fused.score,
+        text=hit.text,
+        source=hit.source,
+        chunk_id=hit.chunk_id,
+        doc_id=hit.doc_id,
+        index=hit.index,
+        start=hit.start,
+        end=hit.end,
+        prev_chunk_id=None,
+        next_chunk_id=None,
+        dense_score=fused.dense_score,
+        sparse_score=fused.sparse_score,
+        dense_rank=fused.dense_rank,
+        sparse_rank=fused.sparse_rank,
+    )
+
+
+def _with_model(status: AnswerStatus, model: str) -> AnswerStatus:
+    return AnswerStatus(
+        ok=status.ok,
+        skipped=status.skipped,
+        text=status.text,
+        citations=status.citations,
+        model=model,
+        error=status.error,
+    )
 
 
 def _search_hit(raw: dict[str, Any]) -> SearchHit:
@@ -135,6 +264,10 @@ def _search_hit(raw: dict[str, Any]) -> SearchHit:
         end=payload.get("end"),
         prev_chunk_id=None,
         next_chunk_id=None,
+        dense_score=None,
+        sparse_score=None,
+        dense_rank=None,
+        sparse_rank=None,
     )
 
 
@@ -154,6 +287,10 @@ def _hit_with_neighbors(
         end=hit.end,
         prev_chunk_id=prev_chunk_id,
         next_chunk_id=next_chunk_id,
+        dense_score=hit.dense_score,
+        sparse_score=hit.sparse_score,
+        dense_rank=hit.dense_rank,
+        sparse_rank=hit.sparse_rank,
     )
 
 
@@ -231,7 +368,8 @@ class RetrievalPipeline:
             vectors = self._embed_document(doc.chunks)
             ids = [point_id_for_chunk(chunk.chunk_id) for chunk in doc.chunks]
             payloads = [_payload(chunk) for chunk in doc.chunks]
-            self.vector_store.upsert_points(ids, vectors, payloads)
+            sparse_vectors = [encode_text(chunk.text) for chunk in doc.chunks]
+            self.vector_store.upsert_points(ids, vectors, payloads, sparse_vectors)
             self.vector_store.delete_by_doc_id(doc.doc_id, keep_ids=ids)
             graph_chunks += self._sync_graph_document(doc)
             graph_documents += 1
@@ -250,12 +388,16 @@ class RetrievalPipeline:
         *,
         top_k: int = 5,
         doc_id: str | None = None,
+        hybrid: bool = False,
+        answer: bool = False,
     ) -> SearchResult:
         """用与入库相同的模型做近邻检索，再按 chunk_id 补前后邻。
 
         先生成查询向量，再看集合是否存在。集合不存在、没有点或过滤后没有命中时，
         返回空的 `hits`，并且不连接 Neo4j。缺 Key、维度不符、集合配置不符或 Qdrant
         连不上时抛错。Neo4j 补邻接失败时仍返回向量命中。
+        `hybrid` 为真时，在补邻之前用进程内 RRF 融合 bm25。`answer` 为真时，
+        补邻之后才请求聊天，且只引用本次命中的 chunk_id。两个开关默认关闭。
         """
         _validate_search(query, top_k, doc_id)
         vector = self.embeddings.embed_one(query)
@@ -264,33 +406,42 @@ class RetrievalPipeline:
                 f"向量维度不符：模型 {self.settings.embedding_model} 返回 {len(vector)} 维，"
                 f"期望 {DEFAULT_VECTOR_SIZE}。未执行检索。"
             )
+        mode = "hybrid" if hybrid else "dense"
         if not self.vector_store.has_collection():
-            return _search_result(
+            result = _search_result(
                 self.settings.embedding_model,
                 query,
                 top_k,
                 doc_id,
                 (),
                 _skipped_graph(),
+                mode=mode,
+                hybrid=_skipped_hybrid(),
             )
+            return self._maybe_answer(result, enabled=answer)
         self.vector_store.require_compatible_collection()
+        limit = candidate_limit(top_k) if hybrid else top_k
         try:
-            raw_hits = self.vector_store.search(vector, top_k=top_k, doc_id=doc_id)
+            raw_hits = self.vector_store.search(vector, top_k=limit, doc_id=doc_id)
         except UnexpectedResponse as exc:
             if exc.status_code != 404:
                 raise
             raw_hits = []
         hits = tuple(_search_hit(item) for item in raw_hits)
-        return self._attach_neighbors(
-            _search_result(
+        if hybrid:
+            result = self._hybrid_hits(query, top_k, doc_id, hits, limit)
+        else:
+            result = _search_result(
                 self.settings.embedding_model,
                 query,
                 top_k,
                 doc_id,
                 hits,
                 _skipped_graph(),
+                mode="dense",
+                hybrid=_skipped_hybrid(),
             )
-        )
+        return self._maybe_answer(self._attach_neighbors(result), enabled=answer)
 
     def close(self) -> None:
         self.vector_store.close()
@@ -352,14 +503,7 @@ class RetrievalPipeline:
                 skipped=False,
                 error=f"{type(exc).__name__}: {exc}",
             )
-            return _search_result(
-                result.embedding_model,
-                result.query,
-                result.top_k,
-                result.doc_id,
-                cleared,
-                status,
-            )
+            return _copy_result(result, hits=cleared, graph=status)
         enriched = []
         for hit in result.hits:
             pair = neighbors.get(hit.chunk_id) if hit.chunk_id else None
@@ -367,14 +511,136 @@ class RetrievalPipeline:
                 enriched.append(hit)
             else:
                 enriched.append(_hit_with_neighbors(hit, pair[0], pair[1]))
-        return _search_result(
-            result.embedding_model,
-            result.query,
-            result.top_k,
-            result.doc_id,
-            tuple(enriched),
-            GraphStatus(ok=True, skipped=False, error=None),
+        return _copy_result(
+            result,
+            hits=tuple(enriched),
+            graph=GraphStatus(ok=True, skipped=False, error=None),
         )
+
+    def _hybrid_hits(
+        self,
+        query: str,
+        top_k: int,
+        doc_id: str | None,
+        hits: tuple[SearchHit, ...],
+        limit: int,
+    ) -> SearchResult:
+        """有稠密命中时才查稀疏。失败或分词为空时保留余弦命中。"""
+        if not hits:
+            return _search_result(
+                self.settings.embedding_model,
+                query,
+                top_k,
+                doc_id,
+                (),
+                _skipped_graph(),
+                mode="hybrid",
+                hybrid=_skipped_hybrid(),
+            )
+        indices, values = encode_text(query)
+        if not indices:
+            return self._dense_hybrid_result(
+                query,
+                top_k,
+                doc_id,
+                hits,
+                HybridStatus(ok=True, skipped=False, error=None),
+            )
+        try:
+            ready = self.vector_store.sparse_ready()
+        except Exception as exc:  # noqa: BLE001 — 稀疏槽读失败仍返回稠密命中
+            return self._dense_hybrid_result(query, top_k, doc_id, hits, _hybrid_error(exc))
+        if not ready:
+            return self._dense_hybrid_result(
+                query,
+                top_k,
+                doc_id,
+                hits,
+                HybridStatus(
+                    ok=False,
+                    skipped=False,
+                    error=f"集合 {DEFAULT_COLLECTION} 没有稀疏向量 bm25",
+                ),
+            )
+        try:
+            raw_sparse = self.vector_store.search_sparse(
+                indices,
+                values,
+                top_k=limit,
+                doc_id=doc_id,
+            )
+        except Exception as exc:  # noqa: BLE001 — 稀疏查询失败仍返回稠密命中
+            return self._dense_hybrid_result(query, top_k, doc_id, hits, _hybrid_error(exc))
+        sparse_hits = tuple(_search_hit(item) for item in raw_sparse)
+        fused = reciprocal_rank_fusion(
+            _ranked_pairs(hits),
+            _ranked_pairs(sparse_hits),
+            top_k=top_k,
+        )
+        by_id = _hits_by_chunk_id(hits, sparse_hits)
+        fused_hits = tuple(_fused_hit(by_id[item.chunk_id], item) for item in fused)
+        return _search_result(
+            self.settings.embedding_model,
+            query,
+            top_k,
+            doc_id,
+            fused_hits,
+            _skipped_graph(),
+            mode="hybrid",
+            score_kind="rrf",
+            hybrid=HybridStatus(
+                ok=True,
+                skipped=False,
+                error=None,
+                rrf_k=RRF_K,
+                candidate_k=limit,
+            ),
+        )
+
+    def _dense_hybrid_result(
+        self,
+        query: str,
+        top_k: int,
+        doc_id: str | None,
+        hits: tuple[SearchHit, ...],
+        hybrid: HybridStatus,
+    ) -> SearchResult:
+        return _search_result(
+            self.settings.embedding_model,
+            query,
+            top_k,
+            doc_id,
+            hits[:top_k],
+            _skipped_graph(),
+            mode="hybrid",
+            score_kind="cosine",
+            hybrid=hybrid,
+        )
+
+    def _maybe_answer(self, result: SearchResult, *, enabled: bool) -> SearchResult:
+        if not enabled:
+            return _copy_result(result, answer=skipped_answer())
+        usable = tuple(hit for hit in result.hits if hit.chunk_id and hit.text)
+        if not usable:
+            return _copy_result(result, answer=no_hits_answer())
+        try:
+            system, user = build_answer_messages(result.query, usable)
+            raw = self._complete_answer(system, user)
+            parsed = parse_answer(raw, {hit.chunk_id for hit in usable if hit.chunk_id})
+            parsed = _with_model(parsed, self.settings.llm_model)
+        except Exception as exc:  # noqa: BLE001 — 回答失败仍返回检索命中
+            parsed = AnswerStatus(
+                ok=False,
+                skipped=False,
+                text=None,
+                citations=(),
+                model=self.settings.llm_model,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        return _copy_result(result, answer=parsed)
+
+    def _complete_answer(self, system: str, user: str) -> str:
+        return ChatClient(self.settings).complete(system, user)
 
     def _embed_document(self, chunks: Sequence[Chunk]) -> list[list[float]]:
         vectors: list[list[float]] = []

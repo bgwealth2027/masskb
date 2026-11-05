@@ -14,8 +14,11 @@ from qdrant_client.models import (
     FilterSelector,
     HasIdCondition,
     MatchValue,
+    Modifier,
     PayloadSchemaType,
     PointStruct,
+    SparseVector,
+    SparseVectorParams,
     VectorParams,
 )
 
@@ -23,6 +26,7 @@ from masskb.config import Settings, get_settings
 
 DEFAULT_COLLECTION = "masskb_chunks"
 DEFAULT_VECTOR_SIZE = 1536
+SPARSE_VECTOR_NAME = "bm25"
 UPSERT_BATCH_SIZE = 64
 POINT_NAMESPACE = uuid.UUID("c0ffee00-1111-5222-8333-445566778899")
 
@@ -48,7 +52,7 @@ SEARCH_PAYLOAD_FIELDS = (
 
 
 class VectorStore:
-    """Qdrant 薄封装：连通性检查、建集合、批量 upsert、按文档删除、近邻查询。"""
+    """Qdrant 薄封装：连通性检查、建集合、批量 upsert、按文档删除、近邻与稀疏查询。"""
 
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()
@@ -94,13 +98,17 @@ class VectorStore:
         *,
         vector_size: int = DEFAULT_VECTOR_SIZE,
     ) -> None:
-        """集合不存在则按余弦距离创建；已存在则核对配置。不一致时不改集合。"""
+        """集合不存在则创建未命名稠密向量和 bm25 稀疏槽；已存在则核对。不一致时不改集合。"""
         if self.has_collection(name):
             self.require_compatible_collection(name, vector_size=vector_size)
+            self._require_sparse_config(name)
         else:
             self.client.create_collection(
                 collection_name=name,
                 vectors_config=VectorParams(size=vector_size, distance=Distance.COSINE),
+                sparse_vectors_config={
+                    SPARSE_VECTOR_NAME: SparseVectorParams(modifier=Modifier.IDF),
+                },
             )
         self._ensure_doc_id_index(name)
 
@@ -109,15 +117,22 @@ class VectorStore:
         ids: Sequence[str],
         vectors: Sequence[Sequence[float]],
         payloads: Sequence[dict[str, Any]],
+        sparse_vectors: Sequence[tuple[Sequence[int], Sequence[float]]] | None = None,
         *,
         name: str = DEFAULT_COLLECTION,
     ) -> None:
-        """按批 upsert。相同 point id 由 Qdrant 覆盖。"""
+        """按批 upsert。相同 point id 由 Qdrant 覆盖稠密向量和稀疏向量。"""
         if len(ids) != len(vectors) or len(ids) != len(payloads):
             raise ValueError("ids、vectors、payloads 长度必须一致")
+        if sparse_vectors is not None and len(sparse_vectors) != len(ids):
+            raise ValueError("ids、vectors、payloads、sparse_vectors 长度必须一致")
         points = [
-            PointStruct(id=point_id, vector=list(vector), payload=dict(payload))
-            for point_id, vector, payload in zip(ids, vectors, payloads)
+            PointStruct(
+                id=point_id,
+                vector=_point_vector(vector, None if sparse_vectors is None else sparse_vectors[index]),
+                payload=dict(payload),
+            )
+            for index, (point_id, vector, payload) in enumerate(zip(ids, vectors, payloads))
         ]
         for start in range(0, len(points), UPSERT_BATCH_SIZE):
             batch = points[start : start + UPSERT_BATCH_SIZE]
@@ -160,24 +175,40 @@ class VectorStore:
         name: str = DEFAULT_COLLECTION,
     ) -> list[dict[str, Any]]:
         """余弦近邻查询。不创建集合，也不写入。集合不存在时由 Qdrant 报错。"""
-        query_filter = None
-        if doc_id is not None:
-            query_filter = Filter(
-                must=[FieldCondition(key="doc_id", match=MatchValue(value=doc_id))]
-            )
         response = self.client.query_points(
             collection_name=name,
             query=list(vector),
-            query_filter=query_filter,
+            query_filter=_doc_filter(doc_id),
             limit=top_k,
             with_payload=list(SEARCH_PAYLOAD_FIELDS),
             with_vectors=False,
         )
-        hits: list[dict[str, Any]] = []
-        for point in response.points:
-            payload = getattr(point, "payload", None)
-            hits.append({"score": float(point.score), "payload": dict(payload or {})})
-        return hits
+        return _hits_from_response(response)
+
+    def search_sparse(
+        self,
+        indices: Sequence[int],
+        values: Sequence[float],
+        *,
+        top_k: int = 5,
+        doc_id: str | None = None,
+        name: str = DEFAULT_COLLECTION,
+    ) -> list[dict[str, Any]]:
+        """查询名为 bm25 的稀疏向量。不创建集合，也不写入。"""
+        response = self.client.query_points(
+            collection_name=name,
+            query=SparseVector(indices=list(indices), values=[float(item) for item in values]),
+            using=SPARSE_VECTOR_NAME,
+            query_filter=_doc_filter(doc_id),
+            limit=top_k,
+            with_payload=list(SEARCH_PAYLOAD_FIELDS),
+            with_vectors=False,
+        )
+        return _hits_from_response(response)
+
+    def sparse_ready(self, name: str = DEFAULT_COLLECTION) -> bool:
+        """集合里是否已有 bm25 槽。只读，不创建，也不改配置。"""
+        return SPARSE_VECTOR_NAME in _sparse_map(self.client.get_collection(name))
 
     def close(self) -> None:
         if self._client is not None:
@@ -195,6 +226,23 @@ class VectorStore:
                 f"实际为 {_describe_vectors(vectors)}。未写入。"
             )
 
+    def _require_sparse_config(self, name: str) -> None:
+        """稠密配置已经核对过。缺 bm25 或 modifier 不是 IDF 时不改集合、不删除。"""
+        info = self.client.get_collection(name)
+        params = _sparse_map(info).get(SPARSE_VECTOR_NAME)
+        if params is None:
+            raise CollectionConfigError(
+                f"集合 {name} 没有稀疏向量 {SPARSE_VECTOR_NAME}。"
+                "请删除该集合后重新执行 ingest。未写入。"
+            )
+        modifier = getattr(params, "modifier", None)
+        if modifier != Modifier.IDF:
+            actual = getattr(modifier, "value", modifier)
+            raise CollectionConfigError(
+                f"集合 {name} 的稀疏向量 {SPARSE_VECTOR_NAME} 与约定不符："
+                f"期望 modifier={Modifier.IDF.value}，实际为 {actual}。未写入。"
+            )
+
     def _ensure_doc_id_index(self, name: str) -> None:
         try:
             self.client.create_payload_index(
@@ -206,6 +254,50 @@ class VectorStore:
             # 索引已存在时保持集合不变，其它错误继续抛出。
             if "already exists" not in str(exc).lower():
                 raise
+
+
+def _doc_filter(doc_id: str | None) -> Filter | None:
+    if doc_id is None:
+        return None
+    return Filter(must=[FieldCondition(key="doc_id", match=MatchValue(value=doc_id))])
+
+
+def _hits_from_response(response: Any) -> list[dict[str, Any]]:
+    hits: list[dict[str, Any]] = []
+    for point in response.points:
+        payload = getattr(point, "payload", None)
+        hits.append({"score": float(point.score), "payload": dict(payload or {})})
+    return hits
+
+
+def _sparse_map(info: Any) -> dict[str, Any]:
+    sparse = getattr(info.config.params, "sparse_vectors", None)
+    if not sparse:
+        return {}
+    if isinstance(sparse, dict):
+        return sparse
+    return dict(sparse)
+
+
+def _point_vector(
+    dense: Sequence[float],
+    sparse: tuple[Sequence[int], Sequence[float]] | None,
+) -> list[float] | dict[str, Any]:
+    dense_list = list(dense)
+    if sparse is None:
+        return dense_list
+    indices, values = sparse
+    if len(indices) != len(values):
+        raise ValueError("稀疏下标与权重长度必须一致")
+    if not indices:
+        return dense_list
+    return {
+        "": dense_list,
+        SPARSE_VECTOR_NAME: SparseVector(
+            indices=list(indices),
+            values=[float(item) for item in values],
+        ),
+    }
 
 
 def _read_vector_params(vectors: Any) -> tuple[Any, Any] | None:

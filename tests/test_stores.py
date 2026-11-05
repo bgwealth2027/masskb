@@ -5,13 +5,14 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
-from qdrant_client.models import Distance, PayloadSchemaType
+from qdrant_client.models import Distance, Modifier, PayloadSchemaType, SparseVector
 
 from masskb.config import Settings
 from masskb.graph_store import GraphStore, GraphStoreError
 from masskb.ingest import Chunk, Document
 from masskb.vector_store import (
     SEARCH_PAYLOAD_FIELDS,
+    SPARSE_VECTOR_NAME,
     CollectionConfigError,
     VectorStore,
     point_id_for_chunk,
@@ -224,8 +225,13 @@ def _names(client: _RecordingQdrant) -> list[str]:
     return [name for name, _ in client.calls]
 
 
-def _collection_info(vectors: object) -> SimpleNamespace:
-    return SimpleNamespace(config=SimpleNamespace(params=SimpleNamespace(vectors=vectors)))
+def _collection_info(vectors: object, sparse: object | None = "default") -> SimpleNamespace:
+    if sparse == "default":
+        sparse_vectors: object = {SPARSE_VECTOR_NAME: SimpleNamespace(modifier=Modifier.IDF)}
+    else:
+        sparse_vectors = sparse
+    params = SimpleNamespace(vectors=vectors, sparse_vectors=sparse_vectors)
+    return SimpleNamespace(config=SimpleNamespace(params=params))
 
 
 def test_point_id_for_chunk_is_stable_uuid5() -> None:
@@ -245,6 +251,9 @@ def test_ensure_collection_creates_cosine_1536(monkeypatch: pytest.MonkeyPatch) 
     assert created[0]["collection_name"] == "masskb_chunks"
     assert created[0]["vectors_config"].size == 1536
     assert created[0]["vectors_config"].distance == Distance.COSINE
+    sparse = created[0]["sparse_vectors_config"]
+    assert set(sparse) == {SPARSE_VECTOR_NAME}
+    assert sparse[SPARSE_VECTOR_NAME].modifier == Modifier.IDF
     indexed = [kwargs for name, kwargs in client.calls if name == "create_payload_index"]
     assert indexed[0]["field_name"] == "doc_id"
     assert indexed[0]["field_schema"] == PayloadSchemaType.KEYWORD
@@ -290,6 +299,41 @@ def test_ensure_collection_rejects_incompatible(
     assert forbidden.isdisjoint(_names(client))
 
 
+def test_ensure_collection_rejects_missing_sparse(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = _RecordingQdrant()
+    client.collections = ["masskb_chunks"]
+    client.info = _collection_info(
+        SimpleNamespace(size=1536, distance=Distance.COSINE),
+        sparse=None,
+    )
+    store = _bind_qdrant(monkeypatch, client)
+
+    with pytest.raises(CollectionConfigError, match="bm25"):
+        store.ensure_collection()
+
+    forbidden = {"create_collection", "upsert", "delete", "delete_collection", "create_payload_index"}
+    assert forbidden.isdisjoint(_names(client))
+
+
+def test_ensure_collection_rejects_wrong_sparse_modifier(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _RecordingQdrant()
+    client.collections = ["masskb_chunks"]
+    client.info = _collection_info(
+        SimpleNamespace(size=1536, distance=Distance.COSINE),
+        sparse={SPARSE_VECTOR_NAME: SimpleNamespace(modifier=None)},
+    )
+    store = _bind_qdrant(monkeypatch, client)
+
+    with pytest.raises(CollectionConfigError, match="未写入"):
+        store.ensure_collection()
+
+    assert "delete_collection" not in _names(client)
+    assert "upsert" not in _names(client)
+    assert "delete" not in _names(client)
+
+
 def test_ensure_collection_ignores_existing_payload_index(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -330,6 +374,36 @@ def test_upsert_points_batches_and_waits(monkeypatch: pytest.MonkeyPatch) -> Non
     assert upserts[0]["points"][0].payload == {"doc_id": "d", "n": 0}
     assert upserts[1]["points"][0].id == "id-64"
     assert "delete_collection" not in _names(client)
+
+
+def test_upsert_points_writes_dense_and_sparse_on_the_same_point(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _RecordingQdrant()
+    store = _bind_qdrant(monkeypatch, client)
+
+    store.upsert_points(
+        ["id-0", "id-1"],
+        [[0.1, 0.2], [0.3]],
+        [{"doc_id": "d"}, {"doc_id": "d"}],
+        [([1, 3], [0.5, 0.2]), ([], [])],
+    )
+
+    point = client.calls[0][1]["points"]
+    assert point[0].vector[""] == [0.1, 0.2]
+    assert point[0].vector[SPARSE_VECTOR_NAME] == SparseVector(indices=[1, 3], values=[0.5, 0.2])
+    assert point[1].vector == [0.3]
+    assert "delete_collection" not in _names(client)
+
+
+def test_upsert_points_rejects_uneven_sparse(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = _RecordingQdrant()
+    store = _bind_qdrant(monkeypatch, client)
+
+    with pytest.raises(ValueError, match="长度必须一致"):
+        store.upsert_points(["a"], [[0.0]], [{"doc_id": "d"}], [([1], [0.2]), ([2], [0.3])])
+
+    assert "upsert" not in _names(client)
 
 
 def test_upsert_points_rejects_uneven_inputs(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -419,6 +493,43 @@ def test_search_filters_by_doc_id(monkeypatch: pytest.MonkeyPatch) -> None:
     assert filt.must_not is None
     forbidden = {"create_collection", "upsert", "delete", "delete_collection", "create_payload_index"}
     assert forbidden.isdisjoint(_names(client))
+
+
+def test_search_sparse_uses_bm25_and_doc_filter(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = _RecordingQdrant()
+    client.query_response = SimpleNamespace(
+        points=[SimpleNamespace(score=_Score(1.5), payload={"chunk_id": "c", "text": "质量"})]
+    )
+    store = _bind_qdrant(monkeypatch, client)
+
+    result = store.search_sparse([3, 8], [0.2, 0.4], top_k=4, doc_id="doc-1")
+
+    query = client.calls[0][1]
+    assert query["using"] == SPARSE_VECTOR_NAME
+    assert query["limit"] == 4
+    assert query["query"] == SparseVector(indices=[3, 8], values=[0.2, 0.4])
+    assert query["with_payload"] == list(SEARCH_PAYLOAD_FIELDS)
+    assert query["with_vectors"] is False
+    assert query["query_filter"].must[0].key == "doc_id"
+    assert query["query_filter"].must[0].match.value == "doc-1"
+    assert result == [{"score": 1.5, "payload": {"chunk_id": "c", "text": "质量"}}]
+    forbidden = {"create_collection", "upsert", "delete", "delete_collection", "create_payload_index"}
+    assert forbidden.isdisjoint(_names(client))
+
+
+def test_sparse_ready_reads_bm25_slot(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = _RecordingQdrant()
+    client.info = _collection_info(SimpleNamespace(size=1536, distance=Distance.COSINE))
+    store = _bind_qdrant(monkeypatch, client)
+
+    assert store.sparse_ready() is True
+
+    client.info = _collection_info(
+        SimpleNamespace(size=1536, distance=Distance.COSINE),
+        sparse=None,
+    )
+    assert store.sparse_ready() is False
+    assert "delete_collection" not in _names(client)
 
 
 def test_require_compatible_collection_is_read_only(monkeypatch: pytest.MonkeyPatch) -> None:

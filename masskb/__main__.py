@@ -94,6 +94,7 @@ def _format_report(
             lines.append("---")
         lines.append(f"collection: {written.collection}")
         lines.append(f"vector_size: {written.vector_size}")
+        lines.append("sparse: bm25")
         lines.append(f"upserted: {written.points_upserted}")
         lines.append(f"graph_documents: {written.graph_documents}")
         lines.append(f"graph_chunks: {written.graph_chunks}")
@@ -158,7 +159,13 @@ def cmd_search(args: argparse.Namespace) -> int:
     pipeline = RetrievalPipeline()
     try:
         try:
-            result = pipeline.search(args.query, top_k=args.top_k, doc_id=args.doc_id)
+            result = pipeline.search(
+                args.query,
+                top_k=args.top_k,
+                doc_id=args.doc_id,
+                hybrid=args.hybrid,
+                answer=args.answer,
+            )
         except Exception as exc:  # noqa: BLE001 — CLI 把检索失败转成退出码
             print(f"[FAIL] {exc}", file=sys.stderr)
             return 1
@@ -228,6 +235,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--doc-id",
         default=None,
         help="只检索该 doc_id；不传则搜索整个集合",
+    )
+    search.add_argument(
+        "--hybrid",
+        action="store_true",
+        help="融合稠密近邻与 bm25 稀疏名次；默认只做余弦近邻",
+    )
+    search.add_argument(
+        "--answer",
+        action="store_true",
+        help="用 LLM_MODEL 根据命中分块生成带 chunk_id 引用的回答；默认关闭",
     )
     search.set_defaults(func=cmd_search)
 

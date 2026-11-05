@@ -8,8 +8,10 @@ import pytest
 from qdrant_client.http.exceptions import UnexpectedResponse
 
 from masskb.config import Settings
+from masskb.fusion import RRF_K, candidate_limit
 from masskb.ingest import ingest_path
 from masskb.pipeline import DimensionMismatchError, GraphSyncError, RetrievalPipeline
+from masskb.sparse import encode_text
 from masskb.vector_store import CollectionConfigError, point_id_for_chunk
 
 
@@ -134,6 +136,18 @@ def _search_pipeline(
         calls.append("delete_by_doc_id")
         raise AssertionError("搜索不应删除")
 
+    def search_sparse(*_args, **_kwargs):
+        calls.append("search_sparse")
+        raise AssertionError("默认检索不应查询稀疏向量")
+
+    def sparse_ready(*_args, **_kwargs):
+        calls.append("sparse_ready")
+        raise AssertionError("默认检索不应读取稀疏槽")
+
+    def complete_answer(_system: str, _user: str) -> str:
+        calls.append("answer")
+        raise AssertionError("默认检索不应请求回答")
+
     neighbor_calls: list[list[str]] = []
 
     def neighbor_chunk_ids(chunk_ids):
@@ -145,8 +159,11 @@ def _search_pipeline(
     pipeline.vector_store.has_collection = has_collection
     pipeline.vector_store.require_compatible_collection = require_compatible_collection
     pipeline.vector_store.search = search
+    pipeline.vector_store.search_sparse = search_sparse
+    pipeline.vector_store.sparse_ready = sparse_ready
     pipeline.vector_store.upsert_points = upsert_points
     pipeline.vector_store.delete_by_doc_id = delete_by_doc_id
+    pipeline._complete_answer = complete_answer
     pipeline.graph_store.neighbor_chunk_ids = neighbor_chunk_ids
     pipeline.neighbor_calls = neighbor_calls  # type: ignore[attr-defined]
     return pipeline, calls
@@ -218,6 +235,16 @@ def test_search_embeds_query_and_maps_hits(monkeypatch: pytest.MonkeyPatch) -> N
     assert result.hits[0].next_chunk_id == "c3"
     assert result.hits[1].prev_chunk_id == "c0"
     assert result.hits[1].next_chunk_id is None
+    assert result.mode == "dense"
+    assert result.score_kind == "cosine"
+    assert result.hybrid.skipped is True
+    assert result.hybrid.ok is True
+    assert result.answer.skipped is True
+    assert result.answer.text is None
+    assert result.hits[0].dense_score is None
+    assert result.hits[0].sparse_rank is None
+    assert "search_sparse" not in calls
+    assert "answer" not in calls
 
 
 def test_search_missing_collection_returns_empty_after_embed(
@@ -412,12 +439,27 @@ class _MemoryVectors:
         if self.ensure_error is not None:
             raise self.ensure_error
 
-    def upsert_points(self, ids, vectors, payloads, *, name: str = "masskb_chunks") -> None:
+    def upsert_points(
+        self,
+        ids,
+        vectors,
+        payloads,
+        sparse_vectors=None,
+        *,
+        name: str = "masskb_chunks",
+    ) -> None:
         self.calls.append("upsert_points")
         assert name == "masskb_chunks"
         assert len(ids) == len(vectors) == len(payloads)
-        for point_id, vector, payload in zip(ids, vectors, payloads):
-            self.points[point_id] = {"vector": list(vector), "payload": dict(payload)}
+        if sparse_vectors is not None:
+            assert len(sparse_vectors) == len(ids)
+        for index, (point_id, vector, payload) in enumerate(zip(ids, vectors, payloads)):
+            sparse = None if sparse_vectors is None else sparse_vectors[index]
+            self.points[point_id] = {
+                "vector": list(vector),
+                "payload": dict(payload),
+                "sparse": sparse,
+            }
 
     def delete_by_doc_id(self, doc_id: str, *, keep_ids=(), name: str = "masskb_chunks") -> None:
         self.calls.append("delete_by_doc_id")
@@ -570,6 +612,7 @@ def test_ingest_probes_before_write_and_skips_probe_point(
     assert set(store.points) == {point_id_for_chunk(chunk.chunk_id)}
     assert set(stored["payload"]) == _PAYLOAD_KEYS
     assert stored["payload"]["text"] == "hello"
+    assert stored["sparse"] == encode_text("hello")
     assert stored["payload"]["text"] != "masskb"
     assert "openai_api_key" not in stored["payload"]
 
@@ -949,3 +992,241 @@ class _FlakySession:
 class _FlakyResult:
     def consume(self):
         return None
+
+
+def test_search_hybrid_fuses_ranks_and_forwards_doc_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    embeddings = _Embeddings()
+    seen: dict = {}
+    sparse_seen: dict = {}
+    raw = [
+        {"score": 0.9, "payload": {"text": "甲", "chunk_id": "a", "source": "a.md"}},
+        {"score": 0.5, "payload": {"text": "乙", "chunk_id": "b", "source": "b.md"}},
+    ]
+    pipeline, calls = _search_pipeline(monkeypatch, embeddings, raw=raw, seen=seen)
+
+    def sparse_ready() -> bool:
+        calls.append("sparse_ready")
+        return True
+
+    def search_sparse(indices, values, *, top_k: int = 5, doc_id: str | None = None, name: str = "masskb_chunks"):
+        calls.append("search_sparse")
+        assert name == "masskb_chunks"
+        sparse_seen["indices"] = list(indices)
+        sparse_seen["values"] = list(values)
+        sparse_seen["top_k"] = top_k
+        sparse_seen["doc_id"] = doc_id
+        return [
+            {"score": 3.0, "payload": {"text": "乙", "chunk_id": "b", "source": "b.md"}},
+            {"score": 1.0, "payload": {"text": "丙", "chunk_id": "c", "source": "c.md"}},
+        ]
+
+    pipeline.vector_store.sparse_ready = sparse_ready
+    pipeline.vector_store.search_sparse = search_sparse
+
+    result = pipeline.search("质量", top_k=5, doc_id="doc-9", hybrid=True)
+    pipeline.close()
+
+    assert embeddings.probes == ["质量"]
+    assert seen["doc_id"] == "doc-9"
+    assert seen["top_k"] == candidate_limit(5)
+    assert sparse_seen["doc_id"] == "doc-9"
+    assert sparse_seen["top_k"] == candidate_limit(5)
+    assert sparse_seen["indices"] == list(encode_text("质量")[0])
+    assert [hit.chunk_id for hit in result.hits] == ["b", "a", "c"]
+    assert result.mode == "hybrid"
+    assert result.score_kind == "rrf"
+    assert result.hybrid.ok is True
+    assert result.hybrid.skipped is False
+    assert result.hybrid.rrf_k == RRF_K
+    assert result.hybrid.candidate_k == candidate_limit(5)
+    assert result.hits[0].dense_rank == 2
+    assert result.hits[0].sparse_rank == 1
+    assert result.hits[0].dense_score == 0.5
+    assert result.hits[0].sparse_score == 3.0
+    assert result.hits[0].score == pytest.approx(1 / (RRF_K + 2) + 1 / (RRF_K + 1))
+    assert result.hits[2].dense_rank is None
+    assert result.hits[2].sparse_rank == 2
+    assert result.answer.skipped is True
+    assert "answer" not in calls
+
+
+def test_search_hybrid_sparse_failure_keeps_dense_hits(monkeypatch: pytest.MonkeyPatch) -> None:
+    raw = [{"score": 0.4, "payload": {"text": "原文", "chunk_id": "c", "source": "a.md"}}]
+    pipeline, calls = _search_pipeline(monkeypatch, _Embeddings(), raw=raw)
+    pipeline.vector_store.sparse_ready = lambda: True
+
+    def search_sparse(*_args, **_kwargs):
+        calls.append("search_sparse")
+        raise RuntimeError("sparse down")
+
+    pipeline.vector_store.search_sparse = search_sparse
+
+    result = pipeline.search("质量", hybrid=True)
+    pipeline.close()
+
+    assert result.hits[0].text == "原文"
+    assert result.hits[0].score == 0.4
+    assert result.score_kind == "cosine"
+    assert result.mode == "hybrid"
+    assert result.hybrid.ok is False
+    assert result.hybrid.error == "RuntimeError: sparse down"
+    assert result.hits[0].sparse_score is None
+    assert "search_sparse" in calls
+
+
+def test_search_hybrid_missing_slot_does_not_query_sparse(monkeypatch: pytest.MonkeyPatch) -> None:
+    raw = [{"score": 0.4, "payload": {"text": "原文", "chunk_id": "c"}}]
+    pipeline, calls = _search_pipeline(monkeypatch, _Embeddings(), raw=raw)
+    pipeline.vector_store.sparse_ready = lambda: False
+
+    result = pipeline.search("质量", hybrid=True)
+    pipeline.close()
+
+    assert result.hybrid.ok is False
+    assert "bm25" in result.hybrid.error
+    assert result.score_kind == "cosine"
+    assert "search_sparse" not in calls
+
+
+def test_search_hybrid_empty_tokens_keep_cosine(monkeypatch: pytest.MonkeyPatch) -> None:
+    raw = [{"score": 0.4, "payload": {"text": "原文", "chunk_id": "c"}}]
+    pipeline, calls = _search_pipeline(monkeypatch, _Embeddings(), raw=raw)
+
+    result = pipeline.search("a", hybrid=True)
+    pipeline.close()
+
+    assert result.mode == "hybrid"
+    assert result.score_kind == "cosine"
+    assert result.hybrid.ok is True
+    assert result.hybrid.skipped is False
+    assert result.hybrid.error is None
+    assert result.hits[0].score == 0.4
+    assert "search_sparse" not in calls
+    assert "sparse_ready" not in calls
+
+
+def test_search_hybrid_empty_dense_skips_sparse(monkeypatch: pytest.MonkeyPatch) -> None:
+    pipeline, calls = _search_pipeline(monkeypatch, _Embeddings(), raw=[])
+
+    result = pipeline.search("质量", hybrid=True)
+    pipeline.close()
+
+    assert result.hits == ()
+    assert result.mode == "hybrid"
+    assert result.hybrid.skipped is True
+    assert result.graph.skipped is True
+    assert "search_sparse" not in calls
+    assert "sparse_ready" not in calls
+
+
+def test_search_answer_cites_only_hit_ids(monkeypatch: pytest.MonkeyPatch) -> None:
+    raw = [
+        {
+            "score": 0.4,
+            "payload": {"text": "原文", "chunk_id": "c1", "source": "a.md"},
+        }
+    ]
+    pipeline, calls = _search_pipeline(
+        monkeypatch,
+        _Embeddings(),
+        raw=raw,
+        neighbors={"c1": ("prev", "next")},
+    )
+    seen: dict = {}
+
+    def complete(system: str, user: str) -> str:
+        calls.append("answer")
+        seen["system"] = system
+        seen["user"] = user
+        return (
+            '{"abstain": false, "answer": "原文说明了这一点",'
+            ' "citations": ["c1", "next", "c1"]}'
+        )
+
+    pipeline._complete_answer = complete
+
+    result = pipeline.search("  质量  ", answer=True)
+    pipeline.close()
+
+    assert calls[-1] == "answer"
+    assert result.query == "  质量  "
+    assert "  质量  " in seen["user"]
+    assert "chunk_id: c1" in seen["user"]
+    assert "text: 原文" in seen["user"]
+    assert "next" not in seen["user"]
+    assert "prev" not in seen["user"]
+    assert result.hits[0].next_chunk_id == "next"
+    assert result.answer.ok is True
+    assert result.answer.skipped is False
+    assert result.answer.text == "原文说明了这一点"
+    assert result.answer.citations == ("c1",)
+    assert result.answer.model == "gpt-4o-mini"
+    assert result.answer.error is None
+
+
+def test_search_answer_uncited_clears_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    raw = [{"score": 0.4, "payload": {"text": "原文", "chunk_id": "c1"}}]
+    pipeline, _calls = _search_pipeline(monkeypatch, _Embeddings(), raw=raw)
+    pipeline._complete_answer = lambda _system, _user: (
+        '{"abstain": false, "answer": "秘密", "citations": ["other"]}'
+    )
+
+    result = pipeline.search("质量", answer=True)
+    pipeline.close()
+
+    assert result.hits[0].text == "原文"
+    assert result.answer.ok is False
+    assert result.answer.error == "uncited"
+    assert result.answer.text is None
+    assert result.answer.citations == ()
+
+
+def test_search_answer_invalid_json_and_chat_error_keep_hits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw = [{"score": 0.4, "payload": {"text": "原文", "chunk_id": "c1"}}]
+    invalid, _calls = _search_pipeline(monkeypatch, _Embeddings(), raw=raw)
+    invalid._complete_answer = lambda _system, _user: "不是 JSON"
+    invalid_result = invalid.search("质量", answer=True)
+    assert invalid_result.answer.error == "invalid_json"
+    assert invalid_result.answer.text is None
+    assert invalid_result.hits[0].text == "原文"
+    invalid.close()
+
+    failed, _calls = _search_pipeline(monkeypatch, _Embeddings(), raw=raw)
+
+    def boom(_system: str, _user: str) -> str:
+        raise RuntimeError("timeout")
+
+    failed._complete_answer = boom
+    failed_result = failed.search("质量", answer=True)
+    assert failed_result.answer.ok is False
+    assert failed_result.answer.error == "RuntimeError: timeout"
+    assert failed_result.hits[0].chunk_id == "c1"
+    failed.close()
+
+
+def test_search_answer_no_hits_does_not_call_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    pipeline, calls = _search_pipeline(monkeypatch, _Embeddings(), raw=[])
+
+    result = pipeline.search("质量", answer=True)
+    pipeline.close()
+
+    assert result.answer.error == "no_hits"
+    assert result.answer.text is None
+    assert result.answer.model is None
+    assert "answer" not in calls
+
+
+def test_search_answer_off_does_not_construct_openai(monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(**_kwargs):
+        raise AssertionError("不应创建 OpenAI")
+
+    monkeypatch.setattr("masskb.answer.OpenAI", boom)
+    pipeline, calls = _search_pipeline(monkeypatch, _Embeddings(), raw=[])
+
+    result = pipeline.search("质量")
+    pipeline.close()
+
+    assert result.answer.skipped is True
+    assert "answer" not in calls
