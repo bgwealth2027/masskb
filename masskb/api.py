@@ -40,6 +40,7 @@ class SearchRequest(BaseModel):
     answer: bool = False
     rerank: bool = False
     rewrite: bool = False
+    graph_hops: bool = False
 
     @field_validator("query")
     @classmethod
@@ -67,6 +68,7 @@ class AskRequest(BaseModel):
     hybrid: bool = False
     rewrite: bool = False
     rerank: bool = False
+    graph_hops: bool = False
     max_steps: int = Field(default=MAX_AGENT_STEPS, ge=1, le=MAX_AGENT_STEPS, strict=True)
 
     @field_validator("query")
@@ -165,6 +167,7 @@ def create_app(pipeline: RetrievalPipeline | None = None) -> FastAPI:
                     answer=body.answer,
                     rerank=body.rerank,
                     rewrite=body.rewrite,
+                    graph_hops=body.graph_hops,
                 )
         except ValueError as exc:
             return UTF8JSONResponse({"detail": str(exc)}, status_code=422)
@@ -184,6 +187,7 @@ def create_app(pipeline: RetrievalPipeline | None = None) -> FastAPI:
                     hybrid=body.hybrid,
                     rewrite=body.rewrite,
                     rerank=body.rerank,
+                    graph_hops=body.graph_hops,
                     max_steps=body.max_steps,
                 )
         except ValueError as exc:

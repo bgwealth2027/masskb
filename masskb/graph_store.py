@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 from neo4j import Driver, GraphDatabase
@@ -162,13 +163,99 @@ RETURN c.chunk_id AS chunk_id,
        nxt.chunk_id AS next_chunk_id
 """
 
+# 每个种子的支路各自 LIMIT，避免热门概念把读查询撑开。数字是常量，不是用户输入。
+GRAPH_HOP_CANDIDATES = 8
+_RELATED_CHUNKS = """
+UNWIND $chunk_ids AS cid
+MATCH (seed:Chunk {chunk_id: cid})
+CALL {
+  WITH seed
+  MATCH (seed)-[:NEXT_CHUNK]-(near:Chunk)
+  WHERE ($doc_id IS NULL OR near.doc_id = $doc_id)
+    AND NOT near.chunk_id IN $chunk_ids
+  WITH near
+  ORDER BY near.chunk_id ASC
+  LIMIT 2
+  RETURN near.chunk_id AS chunk_id, 'next_chunk' AS via, 0 AS shared
+  UNION ALL
+  WITH seed
+  MATCH (seed)-[:MENTIONS]->(entity:Person)<-[:MENTIONS]-(other:Chunk)
+  WHERE other.chunk_id <> seed.chunk_id
+    AND NOT other.chunk_id IN $chunk_ids
+    AND ($doc_id IS NULL OR other.doc_id = $doc_id)
+  WITH other
+  ORDER BY other.chunk_id ASC
+  LIMIT 8
+  RETURN other.chunk_id AS chunk_id, 'person' AS via, 1 AS shared
+  UNION ALL
+  WITH seed
+  MATCH (seed)-[:MENTIONS]->(entity:Concept)<-[:MENTIONS]-(other:Chunk)
+  WHERE other.chunk_id <> seed.chunk_id
+    AND NOT other.chunk_id IN $chunk_ids
+    AND ($doc_id IS NULL OR other.doc_id = $doc_id)
+  WITH other
+  ORDER BY other.chunk_id ASC
+  LIMIT 8
+  RETURN other.chunk_id AS chunk_id, 'concept' AS via, 1 AS shared
+}
+RETURN chunk_id, via, shared
+"""
+
 
 class GraphStoreError(RuntimeError):
     """骨架读回的前后邻不唯一。"""
 
 
+@dataclass(frozen=True)
+class RelatedChunk:
+    """一条图扩展候选。`mention_count` 是人物边与概念边条数之和。"""
+
+    chunk_id: str
+    mention_count: int
+    via_next: bool
+
+
+def rank_related_rows(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    seeds: Sequence[str],
+    limit: int = GRAPH_HOP_CANDIDATES,
+) -> tuple[RelatedChunk, ...]:
+    """合并同一分块的多行，丢掉种子，再按提及数、前后边和 chunk_id 排序。"""
+    seed_set = set(seeds)
+    merged: dict[str, list[int | bool]] = {}
+    order: list[str] = []
+    for row in rows:
+        chunk_id = row.get("chunk_id")
+        if not isinstance(chunk_id, str) or chunk_id == "" or chunk_id in seed_set:
+            continue
+        via = row.get("via")
+        if chunk_id not in merged:
+            merged[chunk_id] = [0, False]
+            order.append(chunk_id)
+        if via == "next_chunk":
+            merged[chunk_id][1] = True
+        elif via in {"person", "concept"}:
+            shared = row.get("shared")
+            if isinstance(shared, int) and not isinstance(shared, bool) and shared > 0:
+                add = shared
+            else:
+                add = 1
+            merged[chunk_id][0] = int(merged[chunk_id][0]) + add
+    ranked = [
+        RelatedChunk(
+            chunk_id=chunk_id,
+            mention_count=int(merged[chunk_id][0]),
+            via_next=bool(merged[chunk_id][1]),
+        )
+        for chunk_id in order
+    ]
+    ranked.sort(key=lambda item: (-item.mention_count, 0 if item.via_next else 1, item.chunk_id))
+    return tuple(ranked[:limit])
+
+
 class GraphStore:
-    """Neo4j 薄封装：连通性检查、文档骨架，以及可选的人物/概念提及。"""
+    """Neo4j 薄封装：连通性检查、文档骨架、可选提及，以及只读的相关分块。"""
 
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()
@@ -363,6 +450,40 @@ class GraphStore:
         with self.driver.session() as session:
             session.execute_write(work)
         return len(persons), len(concepts), len(rows)
+
+    def related_chunks(
+        self,
+        chunk_ids: Sequence[str],
+        *,
+        doc_id: str | None,
+    ) -> tuple[RelatedChunk, ...]:
+        """只读前后块和同人物、同概念的其他分块。空输入不打开驱动。
+
+        不建约束，也不写节点。排序和 8 条上限在进程内完成。
+        """
+        unique: list[str] = []
+        seen: set[str] = set()
+        for chunk_id in chunk_ids:
+            if chunk_id not in seen:
+                seen.add(chunk_id)
+                unique.append(chunk_id)
+        if not unique:
+            return ()
+
+        def work(tx: Any) -> list[dict[str, Any]]:
+            result = tx.run(_RELATED_CHUNKS, chunk_ids=unique, doc_id=doc_id)
+            return [
+                {
+                    "chunk_id": record["chunk_id"],
+                    "via": record["via"],
+                    "shared": record["shared"],
+                }
+                for record in result
+            ]
+
+        with self.driver.session() as session:
+            rows = session.execute_read(work)
+        return rank_related_rows(rows, seeds=unique)
 
     def close(self) -> None:
         if self._driver is not None:

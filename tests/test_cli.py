@@ -408,6 +408,7 @@ def test_search_prints_json_and_closes(
             answer: bool = False,
             rerank: bool = False,
             rewrite: bool = False,
+            graph_hops: bool = False,
         ) -> SearchResult:
             seen["query"] = query
             seen["top_k"] = top_k
@@ -416,6 +417,7 @@ def test_search_prints_json_and_closes(
             seen["answer"] = answer
             seen["rerank"] = rerank
             seen["rewrite"] = rewrite
+            seen["graph_hops"] = graph_hops
             return SearchResult(
                 query=query,
                 top_k=top_k,
@@ -471,6 +473,7 @@ def test_search_prints_json_and_closes(
                 "sparse_score": None,
                 "dense_rank": None,
                 "sparse_rank": None,
+                "graph_via": None,
             }
         ],
         "graph": {"ok": True, "skipped": False, "error": None},
@@ -504,6 +507,13 @@ def test_search_prints_json_and_closes(
             "model": None,
             "error": None,
         },
+        "graph_hops": {
+            "ok": True,
+            "skipped": True,
+            "error": None,
+            "found": None,
+            "expanded": None,
+        },
     }
     assert seen == {
         "query": "质量",
@@ -513,6 +523,7 @@ def test_search_prints_json_and_closes(
         "answer": False,
         "rerank": False,
         "rewrite": False,
+        "graph_hops": False,
     }
     assert closed == ["closed"]
 
@@ -532,6 +543,7 @@ def test_search_empty_hits_exit_zero(
             answer: bool = False,
             rerank: bool = False,
             rewrite: bool = False,
+            graph_hops: bool = False,
         ) -> SearchResult:
             return SearchResult(
                 query=query,
@@ -592,8 +604,41 @@ def test_search_help(capsys: pytest.CaptureFixture[str]) -> None:
     assert "--answer" in out
     assert "--rerank" in out
     assert "--rewrite" in out
+    assert "--graph-hops" in out
     assert "--max-steps" not in out
     assert "chunk_id" in out
+
+
+def test_search_graph_hops_flag_is_forwarded(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    seen: dict[str, object] = {}
+
+    class FakePipeline:
+        def search(self, query: str, **kwargs: object) -> SearchResult:
+            seen["query"] = query
+            seen.update(kwargs)
+            return SearchResult(
+                query=query,
+                top_k=5,
+                collection="masskb_chunks",
+                embedding_model="embed-test",
+                doc_id=None,
+                hits=(),
+                graph=GraphStatus(ok=True, skipped=True),
+            )
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr("masskb.__main__.RetrievalPipeline", FakePipeline)
+
+    assert main(["search", "质量", "--graph-hops"]) == 0
+    assert seen["query"] == "质量"
+    assert seen["graph_hops"] is True
+    assert seen["rerank"] is False
+    assert capsys.readouterr().err == ""
 
 
 def test_search_answer_failure_prints_json_and_exits_zero(
@@ -1083,6 +1128,7 @@ def test_ask_prints_json_and_closes(
             hybrid: bool = False,
             rewrite: bool = False,
             rerank: bool = False,
+            graph_hops: bool = False,
             max_steps: int = 3,
         ) -> AskResult:
             seen["query"] = query
@@ -1091,6 +1137,7 @@ def test_ask_prints_json_and_closes(
             seen["hybrid"] = hybrid
             seen["rewrite"] = rewrite
             seen["rerank"] = rerank
+            seen["graph_hops"] = graph_hops
             seen["max_steps"] = max_steps
             return expected
 
@@ -1116,6 +1163,7 @@ def test_ask_prints_json_and_closes(
         "hybrid": False,
         "rewrite": False,
         "rerank": False,
+        "graph_hops": False,
         "max_steps": 3,
     }
     assert closed == ["closed"]
@@ -1150,6 +1198,7 @@ def test_ask_forwards_flags(
                 "--hybrid",
                 "--rewrite",
                 "--rerank",
+                "--graph-hops",
                 "--max-steps",
                 "2",
             ]
@@ -1163,6 +1212,7 @@ def test_ask_forwards_flags(
         "hybrid": True,
         "rewrite": True,
         "rerank": True,
+        "graph_hops": True,
         "max_steps": 2,
     }
     assert capsys.readouterr().err == ""
@@ -1259,6 +1309,7 @@ def test_ask_help_and_rejected_flags(capsys: pytest.CaptureFixture[str]) -> None
     assert "--hybrid" in out
     assert "--rewrite" in out
     assert "--rerank" in out
+    assert "--graph-hops" in out
     assert "--max-steps" in out
     assert "--answer" not in out
 

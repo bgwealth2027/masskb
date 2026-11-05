@@ -45,6 +45,7 @@ def _hit(**overrides: object) -> dict[str, object]:
         "sparse_score": None,
         "dense_rank": None,
         "sparse_rank": None,
+        "graph_via": None,
     }
     payload.update(overrides)
     return payload
@@ -89,6 +90,13 @@ def _search_body(**overrides: object) -> dict[str, object]:
             "text": None,
             "model": None,
             "error": None,
+        },
+        "graph_hops": {
+            "ok": True,
+            "skipped": True,
+            "error": None,
+            "found": None,
+            "expanded": None,
         },
     }
     payload.update(overrides)
@@ -135,6 +143,7 @@ def _ask_body(**overrides: object) -> dict[str, object]:
         "hybrid": False,
         "rewrite": False,
         "rerank": False,
+        "graph_hops": False,
     }
     payload.update(overrides)
     return payload
@@ -196,6 +205,7 @@ def test_happy_path_requests_and_parsed_results() -> None:
         "answer": False,
         "rerank": False,
         "rewrite": False,
+        "graph_hops": False,
     }
     assert "质量".encode() in seen[1][2]
     assert b"\\u8d28" not in seen[1][2]
@@ -214,6 +224,7 @@ def test_happy_path_requests_and_parsed_results() -> None:
         "hybrid": False,
         "rewrite": False,
         "rerank": False,
+        "graph_hops": False,
         "max_steps": 3,
     }
     assert "answer" not in ask_body
@@ -242,6 +253,7 @@ def test_search_and_ask_keep_query_and_flags() -> None:
             answer=True,
             rerank=True,
             rewrite=True,
+            graph_hops=True,
         )
         answered = kb.ask(
             " 质量 ",
@@ -250,6 +262,7 @@ def test_search_and_ask_keep_query_and_flags() -> None:
             hybrid=True,
             rewrite=True,
             rerank=True,
+            graph_hops=True,
             max_steps=2,
         )
 
@@ -261,6 +274,7 @@ def test_search_and_ask_keep_query_and_flags() -> None:
         "answer": True,
         "rerank": True,
         "rewrite": True,
+        "graph_hops": True,
     }
     assert found.query == " 质量 "
     assert "answer" not in seen[1]
@@ -271,6 +285,7 @@ def test_search_and_ask_keep_query_and_flags() -> None:
         "hybrid": True,
         "rewrite": True,
         "rerank": True,
+        "graph_hops": True,
         "max_steps": 2,
     }
     assert answered.query == " 质量 "
@@ -855,6 +870,7 @@ def test_asgi_round_trip_matches_server_json(tmp_path: Path) -> None:
         "answer": False,
         "rerank": False,
         "rewrite": False,
+        "graph_hops": False,
     }
     assert pipeline.seen_ask == {
         "query": "质量",
@@ -863,6 +879,7 @@ def test_asgi_round_trip_matches_server_json(tmp_path: Path) -> None:
         "hybrid": True,
         "rewrite": True,
         "rerank": True,
+        "graph_hops": False,
         "max_steps": 2,
     }
     assert "answer" not in pipeline.seen_ask

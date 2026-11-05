@@ -25,6 +25,7 @@ def test_prompt_contains_question_and_observation_without_neighbors() -> None:
         hybrid=False,
         rewrite=True,
         rerank=False,
+        graph_hops=True,
     )
 
     assert system == SYSTEM_PROMPT
@@ -40,6 +41,9 @@ def test_prompt_contains_question_and_observation_without_neighbors() -> None:
     assert "prev_chunk_id" not in user
     assert "hybrid：false" in user
     assert "rewrite：true" in user
+    assert "rerank：false" in user
+    assert "graph_hops：true" in user
+    assert "graph_hops" in system
     assert "doc_id：null" in user
 
 
@@ -66,6 +70,7 @@ def test_search_observation_hides_neighbor_ids_and_textless_hits() -> None:
         hybrid=skipped,
         rerank=skipped,
         graph=SimpleNamespace(ok=False, skipped=False, error="bolt"),
+        graph_hops=SimpleNamespace(ok=True, skipped=True, error=None),
     )
 
     text = format_search_observation("质量", result)
@@ -75,6 +80,7 @@ def test_search_observation_hides_neighbor_ids_and_textless_hits() -> None:
     assert "改写后" in text
     assert "bolt" in text
     assert "score_kind: cosine" in text
+    assert "graph_hops: ok=true skipped=true error=null" in text
     assert "prev_chunk_id" not in text
     assert "prev-id" not in text
     assert "next-id" not in text

@@ -230,6 +230,7 @@ def cmd_search(args: argparse.Namespace) -> int:
                 answer=args.answer,
                 rerank=args.rerank,
                 rewrite=args.rewrite,
+                graph_hops=args.graph_hops,
             )
         except Exception as exc:  # noqa: BLE001 — CLI 把检索失败转成退出码
             print(f"[FAIL] {exc}", file=sys.stderr)
@@ -252,6 +253,7 @@ def cmd_ask(args: argparse.Namespace) -> int:
                 hybrid=args.hybrid,
                 rewrite=args.rewrite,
                 rerank=args.rerank,
+                graph_hops=args.graph_hops,
                 max_steps=args.max_steps,
             )
         except Exception as exc:  # noqa: BLE001 — CLI 把失败转成退出码
@@ -349,6 +351,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="用 LLM_MODEL 在检索前把查询改写成一条检索文本；默认关闭",
     )
+    search.add_argument(
+        "--graph-hops",
+        action="store_true",
+        help="沿已有前后边和人物/概念提及最多替换 1 条命中；默认关闭",
+    )
     search.set_defaults(func=cmd_search)
 
     ask = sub.add_parser(
@@ -385,6 +392,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--rerank",
         action="store_true",
         help="每次 search 对已截断的 top_k 做 listwise 重排；默认关闭",
+    )
+    ask.add_argument(
+        "--graph-hops",
+        action="store_true",
+        help="每次 search 沿已有前后边和人物/概念提及最多替换 1 条命中；默认关闭",
     )
     ask.add_argument(
         "--max-steps",

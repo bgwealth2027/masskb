@@ -9,7 +9,12 @@ from qdrant_client.models import Distance, Modifier, PayloadSchemaType, SparseVe
 
 from masskb.config import Settings
 from masskb.entities import EntityMention
-from masskb.graph_store import GraphStore, GraphStoreError
+from masskb.graph_store import (
+    GRAPH_HOP_CANDIDATES,
+    GraphStore,
+    GraphStoreError,
+    rank_related_rows,
+)
 from masskb.ingest import Chunk, Document
 from masskb.vector_store import (
     SEARCH_PAYLOAD_FIELDS,
@@ -215,6 +220,10 @@ class _RecordingQdrant:
     def query_points(self, **kwargs):
         self.calls.append(("query_points", kwargs))
         return getattr(self, "query_response", SimpleNamespace(points=[]))
+
+    def retrieve(self, **kwargs):
+        self.calls.append(("retrieve", kwargs))
+        return getattr(self, "retrieve_points", [])
 
 
 def _bind_qdrant(monkeypatch: pytest.MonkeyPatch, client: _RecordingQdrant) -> VectorStore:
@@ -871,3 +880,96 @@ def test_replace_mentions_rejects_unknown_kind(monkeypatch: pytest.MonkeyPatch) 
         store.replace_mentions("doc-1", ["c1"], [mention])
 
     assert store._driver is None
+
+
+def test_related_chunks_reads_existing_edges(monkeypatch: pytest.MonkeyPatch) -> None:
+    driver = _GraphDriver(
+        rows=[
+            {"chunk_id": "b", "via": "person", "shared": 1},
+            {"chunk_id": "b", "via": "next_chunk", "shared": 0},
+            {"chunk_id": "a", "via": "concept", "shared": 1},
+            {"chunk_id": "a", "via": "concept", "shared": 1},
+            {"chunk_id": 'seed"1', "via": "person", "shared": 1},
+        ]
+    )
+    store = _bind_graph(monkeypatch, driver)
+
+    found = store.related_chunks(['seed"1', 'seed"1'], doc_id='doc"1')
+
+    assert driver.session_obj.read_calls == 1
+    assert driver.session_obj.write_calls == 0
+    query, params = driver.session_obj.queries[0]
+    assert "NEXT_CHUNK" in query
+    assert "MENTIONS" in query
+    assert ":Person" in query
+    assert ":Concept" in query
+    assert "ORDER BY" in query
+    assert "LIMIT 2" in query
+    assert "LIMIT 8" in query
+    assert "apoc" not in query.lower()
+    assert params == {"chunk_ids": ['seed"1'], "doc_id": 'doc"1'}
+    assert 'doc"1' not in query
+    assert 'seed"1' not in query
+    assert [(item.chunk_id, item.mention_count, item.via_next) for item in found] == [
+        ("a", 2, False),
+        ("b", 1, True),
+    ]
+
+
+def test_rank_related_rows_caps_candidates() -> None:
+    rows = [
+        {"chunk_id": f"c{index:02d}", "via": "person", "shared": 1} for index in range(10)
+    ]
+    ranked = rank_related_rows(rows, seeds=["c00"])
+
+    assert len(ranked) == GRAPH_HOP_CANDIDATES
+    assert ranked[0].chunk_id == "c01"
+    assert all(item.chunk_id != "c00" for item in ranked)
+
+
+def test_related_chunks_empty_does_not_open_driver(monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(*_args, **_kwargs):
+        raise AssertionError("不应连接 Neo4j")
+
+    monkeypatch.setattr("masskb.graph_store.GraphDatabase.driver", boom)
+    store = GraphStore(Settings())
+
+    assert store.related_chunks([], doc_id=None) == ()
+    assert store._driver is None
+
+
+def test_get_by_chunk_ids_retrieves_payloads(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = _RecordingQdrant()
+    client.retrieve_points = [
+        SimpleNamespace(payload={"chunk_id": "c1", "text": "甲", "doc_id": "d"}),
+        SimpleNamespace(payload=None),
+        SimpleNamespace(payload={"text": "没有 id"}),
+        SimpleNamespace(payload={"chunk_id": "c1", "text": "重复"}),
+    ]
+    store = _bind_qdrant(monkeypatch, client)
+
+    found = store.get_by_chunk_ids(["c1", "c1", "c2"])
+
+    retrieve = [kwargs for name, kwargs in client.calls if name == "retrieve"]
+    assert len(retrieve) == 1
+    assert retrieve[0]["collection_name"] == "masskb_chunks"
+    assert retrieve[0]["ids"] == [point_id_for_chunk("c1"), point_id_for_chunk("c2")]
+    assert retrieve[0]["with_payload"] == list(SEARCH_PAYLOAD_FIELDS)
+    assert retrieve[0]["with_vectors"] is False
+    assert found == {"c1": {"chunk_id": "c1", "text": "甲", "doc_id": "d"}}
+    forbidden = {
+        "create_collection",
+        "upsert",
+        "delete",
+        "delete_collection",
+        "create_payload_index",
+        "query_points",
+    }
+    assert forbidden.isdisjoint(_names(client))
+
+
+def test_get_by_chunk_ids_empty_does_not_open_client() -> None:
+    store = VectorStore(Settings())
+
+    assert store.get_by_chunk_ids([]) == {}
+    assert store._client is None

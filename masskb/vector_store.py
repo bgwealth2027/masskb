@@ -52,7 +52,7 @@ SEARCH_PAYLOAD_FIELDS = (
 
 
 class VectorStore:
-    """Qdrant 薄封装：连通性检查、建集合、批量 upsert、按文档删除、近邻与稀疏查询。"""
+    """Qdrant 薄封装：连通性检查、建集合、批量 upsert、按文档删除、近邻、稀疏查询和按 id 读 payload。"""
 
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()
@@ -205,6 +205,35 @@ class VectorStore:
             with_vectors=False,
         )
         return _hits_from_response(response)
+
+    def get_by_chunk_ids(
+        self,
+        chunk_ids: Sequence[str],
+        *,
+        name: str = DEFAULT_COLLECTION,
+    ) -> dict[str, dict[str, Any]]:
+        """按 chunk_id 读取 payload。不创建集合，也不写入。空输入不打开客户端。"""
+        unique: list[str] = []
+        seen: set[str] = set()
+        for chunk_id in chunk_ids:
+            if chunk_id not in seen:
+                seen.add(chunk_id)
+                unique.append(chunk_id)
+        if not unique:
+            return {}
+        points = self.client.retrieve(
+            collection_name=name,
+            ids=[point_id_for_chunk(chunk_id) for chunk_id in unique],
+            with_payload=list(SEARCH_PAYLOAD_FIELDS),
+            with_vectors=False,
+        )
+        found: dict[str, dict[str, Any]] = {}
+        for point in points:
+            payload = dict(getattr(point, "payload", None) or {})
+            chunk_id = payload.get("chunk_id")
+            if isinstance(chunk_id, str) and chunk_id and chunk_id not in found:
+                found[chunk_id] = payload
+        return found
 
     def sparse_ready(self, name: str = DEFAULT_COLLECTION) -> bool:
         """集合里是否已有 bm25 槽。只读，不创建，也不改配置。"""

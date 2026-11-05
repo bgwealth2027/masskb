@@ -1,4 +1,4 @@
-"""检索编排：向量与稀疏写入、文档骨架，以及可选的查询改写、混合检索、重排、引用回答和有界工具循环。"""
+"""检索编排：向量与稀疏写入、文档骨架，以及可选的查询改写、混合检索、图扩展、重排、引用回答和有界工具循环。"""
 
 from __future__ import annotations
 
@@ -34,7 +34,7 @@ from masskb.entities import (
     parse_entity_response,
 )
 from masskb.fusion import RRF_K, FusedHit, candidate_limit, reciprocal_rank_fusion
-from masskb.graph_store import GraphStore
+from masskb.graph_store import GraphStore, RelatedChunk
 from masskb.ingest import (
     DEFAULT_CHUNK_OVERLAP,
     DEFAULT_CHUNK_SIZE,
@@ -89,6 +89,7 @@ class SearchHit:
     sparse_score: float | None = None
     dense_rank: int | None = None
     sparse_rank: int | None = None
+    graph_via: str | None = None
 
 
 @dataclass(frozen=True)
@@ -119,6 +120,21 @@ class RerankStatus:
     skipped: bool
     error: str | None = None
     model: str | None = None
+
+
+@dataclass(frozen=True)
+class GraphHopStatus:
+    """这次有没有沿已有边扩展命中。`skipped` 表示没有去做。
+
+    `found` 是排序后的候选数，最多 8。`expanded` 是进入命中列表的条数，为 0 或 1。
+    跳过、没有种子或失败时，这两个计数是 None。
+    """
+
+    ok: bool
+    skipped: bool
+    error: str | None = None
+    found: int | None = None
+    expanded: int | None = None
 
 
 @dataclass(frozen=True)
@@ -153,6 +169,7 @@ class SearchResult:
     answer: AnswerStatus | None = None
     rerank: RerankStatus | None = None
     rewrite: RewriteStatus | None = None
+    graph_hops: GraphHopStatus | None = None
 
     def __post_init__(self) -> None:
         if self.hybrid is None:
@@ -163,6 +180,8 @@ class SearchResult:
             object.__setattr__(self, "rerank", _skipped_rerank())
         if self.rewrite is None:
             object.__setattr__(self, "rewrite", _skipped_rewrite())
+        if self.graph_hops is None:
+            object.__setattr__(self, "graph_hops", _skipped_graph_hops())
 
 
 @dataclass(frozen=True)
@@ -193,6 +212,7 @@ class AskResult:
     hybrid: bool
     rewrite: bool
     rerank: bool
+    graph_hops: bool = False
 
 
 @dataclass(frozen=True)
@@ -241,6 +261,7 @@ def _ask_result(
     hybrid: bool,
     rewrite: bool,
     rerank: bool,
+    graph_hops: bool,
 ) -> AskResult:
     return AskResult(
         query=query,
@@ -254,6 +275,7 @@ def _ask_result(
         hybrid=hybrid,
         rewrite=rewrite,
         rerank=rerank,
+        graph_hops=graph_hops,
     )
 
 
@@ -305,6 +327,61 @@ def _skipped_rewrite() -> RewriteStatus:
     return RewriteStatus(ok=True, skipped=True, text=None, model=None, error=None)
 
 
+def _skipped_graph_hops() -> GraphHopStatus:
+    return GraphHopStatus(ok=True, skipped=True, error=None)
+
+
+def _graph_hop_error(exc: Exception) -> GraphHopStatus:
+    return GraphHopStatus(
+        ok=False,
+        skipped=False,
+        error=f"{type(exc).__name__}: {exc}",
+    )
+
+
+def _graph_via(item: RelatedChunk) -> str:
+    if item.mention_count > 0 and item.via_next:
+        return "mention+next_chunk"
+    if item.mention_count > 0:
+        return "mention"
+    return "next_chunk"
+
+
+def _first_graph_payload(
+    related: Sequence[RelatedChunk],
+    payloads: dict[str, dict[str, Any]],
+    doc_id: str | None,
+) -> tuple[RelatedChunk, dict[str, Any]] | None:
+    for item in related:
+        payload = payloads.get(item.chunk_id)
+        if payload is None:
+            continue
+        text = payload.get("text")
+        if not isinstance(text, str) or text == "":
+            continue
+        if doc_id is not None and payload.get("doc_id") != doc_id:
+            continue
+        return item, payload
+    return None
+
+
+def _hit_from_payload(payload: dict[str, Any], item: RelatedChunk) -> SearchHit:
+    chunk_id = payload.get("chunk_id")
+    return SearchHit(
+        score=0.0,
+        text=payload.get("text"),
+        source=payload.get("source"),
+        chunk_id=chunk_id if isinstance(chunk_id, str) and chunk_id else item.chunk_id,
+        doc_id=payload.get("doc_id"),
+        index=payload.get("index"),
+        start=payload.get("start"),
+        end=payload.get("end"),
+        prev_chunk_id=None,
+        next_chunk_id=None,
+        graph_via=_graph_via(item),
+    )
+
+
 def _no_hits_rerank() -> RerankStatus:
     return RerankStatus(ok=True, skipped=False, error="no_hits", model=None)
 
@@ -328,6 +405,7 @@ def _copy_result(
     score_kind: str | None = None,
     rerank: RerankStatus | None = None,
     rewrite: RewriteStatus | None = None,
+    graph_hops: GraphHopStatus | None = None,
 ) -> SearchResult:
     return SearchResult(
         query=result.query,
@@ -343,6 +421,7 @@ def _copy_result(
         answer=result.answer if answer is None else answer,
         rerank=result.rerank if rerank is None else rerank,
         rewrite=result.rewrite if rewrite is None else rewrite,
+        graph_hops=result.graph_hops if graph_hops is None else graph_hops,
     )
 
 
@@ -381,6 +460,7 @@ def _fused_hit(hit: SearchHit, fused: FusedHit) -> SearchHit:
         sparse_score=fused.sparse_score,
         dense_rank=fused.dense_rank,
         sparse_rank=fused.sparse_rank,
+        graph_via=hit.graph_via,
     )
 
 
@@ -431,6 +511,7 @@ def _hit_with_score(hit: SearchHit, score: float) -> SearchHit:
         sparse_score=hit.sparse_score,
         dense_rank=hit.dense_rank,
         sparse_rank=hit.sparse_rank,
+        graph_via=hit.graph_via,
     )
 
 
@@ -454,6 +535,7 @@ def _hit_with_neighbors(
         sparse_score=hit.sparse_score,
         dense_rank=hit.dense_rank,
         sparse_rank=hit.sparse_rank,
+        graph_via=hit.graph_via,
     )
 
 
@@ -587,6 +669,7 @@ class RetrievalPipeline:
         answer: bool = False,
         rerank: bool = False,
         rewrite: bool = False,
+        graph_hops: bool = False,
     ) -> SearchResult:
         """用与入库相同的模型做近邻检索，再按 chunk_id 补前后邻。
 
@@ -597,9 +680,11 @@ class RetrievalPipeline:
         `rewrite` 为真时，改写发生在 embedding 和稀疏编码之前。失败时仍用原文检索。
         `SearchResult.query` 始终是用户原文。
         `hybrid` 为真时，在补邻之前用进程内 RRF 融合 bm25。
-        `rerank` 为真时，在已经截成 `top_k` 之后、补邻之前做 listwise 重排。
+        `graph_hops` 为真时，在截成 `top_k` 之后、重排之前沿已有边最多替换 1 条命中。
+        图扩展失败时仍返回向量命中。
+        `rerank` 为真时，在图扩展之后、补邻之前做 listwise 重排。
         `answer` 为真时，补邻之后才请求聊天，且只引用本次命中的 chunk_id。
-        重排和回答的提示词使用用户原文。四个开关默认关闭。
+        重排和回答的提示词使用用户原文。这些开关默认关闭。
         """
         _validate_search(query, top_k, doc_id)
         retrieval_text, rewrite_status = self._maybe_rewrite(query, enabled=rewrite)
@@ -624,7 +709,10 @@ class RetrievalPipeline:
                 rewrite=rewrite_status,
             )
             return self._maybe_answer(
-                self._maybe_rerank(result, enabled=rerank),
+                self._maybe_rerank(
+                    self._maybe_graph_hops(result, enabled=graph_hops),
+                    enabled=rerank,
+                ),
                 enabled=answer,
             )
         self.vector_store.require_compatible_collection(
@@ -661,7 +749,12 @@ class RetrievalPipeline:
                 rewrite=rewrite_status,
             )
         return self._maybe_answer(
-            self._attach_neighbors(self._maybe_rerank(result, enabled=rerank)),
+            self._attach_neighbors(
+                self._maybe_rerank(
+                    self._maybe_graph_hops(result, enabled=graph_hops),
+                    enabled=rerank,
+                )
+            ),
             enabled=answer,
         )
 
@@ -674,13 +767,14 @@ class RetrievalPipeline:
         hybrid: bool = False,
         rewrite: bool = False,
         rerank: bool = False,
+        graph_hops: bool = False,
         max_steps: int = MAX_AGENT_STEPS,
     ) -> AskResult:
         """用有界工具循环回答问题。默认不由 `search` 进入。
 
         每一步只接受一个 JSON 动作：`search`、`healthcheck` 或 `finish`。
-        `search` 转发调用方的 `top_k`、`doc_id`、`hybrid`、`rewrite`、`rerank`，
-        并固定 `answer=False`。引用只能来自本轮带正文的命中。
+        `search` 转发调用方的 `top_k`、`doc_id`、`hybrid`、`rewrite`、`rerank`、
+        `graph_hops`，并固定 `answer=False`。引用只能来自本轮带正文的命中。
         空白问题、非法 `top_k`、`doc_id` 或 `max_steps` 在第一次聊天前抛出 `ValueError`。
         缺 Key、聊天失败，以及 `search` 的硬错误会继续抛出。
         走满步数仍未 `finish` 时返回 `stopped="max_steps"`，不抛错。
@@ -700,6 +794,7 @@ class RetrievalPipeline:
                 hybrid=hybrid,
                 rewrite=rewrite,
                 rerank=rerank,
+                graph_hops=graph_hops,
             )
             raw = self._complete_agent(system, user)
             action = parse_agent_action(raw)
@@ -730,6 +825,7 @@ class RetrievalPipeline:
                     hybrid=hybrid,
                     rewrite=rewrite,
                     rerank=rerank,
+                    graph_hops=graph_hops,
                 )
             if action.kind == "healthcheck":
                 payload = self.healthcheck()
@@ -751,6 +847,7 @@ class RetrievalPipeline:
                 answer=False,
                 rerank=rerank,
                 rewrite=rewrite,
+                graph_hops=graph_hops,
             )
             for hit in result.hits:
                 if hit.chunk_id and hit.text:
@@ -784,6 +881,7 @@ class RetrievalPipeline:
             hybrid=hybrid,
             rewrite=rewrite,
             rerank=rerank,
+            graph_hops=graph_hops,
         )
 
     def _complete_agent(self, system: str, user: str) -> str:
@@ -877,6 +975,70 @@ class RetrievalPipeline:
             raise
         except Exception as exc:  # 点已删，骨架失败时可重试
             raise _graph_failure(doc_id, exc) from exc
+
+    def _maybe_graph_hops(self, result: SearchResult, *, enabled: bool) -> SearchResult:
+        """在重排之前沿已有边最多换入 1 条分块。关闭或失败时不改向量命中。"""
+        if not enabled:
+            return _copy_result(result, graph_hops=_skipped_graph_hops())
+        seeds: list[str] = []
+        seen: set[str] = set()
+        for hit in result.hits:
+            if hit.chunk_id and hit.chunk_id not in seen:
+                seen.add(hit.chunk_id)
+                seeds.append(hit.chunk_id)
+        if not seeds:
+            return _copy_result(
+                result,
+                graph_hops=GraphHopStatus(ok=True, skipped=False, error="no_hits"),
+            )
+        try:
+            related = self.graph_store.related_chunks(seeds, doc_id=result.doc_id)
+        except Exception as exc:  # noqa: BLE001 — 图扩展失败仍返回向量命中
+            return _copy_result(result, graph_hops=_graph_hop_error(exc))
+        found = len(related)
+        if found == 0 or result.top_k < 2:
+            return _copy_result(
+                result,
+                graph_hops=GraphHopStatus(
+                    ok=True,
+                    skipped=False,
+                    error=None,
+                    found=found,
+                    expanded=0,
+                ),
+            )
+        try:
+            payloads = self.vector_store.get_by_chunk_ids(tuple(item.chunk_id for item in related))
+        except Exception as exc:  # noqa: BLE001 — 取正文失败仍返回向量命中
+            return _copy_result(result, graph_hops=_graph_hop_error(exc))
+        chosen = _first_graph_payload(related, payloads, result.doc_id)
+        if chosen is None:
+            return _copy_result(
+                result,
+                graph_hops=GraphHopStatus(
+                    ok=True,
+                    skipped=False,
+                    error=None,
+                    found=found,
+                    expanded=0,
+                ),
+            )
+        item, payload = chosen
+        expansion = _hit_from_payload(payload, item)
+        kept = result.hits[: result.top_k - 1]
+        hits = (*kept, expansion)[: result.top_k]
+        expanded = 1 if any(hit.graph_via for hit in hits) else 0
+        return _copy_result(
+            result,
+            hits=hits,
+            graph_hops=GraphHopStatus(
+                ok=True,
+                skipped=False,
+                error=None,
+                found=found,
+                expanded=expanded,
+            ),
+        )
 
     def _attach_neighbors(self, result: SearchResult) -> SearchResult:
         chunk_ids: list[str] = []
