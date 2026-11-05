@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Environment & secrets
+.env
+.env.local
+.env.*.local
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Data & runtime
+data/
+*.log
+.docker/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Explicitly exclude internal research / planning docs (keep on disk, never push)
+01-立项方案.md
+02-技术架构.md
+03-开源社区运营规范.md
+给普通人看的.md
+竞品对比.md
+调研深挖.md
