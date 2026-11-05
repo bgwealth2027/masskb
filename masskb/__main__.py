@@ -14,7 +14,7 @@ from masskb.ingest import (
     IngestReport,
     ingest_path,
 )
-from masskb.pipeline import RetrievalPipeline
+from masskb.pipeline import IngestWriteResult, RetrievalPipeline
 
 _PREVIEW_CHARS = 80
 
@@ -58,7 +58,13 @@ def _preview_text(text: str, limit: int = _PREVIEW_CHARS) -> str:
     return flat[: limit - 1] + "…"
 
 
-def _format_report(report: IngestReport, *, dry_run: bool, preview_limit: int) -> str:
+def _format_report(
+    report: IngestReport,
+    *,
+    dry_run: bool,
+    preview_limit: int,
+    written: IngestWriteResult | None = None,
+) -> str:
     header = "=== MassKB Ingest (dry-run) ===" if dry_run else "=== MassKB Ingest ==="
     lines = [
         header,
@@ -82,13 +88,20 @@ def _format_report(report: IngestReport, *, dry_run: bool, preview_limit: int) -
             lines.append(f"... 还有 {hidden} 个分块未展示")
     if dry_run:
         lines.append("[INFO] dry-run：未连接 Qdrant、Neo4j 或 OpenAI。")
-    else:
-        lines.append("[INFO] 未写入向量库：当前版本不会连接 Qdrant、Neo4j 或 OpenAI。")
+    elif written is not None:
+        if report.files:
+            lines.append("---")
+        lines.append(f"collection: {written.collection}")
+        lines.append(f"vector_size: {written.vector_size}")
+        lines.append(f"upserted: {written.points_upserted}")
+        lines.append(
+            f"[INFO] 已写入 Qdrant 集合 {written.collection}。未连接 Neo4j，未执行检索。"
+        )
     return "\n".join(lines)
 
 
 def cmd_ingest(args: argparse.Namespace) -> int:
-    """本地切分并打印预览。不创建 Qdrant / Neo4j / OpenAI 客户端。"""
+    """切分本地文本。--dry-run 只预览；否则写入 Qdrant。"""
     if args.preview < 0:
         print("[FAIL] preview 不能为负", file=sys.stderr)
         return 1
@@ -104,14 +117,33 @@ def cmd_ingest(args: argparse.Namespace) -> int:
     except IngestError as exc:
         print(f"[FAIL] {exc}", file=sys.stderr)
         return 1
-    print(
-        _format_report(
-            report,
-            dry_run=bool(args.dry_run),
-            preview_limit=args.preview,
+    if args.dry_run:
+        print(_format_report(report, dry_run=True, preview_limit=args.preview))
+        return 0
+
+    pipeline = RetrievalPipeline()
+    try:
+        try:
+            result = pipeline.ingest(
+                path,
+                root=root,
+                chunk_size=args.chunk_size,
+                overlap=args.overlap,
+            )
+        except Exception as exc:  # noqa: BLE001 — CLI 把写入失败转成退出码
+            print(f"[FAIL] {exc}", file=sys.stderr)
+            return 1
+        print(
+            _format_report(
+                result.report,
+                dry_run=False,
+                preview_limit=args.preview,
+                written=result,
+            )
         )
-    )
-    return 0
+        return 0
+    finally:
+        pipeline.close()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -123,7 +155,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     ingest = sub.add_parser(
         "ingest",
-        help="本地切分 UTF-8 的 .txt/.md 并预览（不写向量库）",
+        help="切分 UTF-8 的 .txt/.md；默认写入 Qdrant。--dry-run 只预览",
     )
     ingest.add_argument("path", type=Path, help="要切分的 .txt/.md 文件或目录")
     ingest.add_argument(
