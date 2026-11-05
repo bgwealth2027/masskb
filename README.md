@@ -69,7 +69,22 @@ pip install -e .           # 或: pip install -r requirements.txt
 
 成功时会打印 Qdrant / Neo4j 的 `[OK]`；若缺少真实 API Key，会提示 embedding 暂不可用（不阻塞）。
 
-### 5. 测试
+无参数的 `python -m masskb` 仍然执行 healthcheck，退出码含义不变：连通为 0，否则为 1。
+
+### 5. 本地切分预览（dry-run）
+
+`ingest` 在本阶段只把本地 UTF-8 文本切成稳定分块并打印预览。**不会**连接 Qdrant、Neo4j 或 OpenAI，也**不会**写入向量；真实向量写入不在本 PR。
+
+```bash
+python -m masskb ingest path/to/file.md --dry-run
+python -m masskb ingest path/to/dir --dry-run
+```
+
+- 只接受 UTF-8 的 `.txt` 与 `.md`。传入目录时会递归收集这两种文件，其他文件跳过。
+- 先按空行分段，短段不会合并；某一段超过字符窗口（默认 800）时，再按窗口切分，相邻块重叠 100 个字符。
+- `doc_id` 是路径键的 SHA-256；`chunk_id` 是 `doc_id` 与字符起止偏移的 SHA-256。仓库内文件默认相对仓库根目录（可用 `--root` 指定别的根），因此同一文件在不同工作目录下得到相同 id。偏移相对换行已规范成 LF 的文本。
+
+### 6. 测试
 
 单元测试不连接 Qdrant、Neo4j，也不会调用 OpenAI（客户端均已 mock）：
 
@@ -80,7 +95,7 @@ python -m pytest
 
 推送到 `main` 或打开 Pull Request 时，GitHub Actions（`.github/workflows/ci.yml`）会安装本包并运行同一套测试。
 
-### 6. Node（可选）
+### 7. Node（可选）
 
 本机需 Node.js v18+（推荐 v22）。
 
@@ -101,7 +116,8 @@ MassKB-检索/
 ├── README.md
 ├── masskb/                 # Python 应用包
 │   ├── __init__.py
-│   ├── __main__.py         # CLI：healthcheck
+│   ├── __main__.py         # CLI：healthcheck / ingest（dry-run）
+│   ├── ingest.py           # 本地切分：稳定 doc_id / chunk_id 与偏移
 │   ├── config.py           # 读取 .env
 │   ├── vector_store.py     # Qdrant 封装
 │   ├── graph_store.py      # Neo4j 封装
