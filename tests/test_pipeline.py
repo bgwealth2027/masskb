@@ -153,6 +153,10 @@ def _search_pipeline(
         calls.append("answer")
         raise AssertionError("默认检索不应请求回答")
 
+    def complete_rerank(_system: str, _user: str) -> str:
+        calls.append("rerank")
+        raise AssertionError("默认检索不应请求重排")
+
     neighbor_calls: list[list[str]] = []
 
     def neighbor_chunk_ids(chunk_ids):
@@ -169,6 +173,7 @@ def _search_pipeline(
     pipeline.vector_store.upsert_points = upsert_points
     pipeline.vector_store.delete_by_doc_id = delete_by_doc_id
     pipeline._complete_answer = complete_answer
+    pipeline._complete_rerank = complete_rerank
     pipeline.graph_store.neighbor_chunk_ids = neighbor_chunk_ids
     pipeline.neighbor_calls = neighbor_calls  # type: ignore[attr-defined]
     return pipeline, calls
@@ -246,10 +251,13 @@ def test_search_embeds_query_and_maps_hits(monkeypatch: pytest.MonkeyPatch) -> N
     assert result.hybrid.ok is True
     assert result.answer.skipped is True
     assert result.answer.text is None
+    assert result.rerank.skipped is True
+    assert result.rerank.ok is True
     assert result.hits[0].dense_score is None
     assert result.hits[0].sparse_rank is None
     assert "search_sparse" not in calls
     assert "answer" not in calls
+    assert "rerank" not in calls
 
 
 def test_search_missing_collection_returns_empty_after_embed(
@@ -268,6 +276,7 @@ def test_search_missing_collection_returns_empty_after_embed(
     assert result.graph.ok is True
     assert result.graph.skipped is True
     assert result.graph.error is None
+    assert result.rerank.skipped is True
     assert result.collection == "masskb_chunks"
     assert result.embedding_model == "embed-test"
     assert result.doc_id is None
@@ -1052,7 +1061,9 @@ def test_search_hybrid_fuses_ranks_and_forwards_doc_id(monkeypatch: pytest.Monke
     assert result.hits[2].dense_rank is None
     assert result.hits[2].sparse_rank == 2
     assert result.answer.skipped is True
+    assert result.rerank.skipped is True
     assert "answer" not in calls
+    assert "rerank" not in calls
 
 
 def test_search_hybrid_sparse_failure_keeps_dense_hits(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1234,7 +1245,391 @@ def test_search_answer_off_does_not_construct_openai(monkeypatch: pytest.MonkeyP
     pipeline.close()
 
     assert result.answer.skipped is True
+    assert result.rerank.skipped is True
     assert "answer" not in calls
+    assert "rerank" not in calls
+
+
+def test_search_rerank_reorders_dense_hits_before_neighbors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw = [
+        {"score": 0.2, "payload": {"text": "甲", "chunk_id": "a", "source": "a.md"}},
+        {"score": 0.9, "payload": {"text": "乙", "chunk_id": "b", "source": "b.md"}},
+        {"score": 0.4, "payload": {"text": "丙", "chunk_id": "c", "source": "c.md"}},
+    ]
+    pipeline, calls = _search_pipeline(
+        monkeypatch,
+        _Embeddings(),
+        raw=raw,
+        neighbors={"a": (None, "a2"), "b": ("b0", None), "c": ("c0", "c2")},
+    )
+    seen: dict = {}
+
+    def complete(system: str, user: str) -> str:
+        calls.append("rerank")
+        seen["system"] = system
+        seen["user"] = user
+        seen["neighbors_during"] = list(pipeline.neighbor_calls)  # type: ignore[attr-defined]
+        return '{"order": ["c", "nope", "a", "c"]}'
+
+    pipeline._complete_rerank = complete
+
+    result = pipeline.search("  质量  ", rerank=True)
+    pipeline.close()
+
+    assert calls[-1] == "rerank"
+    assert "answer" not in calls
+    assert seen["neighbors_during"] == []
+    assert "不可信数据" in seen["system"]
+    assert "问题：  质量  " in seen["user"]
+    assert seen["user"].index("chunk_id: a") < seen["user"].index("chunk_id: b")
+    assert "a2" not in seen["user"]
+    assert [hit.chunk_id for hit in result.hits] == ["c", "a", "b"]
+    assert [hit.score for hit in result.hits] == [1.0, 0.5, 1.0 / 3]
+    assert result.score_kind == "rerank"
+    assert result.mode == "dense"
+    assert result.hits[0].dense_score is None
+    assert result.hits[0].sparse_score is None
+    assert result.hits[0].dense_rank is None
+    assert result.hits[0].sparse_rank is None
+    assert result.hits[0].text == "丙"
+    assert result.rerank.ok is True
+    assert result.rerank.skipped is False
+    assert result.rerank.error is None
+    assert result.rerank.model == "gpt-4o-mini"
+    assert pipeline.neighbor_calls == [["c", "a", "b"]]  # type: ignore[attr-defined]
+    assert result.hits[0].prev_chunk_id == "c0"
+    assert result.hits[0].next_chunk_id == "c2"
+    assert result.hits[1].next_chunk_id == "a2"
+    assert result.graph.ok is True
+    assert result.graph.skipped is False
+
+
+def test_search_rerank_same_order_still_replaces_scores(monkeypatch: pytest.MonkeyPatch) -> None:
+    raw = [
+        {"score": 0.2, "payload": {"text": "甲", "chunk_id": "a"}},
+        {"score": 0.9, "payload": {"text": "乙", "chunk_id": "b"}},
+    ]
+    pipeline, _calls = _search_pipeline(monkeypatch, _Embeddings(), raw=raw)
+    pipeline._complete_rerank = lambda _system, _user: '{"order": ["a", "b"]}'
+
+    result = pipeline.search("质量", rerank=True)
+    pipeline.close()
+
+    assert [hit.chunk_id for hit in result.hits] == ["a", "b"]
+    assert [hit.score for hit in result.hits] == [1.0, 0.5]
+    assert result.score_kind == "rerank"
+    assert result.mode == "dense"
+
+
+def test_search_rerank_single_hit_still_calls_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    raw = [{"score": 0.4, "payload": {"text": "甲", "chunk_id": "a"}}]
+    pipeline, calls = _search_pipeline(monkeypatch, _Embeddings(), raw=raw)
+
+    def complete(_system: str, _user: str) -> str:
+        calls.append("rerank")
+        return '{"order": []}'
+
+    pipeline._complete_rerank = complete
+    result = pipeline.search("质量", top_k=1, rerank=True)
+    pipeline.close()
+
+    assert calls[-1] == "rerank"
+    assert result.hits[0].chunk_id == "a"
+    assert result.hits[0].score == 1.0
+    assert result.score_kind == "rerank"
+    assert result.rerank.ok is True
+
+
+def test_search_rerank_hybrid_keeps_leg_scores_and_uses_top_k(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    embeddings = _Embeddings()
+    seen: dict = {}
+    raw = [
+        {"score": 0.9, "payload": {"text": "甲", "chunk_id": "a", "source": "a.md"}},
+        {"score": 0.5, "payload": {"text": "乙", "chunk_id": "b", "source": "b.md"}},
+        {"score": 0.2, "payload": {"text": "丙", "chunk_id": "c", "source": "c.md"}},
+    ]
+    pipeline, calls = _search_pipeline(monkeypatch, embeddings, raw=raw, seen=seen)
+    prompt: dict = {}
+
+    def sparse_ready() -> bool:
+        calls.append("sparse_ready")
+        return True
+
+    def search_sparse(*_args, **_kwargs):
+        calls.append("search_sparse")
+        return [
+            {"score": 4.0, "payload": {"text": "丙", "chunk_id": "c", "source": "c.md"}},
+            {"score": 1.0, "payload": {"text": "甲", "chunk_id": "a", "source": "a.md"}},
+        ]
+
+    def complete(_system: str, user: str) -> str:
+        calls.append("rerank")
+        prompt["user"] = user
+        return '{"order": ["c", "missing"]}'
+
+    pipeline.vector_store.sparse_ready = sparse_ready
+    pipeline.vector_store.search_sparse = search_sparse
+    pipeline._complete_rerank = complete
+
+    result = pipeline.search("质量", top_k=2, hybrid=True, rerank=True)
+    pipeline.close()
+
+    assert seen["top_k"] == candidate_limit(2)
+    assert result.hybrid.candidate_k == candidate_limit(2)
+    assert "chunk_id: b" not in prompt["user"]
+    assert prompt["user"].index("chunk_id: a") < prompt["user"].index("chunk_id: c")
+    assert [hit.chunk_id for hit in result.hits] == ["c", "a"]
+    assert [hit.score for hit in result.hits] == [1.0, 0.5]
+    assert result.mode == "hybrid"
+    assert result.score_kind == "rerank"
+    assert result.hits[0].dense_score == 0.2
+    assert result.hits[0].sparse_score == 4.0
+    assert result.hits[0].dense_rank == 3
+    assert result.hits[0].sparse_rank == 1
+    assert result.hits[1].dense_score == 0.9
+    assert result.hits[1].sparse_score == 1.0
+    assert result.hits[1].dense_rank == 1
+    assert result.hits[1].sparse_rank == 2
+    assert result.hybrid.ok is True
+    assert result.hybrid.rrf_k == RRF_K
+
+
+def test_search_rerank_invalid_json_and_chat_error_keep_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw = [
+        {"score": 0.4, "payload": {"text": "甲", "chunk_id": "a"}},
+        {"score": 0.2, "payload": {"text": "乙", "chunk_id": "b"}},
+    ]
+    invalid, _calls = _search_pipeline(monkeypatch, _Embeddings(), raw=raw)
+    invalid._complete_rerank = lambda _system, _user: "不是 JSON"
+    invalid_result = invalid.search("质量", rerank=True)
+    assert [hit.chunk_id for hit in invalid_result.hits] == ["a", "b"]
+    assert [hit.score for hit in invalid_result.hits] == [0.4, 0.2]
+    assert invalid_result.score_kind == "cosine"
+    assert invalid_result.rerank.ok is False
+    assert invalid_result.rerank.skipped is False
+    assert invalid_result.rerank.error == "invalid_json"
+    assert invalid_result.rerank.model == "gpt-4o-mini"
+    invalid.close()
+
+    failed, failed_calls = _search_pipeline(monkeypatch, _Embeddings(), raw=raw)
+    failed.vector_store.sparse_ready = lambda: True
+
+    def search_sparse(*_args, **_kwargs):
+        failed_calls.append("search_sparse")
+        return [
+            {"score": 2.0, "payload": {"text": "甲", "chunk_id": "a"}},
+            {"score": 1.0, "payload": {"text": "乙", "chunk_id": "b"}},
+        ]
+
+    def boom(_system: str, _user: str) -> str:
+        raise RuntimeError("timeout")
+
+    failed.vector_store.search_sparse = search_sparse
+    failed._complete_rerank = boom
+    failed_result = failed.search("质量", hybrid=True, rerank=True)
+    assert [hit.chunk_id for hit in failed_result.hits] == ["a", "b"]
+    assert failed_result.hits[0].score == pytest.approx(2 / (RRF_K + 1))
+    assert failed_result.hits[0].dense_score == 0.4
+    assert failed_result.hits[0].sparse_score == 2.0
+    assert failed_result.mode == "hybrid"
+    assert failed_result.score_kind == "rrf"
+    assert failed_result.rerank.ok is False
+    assert failed_result.rerank.error == "RuntimeError: timeout"
+    failed.close()
+
+
+def test_search_rerank_no_hits_does_not_call_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    empty, calls = _search_pipeline(monkeypatch, _Embeddings(), raw=[])
+    result = empty.search("质量", rerank=True)
+    empty.close()
+    assert result.rerank.error == "no_hits"
+    assert result.rerank.ok is True
+    assert result.rerank.skipped is False
+    assert result.rerank.model is None
+    assert result.score_kind == "cosine"
+    assert "rerank" not in calls
+
+    missing, missing_calls = _search_pipeline(monkeypatch, _Embeddings(), present=False)
+    missing_result = missing.search("质量", rerank=True)
+    missing.close()
+    assert missing_result.hits == ()
+    assert missing_result.rerank.error == "no_hits"
+    assert missing_result.graph.skipped is True
+    assert "rerank" not in missing_calls
+
+    blank, blank_calls = _search_pipeline(
+        monkeypatch,
+        _Embeddings(),
+        raw=[{"score": 0.4, "payload": {"source": "a.md", "chunk_id": "c"}}],
+    )
+    blank_result = blank.search("质量", rerank=True)
+    blank.close()
+    assert blank_result.hits[0].score == 0.4
+    assert blank_result.score_kind == "cosine"
+    assert blank_result.rerank.error == "no_hits"
+    assert "rerank" not in blank_calls
+
+
+def test_search_rerank_appends_unranked_hits(monkeypatch: pytest.MonkeyPatch) -> None:
+    raw = [
+        {"score": 0.9, "payload": {"text": "甲", "chunk_id": "a"}},
+        {"score": 0.4, "payload": {"chunk_id": "gap", "source": "g.md"}},
+        {"score": 0.2, "payload": {"text": "丙", "chunk_id": "c"}},
+        {"score": 0.1, "payload": {"text": "又一个甲", "chunk_id": "a"}},
+    ]
+    pipeline, _calls = _search_pipeline(monkeypatch, _Embeddings(), raw=raw)
+    seen: dict = {}
+
+    def complete(_system: str, user: str) -> str:
+        seen["user"] = user
+        return '{"order": ["c", "unknown"]}'
+
+    pipeline._complete_rerank = complete
+    result = pipeline.search("质量", rerank=True)
+    pipeline.close()
+
+    assert "chunk_id: gap" not in seen["user"]
+    assert seen["user"].count("chunk_id: a") == 1
+    assert [hit.chunk_id for hit in result.hits] == ["c", "a", "gap", "a"]
+    assert [hit.text for hit in result.hits] == ["丙", "甲", None, "又一个甲"]
+    assert [hit.score for hit in result.hits] == [1.0, 0.5, 1.0 / 3, 0.25]
+    assert result.score_kind == "rerank"
+
+
+def test_search_rerank_graph_failure_keeps_new_order(monkeypatch: pytest.MonkeyPatch) -> None:
+    raw = [
+        {"score": 0.2, "payload": {"text": "甲", "chunk_id": "a"}},
+        {"score": 0.9, "payload": {"text": "乙", "chunk_id": "b"}},
+    ]
+    pipeline, _calls = _search_pipeline(
+        monkeypatch,
+        _Embeddings(),
+        raw=raw,
+        neighbor_error=RuntimeError("neo4j down"),
+    )
+    pipeline._complete_rerank = lambda _system, _user: '{"order": ["b", "a"]}'
+
+    result = pipeline.search("质量", rerank=True)
+    pipeline.close()
+
+    assert [hit.chunk_id for hit in result.hits] == ["b", "a"]
+    assert [hit.score for hit in result.hits] == [1.0, 0.5]
+    assert result.hits[0].prev_chunk_id is None
+    assert result.hits[0].next_chunk_id is None
+    assert result.graph.ok is False
+    assert result.graph.error == "RuntimeError: neo4j down"
+    assert result.rerank.ok is True
+    assert result.score_kind == "rerank"
+
+
+def test_search_rerank_then_answer_uses_new_order(monkeypatch: pytest.MonkeyPatch) -> None:
+    raw = [
+        {"score": 0.2, "payload": {"text": "甲", "chunk_id": "a"}},
+        {"score": 0.9, "payload": {"text": "乙", "chunk_id": "b"}},
+    ]
+    pipeline, calls = _search_pipeline(monkeypatch, _Embeddings(), raw=raw)
+    seen: dict = {}
+
+    def rerank(_system: str, _user: str) -> str:
+        calls.append("rerank")
+        return '{"order": ["b", "a"]}'
+
+    def answer(_system: str, user: str) -> str:
+        calls.append("answer")
+        seen["user"] = user
+        return '{"abstain": false, "answer": "乙在前", "citations": ["b"]}'
+
+    pipeline._complete_rerank = rerank
+    pipeline._complete_answer = answer
+
+    result = pipeline.search("质量", rerank=True, answer=True)
+    pipeline.close()
+
+    assert calls[-2:] == ["rerank", "answer"]
+    assert seen["user"].index("chunk_id: b") < seen["user"].index("chunk_id: a")
+    assert [hit.chunk_id for hit in result.hits] == ["b", "a"]
+    assert result.score_kind == "rerank"
+    assert result.answer.ok is True
+    assert result.answer.citations == ("b",)
+    assert result.answer.text == "乙在前"
+
+
+def test_search_rerank_failure_still_answers_original_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw = [
+        {"score": 0.2, "payload": {"text": "甲", "chunk_id": "a"}},
+        {"score": 0.9, "payload": {"text": "乙", "chunk_id": "b"}},
+    ]
+    pipeline, calls = _search_pipeline(monkeypatch, _Embeddings(), raw=raw)
+    seen: dict = {}
+
+    def rerank(_system: str, _user: str) -> str:
+        calls.append("rerank")
+        raise RuntimeError("timeout")
+
+    def answer(_system: str, user: str) -> str:
+        calls.append("answer")
+        seen["user"] = user
+        return '{"abstain": false, "answer": "甲在前", "citations": ["a"]}'
+
+    pipeline._complete_rerank = rerank
+    pipeline._complete_answer = answer
+
+    result = pipeline.search("质量", rerank=True, answer=True)
+    pipeline.close()
+
+    assert calls[-2:] == ["rerank", "answer"]
+    assert seen["user"].index("chunk_id: a") < seen["user"].index("chunk_id: b")
+    assert [hit.chunk_id for hit in result.hits] == ["a", "b"]
+    assert [hit.score for hit in result.hits] == [0.2, 0.9]
+    assert result.score_kind == "cosine"
+    assert result.rerank.ok is False
+    assert result.answer.ok is True
+    assert result.answer.citations == ("a",)
+
+
+def test_search_rerank_missing_api_key_fails_before_chat(monkeypatch: pytest.MonkeyPatch) -> None:
+    created = _forbid_backends(monkeypatch)
+
+    def boom(**_kwargs):
+        created.append("chat")
+        raise AssertionError("不应创建 OpenAI")
+
+    monkeypatch.setattr("masskb.answer.OpenAI", boom)
+    pipeline = RetrievalPipeline(Settings(openai_api_key="sk-your-api-key-here"))
+
+    with pytest.raises(RuntimeError, match="OPENAI_API_KEY"):
+        pipeline.search("质量", rerank=True)
+
+    assert created == []
+    pipeline.close()
+
+
+def test_search_rerank_off_does_not_construct_openai(monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(**_kwargs):
+        raise AssertionError("不应创建 OpenAI")
+
+    monkeypatch.setattr("masskb.answer.OpenAI", boom)
+    pipeline, calls = _search_pipeline(
+        monkeypatch,
+        _Embeddings(),
+        raw=[{"score": 0.4, "payload": {"text": "原文", "chunk_id": "c"}}],
+    )
+
+    result = pipeline.search("质量", rerank=False)
+    pipeline.close()
+
+    assert result.rerank.skipped is True
+    assert result.score_kind == "cosine"
+    assert result.hits[0].score == 0.4
+    assert "rerank" not in calls
 
 
 def test_ingest_without_entities_does_not_call_chat(

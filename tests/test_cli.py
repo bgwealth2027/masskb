@@ -14,6 +14,7 @@ from masskb.pipeline import (
     DimensionMismatchError,
     GraphStatus,
     IngestWriteResult,
+    RerankStatus,
     SearchHit,
     SearchResult,
 )
@@ -371,12 +372,14 @@ def test_search_prints_json_and_closes(
             doc_id: str | None = None,
             hybrid: bool = False,
             answer: bool = False,
+            rerank: bool = False,
         ) -> SearchResult:
             seen["query"] = query
             seen["top_k"] = top_k
             seen["doc_id"] = doc_id
             seen["hybrid"] = hybrid
             seen["answer"] = answer
+            seen["rerank"] = rerank
             return SearchResult(
                 query=query,
                 top_k=top_k,
@@ -452,6 +455,12 @@ def test_search_prints_json_and_closes(
             "model": None,
             "error": None,
         },
+        "rerank": {
+            "ok": True,
+            "skipped": True,
+            "error": None,
+            "model": None,
+        },
     }
     assert seen == {
         "query": "质量",
@@ -459,6 +468,7 @@ def test_search_prints_json_and_closes(
         "doc_id": "abc",
         "hybrid": False,
         "answer": False,
+        "rerank": False,
     }
     assert closed == ["closed"]
 
@@ -476,6 +486,7 @@ def test_search_empty_hits_exit_zero(
             doc_id: str | None = None,
             hybrid: bool = False,
             answer: bool = False,
+            rerank: bool = False,
         ) -> SearchResult:
             return SearchResult(
                 query=query,
@@ -534,6 +545,7 @@ def test_search_help(capsys: pytest.CaptureFixture[str]) -> None:
     assert "--doc-id" in out
     assert "--hybrid" in out
     assert "--answer" in out
+    assert "--rerank" in out
     assert "chunk_id" in out
 
 
@@ -585,6 +597,90 @@ def test_search_answer_failure_prints_json_and_exits_zero(
     assert payload["answer"]["ok"] is False
     assert payload["answer"]["error"] == "uncited"
     assert payload["answer"]["text"] is None
+
+
+def test_search_rerank_flag_is_forwarded(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    seen: dict = {}
+
+    class FakePipeline:
+        def search(self, query: str, **kwargs) -> SearchResult:
+            seen["query"] = query
+            seen.update(kwargs)
+            return SearchResult(
+                query=query,
+                top_k=kwargs["top_k"],
+                collection="masskb_chunks",
+                embedding_model="embed-test",
+                doc_id=None,
+                hits=(),
+                graph=GraphStatus(ok=True, skipped=True),
+            )
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr("masskb.__main__.RetrievalPipeline", FakePipeline)
+
+    assert main(["search", "质量", "--rerank"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert seen["rerank"] is True
+    assert seen["hybrid"] is False
+    assert seen["answer"] is False
+    assert payload["rerank"]["skipped"] is True
+    assert payload["hits"] == []
+
+
+def test_search_rerank_failure_prints_json_and_exits_zero(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class FakePipeline:
+        def search(self, *_args, **_kwargs) -> SearchResult:
+            return SearchResult(
+                query="质量",
+                top_k=5,
+                collection="masskb_chunks",
+                embedding_model="embed-test",
+                doc_id=None,
+                hits=(
+                    SearchHit(
+                        score=0.4,
+                        text="原文",
+                        source="a.md",
+                        chunk_id="c",
+                        doc_id="d",
+                        index=0,
+                        start=0,
+                        end=2,
+                        prev_chunk_id=None,
+                        next_chunk_id=None,
+                    ),
+                ),
+                graph=GraphStatus(ok=True, skipped=False),
+                score_kind="cosine",
+                rerank=RerankStatus(
+                    ok=False,
+                    skipped=False,
+                    error="invalid_json",
+                    model="gpt-4o-mini",
+                ),
+            )
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr("masskb.__main__.RetrievalPipeline", FakePipeline)
+
+    assert main(["search", "质量", "--rerank"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["hits"][0]["chunk_id"] == "c"
+    assert payload["hits"][0]["score"] == 0.4
+    assert payload["score_kind"] == "cosine"
+    assert payload["rerank"]["ok"] is False
+    assert payload["rerank"]["error"] == "invalid_json"
 
 
 def test_ingest_entities_prints_counts(
