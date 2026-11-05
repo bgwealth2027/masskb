@@ -1,4 +1,4 @@
-"""检索编排：向量入库，以及同一模型上的近邻检索。"""
+"""检索编排：向量入库与文档骨架同步，以及同一模型上的近邻检索。"""
 
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ from masskb.ingest import (
     DEFAULT_CHUNK_OVERLAP,
     DEFAULT_CHUNK_SIZE,
     Chunk,
+    Document,
     IngestReport,
     ingest_path,
 )
@@ -34,9 +35,13 @@ class DimensionMismatchError(RuntimeError):
     """探测、分块或查询向量的维度与约定的 1536 不一致。"""
 
 
+class GraphSyncError(RuntimeError):
+    """向量已按文档提交，图谱事务未完成。整次 ingest 可重试。"""
+
+
 @dataclass(frozen=True)
 class SearchHit:
-    """一条近邻命中。`score` 来自 Qdrant，其余字段来自入库 payload。"""
+    """一条近邻命中。`score` 来自 Qdrant，正文来自 payload，前后 id 来自图。"""
 
     score: float
     text: str | None
@@ -46,6 +51,17 @@ class SearchHit:
     index: int | None
     start: int | None
     end: int | None
+    prev_chunk_id: str | None
+    next_chunk_id: str | None
+
+
+@dataclass(frozen=True)
+class GraphStatus:
+    """这次检索有没有补上前后邻。`skipped` 表示没有去查 Neo4j。"""
+
+    ok: bool
+    skipped: bool
+    error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -58,16 +74,20 @@ class SearchResult:
     embedding_model: str
     doc_id: str | None
     hits: tuple[SearchHit, ...]
+    graph: GraphStatus
 
 
 @dataclass(frozen=True)
 class IngestWriteResult:
-    """一次向量写入的结果。`points_upserted` 是本次 upsert 的点数。"""
+    """一次写入的结果。`points_upserted` 是本次 upsert 的点数。"""
 
     report: IngestReport
     collection: str
     vector_size: int
     points_upserted: int
+    graph_documents: int
+    graph_chunks: int
+    graph_skipped: bool
 
 
 def _validate_search(query: str, top_k: int, doc_id: str | None) -> None:
@@ -85,6 +105,7 @@ def _search_result(
     top_k: int,
     doc_id: str | None,
     hits: tuple[SearchHit, ...],
+    graph: GraphStatus,
 ) -> SearchResult:
     return SearchResult(
         query=query,
@@ -93,7 +114,12 @@ def _search_result(
         embedding_model=embedding_model,
         doc_id=doc_id,
         hits=hits,
+        graph=graph,
     )
+
+
+def _skipped_graph() -> GraphStatus:
+    return GraphStatus(ok=True, skipped=True, error=None)
 
 
 def _search_hit(raw: dict[str, Any]) -> SearchHit:
@@ -107,6 +133,34 @@ def _search_hit(raw: dict[str, Any]) -> SearchHit:
         index=payload.get("index"),
         start=payload.get("start"),
         end=payload.get("end"),
+        prev_chunk_id=None,
+        next_chunk_id=None,
+    )
+
+
+def _hit_with_neighbors(
+    hit: SearchHit,
+    prev_chunk_id: str | None,
+    next_chunk_id: str | None,
+) -> SearchHit:
+    return SearchHit(
+        score=hit.score,
+        text=hit.text,
+        source=hit.source,
+        chunk_id=hit.chunk_id,
+        doc_id=hit.doc_id,
+        index=hit.index,
+        start=hit.start,
+        end=hit.end,
+        prev_chunk_id=prev_chunk_id,
+        next_chunk_id=next_chunk_id,
+    )
+
+
+def _graph_failure(doc_id: str, exc: Exception) -> GraphSyncError:
+    return GraphSyncError(
+        f"文档 {doc_id} 的 Qdrant 已写入，Neo4j 骨架未完成，可重试。"
+        f"{type(exc).__name__}: {exc}"
     )
 
 
@@ -123,7 +177,7 @@ def _payload(chunk: Chunk) -> dict[str, Any]:
 
 
 class RetrievalPipeline:
-    """组装向量、图谱与 Embedding。`ingest` 只写 Qdrant；`search` 只读近邻。"""
+    """组装向量、图谱与 Embedding。`ingest` 先写 Qdrant 再同步骨架。"""
 
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()
@@ -150,10 +204,11 @@ class RetrievalPipeline:
         chunk_size: int = DEFAULT_CHUNK_SIZE,
         overlap: int = DEFAULT_CHUNK_OVERLAP,
     ) -> IngestWriteResult:
-        """切分并写入 Qdrant。不写 Neo4j，不做检索。
+        """切分并写入 Qdrant，再同步这篇文档的 Neo4j 骨架。不做检索。
 
         有分块时先探测一条向量的维度，再确保集合存在。维度或集合配置不符时中止，
-        不 upsert，也不删除。探测用的那条向量不会写入。
+        不 upsert，也不删除，也不连接 Neo4j。探测用的那条向量不会写入。
+        每个文档的向量 upsert 和过期点删除都成功后，才写该文档的图。
         """
         report = ingest_path(path, root=root, chunk_size=chunk_size, overlap=overlap)
         if not any(doc.chunks for doc in report.files):
@@ -165,17 +220,29 @@ class RetrievalPipeline:
 
         self.vector_store.ensure_collection()
         upserted = 0
+        graph_documents = 0
+        graph_chunks = 0
         for doc in report.files:
             if not doc.chunks:
                 self.vector_store.delete_by_doc_id(doc.doc_id)
+                self._delete_graph_document(doc.doc_id)
+                graph_documents += 1
                 continue
             vectors = self._embed_document(doc.chunks)
             ids = [point_id_for_chunk(chunk.chunk_id) for chunk in doc.chunks]
             payloads = [_payload(chunk) for chunk in doc.chunks]
             self.vector_store.upsert_points(ids, vectors, payloads)
             self.vector_store.delete_by_doc_id(doc.doc_id, keep_ids=ids)
+            graph_chunks += self._sync_graph_document(doc)
+            graph_documents += 1
             upserted += len(ids)
-        return self._result(report, upserted)
+        return self._result(
+            report,
+            upserted,
+            graph_documents=graph_documents,
+            graph_chunks=graph_chunks,
+            graph_skipped=False,
+        )
 
     def search(
         self,
@@ -184,10 +251,11 @@ class RetrievalPipeline:
         top_k: int = 5,
         doc_id: str | None = None,
     ) -> SearchResult:
-        """用与入库相同的模型做近邻检索。不写 Qdrant，也不访问 Neo4j。
+        """用与入库相同的模型做近邻检索，再按 chunk_id 补前后邻。
 
         先生成查询向量，再看集合是否存在。集合不存在、没有点或过滤后没有命中时，
-        返回空的 `hits`。缺 Key、维度不符、集合配置不符或 Qdrant 连不上时抛错。
+        返回空的 `hits`，并且不连接 Neo4j。缺 Key、维度不符、集合配置不符或 Qdrant
+        连不上时抛错。Neo4j 补邻接失败时仍返回向量命中。
         """
         _validate_search(query, top_k, doc_id)
         vector = self.embeddings.embed_one(query)
@@ -197,7 +265,14 @@ class RetrievalPipeline:
                 f"期望 {DEFAULT_VECTOR_SIZE}。未执行检索。"
             )
         if not self.vector_store.has_collection():
-            return _search_result(self.settings.embedding_model, query, top_k, doc_id, ())
+            return _search_result(
+                self.settings.embedding_model,
+                query,
+                top_k,
+                doc_id,
+                (),
+                _skipped_graph(),
+            )
         self.vector_store.require_compatible_collection()
         try:
             raw_hits = self.vector_store.search(vector, top_k=top_k, doc_id=doc_id)
@@ -206,18 +281,100 @@ class RetrievalPipeline:
                 raise
             raw_hits = []
         hits = tuple(_search_hit(item) for item in raw_hits)
-        return _search_result(self.settings.embedding_model, query, top_k, doc_id, hits)
+        return self._attach_neighbors(
+            _search_result(
+                self.settings.embedding_model,
+                query,
+                top_k,
+                doc_id,
+                hits,
+                _skipped_graph(),
+            )
+        )
 
     def close(self) -> None:
         self.vector_store.close()
         self.graph_store.close()
 
     def _clear_docs_if_collection_exists(self, report: IngestReport) -> IngestWriteResult:
-        """没有可写入的分块时不探测、不建集合。集合已在则按 doc_id 清掉旧点。"""
-        if self.vector_store.has_collection():
-            for doc in report.files:
-                self.vector_store.delete_by_doc_id(doc.doc_id)
-        return self._result(report, 0)
+        """没有可写入的分块时不探测、不建集合。集合已在则先删点，再删骨架。"""
+        if not self.vector_store.has_collection() or not report.files:
+            return self._result(
+                report,
+                0,
+                graph_documents=0,
+                graph_chunks=0,
+                graph_skipped=True,
+            )
+        for doc in report.files:
+            self.vector_store.delete_by_doc_id(doc.doc_id)
+            self._delete_graph_document(doc.doc_id)
+        return self._result(
+            report,
+            0,
+            graph_documents=len(report.files),
+            graph_chunks=0,
+            graph_skipped=False,
+        )
+
+    def _sync_graph_document(self, doc: Document) -> int:
+        try:
+            self.graph_store.ensure_schema()
+            return self.graph_store.upsert_document(doc)
+        except GraphSyncError:
+            raise
+        except Exception as exc:  # 图失败不回滚已写入的向量
+            raise _graph_failure(doc.doc_id, exc) from exc
+
+    def _delete_graph_document(self, doc_id: str) -> None:
+        try:
+            self.graph_store.delete_document(doc_id)
+        except GraphSyncError:
+            raise
+        except Exception as exc:  # 点已删，骨架失败时可重试
+            raise _graph_failure(doc_id, exc) from exc
+
+    def _attach_neighbors(self, result: SearchResult) -> SearchResult:
+        chunk_ids: list[str] = []
+        seen: set[str] = set()
+        for hit in result.hits:
+            if hit.chunk_id and hit.chunk_id not in seen:
+                seen.add(hit.chunk_id)
+                chunk_ids.append(hit.chunk_id)
+        if not chunk_ids:
+            return result
+        try:
+            neighbors = self.graph_store.neighbor_chunk_ids(chunk_ids)
+        except Exception as exc:  # noqa: BLE001 — 邻接失败仍返回向量命中
+            cleared = tuple(_hit_with_neighbors(hit, None, None) for hit in result.hits)
+            status = GraphStatus(
+                ok=False,
+                skipped=False,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            return _search_result(
+                result.embedding_model,
+                result.query,
+                result.top_k,
+                result.doc_id,
+                cleared,
+                status,
+            )
+        enriched = []
+        for hit in result.hits:
+            pair = neighbors.get(hit.chunk_id) if hit.chunk_id else None
+            if pair is None:
+                enriched.append(hit)
+            else:
+                enriched.append(_hit_with_neighbors(hit, pair[0], pair[1]))
+        return _search_result(
+            result.embedding_model,
+            result.query,
+            result.top_k,
+            result.doc_id,
+            tuple(enriched),
+            GraphStatus(ok=True, skipped=False, error=None),
+        )
 
     def _embed_document(self, chunks: Sequence[Chunk]) -> list[list[float]]:
         vectors: list[list[float]] = []
@@ -243,10 +400,20 @@ class RetrievalPipeline:
         )
 
     @staticmethod
-    def _result(report: IngestReport, points_upserted: int) -> IngestWriteResult:
+    def _result(
+        report: IngestReport,
+        points_upserted: int,
+        *,
+        graph_documents: int,
+        graph_chunks: int,
+        graph_skipped: bool,
+    ) -> IngestWriteResult:
         return IngestWriteResult(
             report=report,
             collection=DEFAULT_COLLECTION,
             vector_size=DEFAULT_VECTOR_SIZE,
             points_upserted=points_upserted,
+            graph_documents=graph_documents,
+            graph_chunks=graph_chunks,
+            graph_skipped=graph_skipped,
         )

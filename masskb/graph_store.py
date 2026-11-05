@@ -2,19 +2,92 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
-from neo4j import GraphDatabase, Driver
+from neo4j import Driver, GraphDatabase
 
 from masskb.config import Settings, get_settings
+from masskb.ingest import Document
+
+# 单独的语句，避免和数据写入放在同一个显式事务里。
+_SCHEMA_STATEMENTS = (
+    """
+    CREATE CONSTRAINT masskb_document_doc_id IF NOT EXISTS
+    FOR (d:Document) REQUIRE d.doc_id IS UNIQUE
+    """,
+    """
+    CREATE CONSTRAINT masskb_chunk_chunk_id IF NOT EXISTS
+    FOR (c:Chunk) REQUIRE c.chunk_id IS UNIQUE
+    """,
+    """
+    CREATE INDEX masskb_chunk_doc_id IF NOT EXISTS
+    FOR (c:Chunk) ON (c.doc_id)
+    """,
+)
+
+# 过期块和旧 NEXT_CHUNK 用 OPTIONAL MATCH。普通 MATCH 没命中时会让整条查询停掉，
+# 首次写入就建不出前后关系。
+_UPSERT_DOCUMENT = """
+MERGE (d:Document {doc_id: $doc_id})
+SET d.source = $source
+WITH d
+UNWIND $chunks AS row
+MERGE (c:Chunk {chunk_id: row.chunk_id})
+SET c.doc_id = $doc_id,
+    c.source = $source,
+    c.index = row.index,
+    c.start = row.start,
+    c.end = row.end
+MERGE (d)-[:HAS_CHUNK]->(c)
+WITH DISTINCT d
+OPTIONAL MATCH (stale:Chunk {doc_id: $doc_id})
+WHERE NOT stale.chunk_id IN $keep_ids
+WITH d, collect(DISTINCT stale) AS stale_nodes
+FOREACH (n IN [node IN stale_nodes WHERE node IS NOT NULL] | DETACH DELETE n)
+WITH d
+OPTIONAL MATCH (c:Chunk {doc_id: $doc_id})-[rel:NEXT_CHUNK]-()
+WITH d, collect(DISTINCT rel) AS old_rels
+FOREACH (r IN [item IN old_rels WHERE item IS NOT NULL] | DELETE r)
+WITH d
+MATCH (d)-[:HAS_CHUNK]->(c:Chunk)
+WITH c ORDER BY c.index ASC
+WITH collect(c) AS chunks
+UNWIND range(0, size(chunks) - 2) AS i
+WITH chunks[i] AS prev, chunks[i + 1] AS nxt
+MERGE (prev)-[:NEXT_CHUNK]->(nxt)
+"""
+
+_DELETE_DOCUMENT = """
+OPTIONAL MATCH (c:Chunk {doc_id: $doc_id})
+DETACH DELETE c
+WITH 1 AS ignored
+OPTIONAL MATCH (d:Document {doc_id: $doc_id})
+DETACH DELETE d
+"""
+
+_NEIGHBORS = """
+UNWIND $chunk_ids AS cid
+MATCH (c:Chunk {chunk_id: cid})
+OPTIONAL MATCH (prev:Chunk)-[:NEXT_CHUNK]->(c)
+OPTIONAL MATCH (c)-[:NEXT_CHUNK]->(nxt:Chunk)
+RETURN c.chunk_id AS chunk_id,
+       prev.chunk_id AS prev_chunk_id,
+       nxt.chunk_id AS next_chunk_id
+"""
+
+
+class GraphStoreError(RuntimeError):
+    """骨架读回的前后邻不唯一。"""
 
 
 class GraphStore:
-    """Neo4j 薄封装：Bolt 连通性检查 + 后续图查询扩展点。"""
+    """Neo4j 薄封装：连通性检查，以及文档骨架的写入和一跳邻接读取。"""
 
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()
         self._driver: Driver | None = None
+        self._schema_ready = False
 
     @property
     def driver(self) -> Driver:
@@ -43,6 +116,92 @@ class GraphStore:
                 "uri": self.settings.neo4j_uri,
                 "error": f"{type(exc).__name__}: {exc}",
             }
+
+    def ensure_schema(self) -> None:
+        """创建文档骨架的唯一约束和 doc_id 索引。同一实例只发一次。"""
+        if self._schema_ready:
+            return
+
+        def work(tx: Any) -> None:
+            for statement in _SCHEMA_STATEMENTS:
+                tx.run(statement).consume()
+
+        with self.driver.session() as session:
+            session.execute_write(work)
+        self._schema_ready = True
+
+    def upsert_document(self, doc: Document) -> int:
+        """MERGE 一篇文档的骨架，并按 index 重建 NEXT_CHUNK。返回分块数。"""
+        if not doc.chunks:
+            raise ValueError("空文档应使用 delete_document")
+        chunks = [
+            {
+                "chunk_id": chunk.chunk_id,
+                "index": chunk.index,
+                "start": chunk.start,
+                "end": chunk.end,
+            }
+            for chunk in doc.chunks
+        ]
+        keep_ids = [chunk.chunk_id for chunk in doc.chunks]
+
+        def work(tx: Any) -> None:
+            tx.run(
+                _UPSERT_DOCUMENT,
+                doc_id=doc.doc_id,
+                source=doc.source,
+                chunks=chunks,
+                keep_ids=keep_ids,
+            ).consume()
+
+        with self.driver.session() as session:
+            session.execute_write(work)
+        return len(doc.chunks)
+
+    def delete_document(self, doc_id: str) -> None:
+        """删除该 doc_id 的 Chunk 和 Document。库里没有时也成功。"""
+
+        def work(tx: Any) -> None:
+            tx.run(_DELETE_DOCUMENT, doc_id=doc_id).consume()
+
+        with self.driver.session() as session:
+            session.execute_write(work)
+
+    def neighbor_chunk_ids(
+        self,
+        chunk_ids: Sequence[str],
+    ) -> dict[str, tuple[str | None, str | None]]:
+        """读取一跳前后邻。图里没有的 id 不出现在结果里。空输入不打开驱动。"""
+        unique: list[str] = []
+        seen: set[str] = set()
+        for chunk_id in chunk_ids:
+            if chunk_id not in seen:
+                seen.add(chunk_id)
+                unique.append(chunk_id)
+        if not unique:
+            return {}
+
+        def work(tx: Any) -> list[dict[str, Any]]:
+            result = tx.run(_NEIGHBORS, chunk_ids=unique)
+            return [
+                {
+                    "chunk_id": record["chunk_id"],
+                    "prev_chunk_id": record["prev_chunk_id"],
+                    "next_chunk_id": record["next_chunk_id"],
+                }
+                for record in result
+            ]
+
+        with self.driver.session() as session:
+            rows = session.execute_read(work)
+
+        found: dict[str, tuple[str | None, str | None]] = {}
+        for row in rows:
+            chunk_id = row["chunk_id"]
+            if chunk_id in found:
+                raise GraphStoreError(f"分块 {chunk_id} 的前后邻不唯一")
+            found[chunk_id] = (row["prev_chunk_id"], row["next_chunk_id"])
+        return found
 
     def close(self) -> None:
         if self._driver is not None:

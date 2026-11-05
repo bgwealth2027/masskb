@@ -8,7 +8,8 @@ import pytest
 from qdrant_client.models import Distance, PayloadSchemaType
 
 from masskb.config import Settings
-from masskb.graph_store import GraphStore
+from masskb.graph_store import GraphStore, GraphStoreError
+from masskb.ingest import Chunk, Document
 from masskb.vector_store import (
     SEARCH_PAYLOAD_FIELDS,
     CollectionConfigError,
@@ -428,3 +429,213 @@ def test_require_compatible_collection_is_read_only(monkeypatch: pytest.MonkeyPa
     store.require_compatible_collection()
 
     assert _names(client) == ["get_collection"]
+
+
+class _GraphResult:
+    def __init__(self, rows: list[dict]) -> None:
+        self._rows = rows
+
+    def __iter__(self):
+        return iter(self._rows)
+
+    def consume(self):
+        return None
+
+    def single(self):
+        return self._rows[0] if self._rows else None
+
+
+class _GraphSession:
+    def __init__(self, rows: list[dict] | None = None) -> None:
+        self.queries: list[tuple[str, dict]] = []
+        self.write_calls = 0
+        self.read_calls = 0
+        self.rows = [] if rows is None else rows
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def execute_write(self, work):
+        self.write_calls += 1
+        return work(self)
+
+    def execute_read(self, work):
+        self.read_calls += 1
+        return work(self)
+
+    def run(self, query, **params):
+        self.queries.append((query, params))
+        return _GraphResult(self.rows)
+
+
+class _GraphDriver:
+    def __init__(self, rows: list[dict] | None = None) -> None:
+        self.session_obj = _GraphSession(rows)
+        self.sessions = 0
+        self.closed = False
+
+    def session(self):
+        self.sessions += 1
+        return self.session_obj
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _bind_graph(monkeypatch: pytest.MonkeyPatch, driver: _GraphDriver) -> GraphStore:
+    monkeypatch.setattr("masskb.graph_store.GraphDatabase.driver", lambda *args, **kwargs: driver)
+    return GraphStore(Settings(neo4j_uri="bolt://neo4j.test:7687"))
+
+
+def _skeleton_doc(*chunks: Chunk) -> Document:
+    return Document(source=chunks[0].source, doc_id=chunks[0].doc_id, chunks=chunks)
+
+
+def _skeleton_chunk(
+    chunk_id: str,
+    *,
+    index: int = 0,
+    start: int = 0,
+    end: int = 1,
+    text: str = "正文不应出现在语句里",
+) -> Chunk:
+    return Chunk(
+        doc_id='doc"1',
+        chunk_id=chunk_id,
+        source='a".txt',
+        index=index,
+        start=start,
+        end=end,
+        text=text,
+    )
+
+
+def test_ensure_schema_runs_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    driver = _GraphDriver()
+    store = _bind_graph(monkeypatch, driver)
+
+    store.ensure_schema()
+    store.ensure_schema()
+
+    assert driver.sessions == 1
+    assert driver.session_obj.write_calls == 1
+    assert driver.session_obj.read_calls == 0
+    queries = [query for query, _params in driver.session_obj.queries]
+    assert len(queries) == 3
+    combined = "\n".join(queries)
+    assert "masskb_document_doc_id" in combined
+    assert "masskb_chunk_chunk_id" in combined
+    assert "masskb_chunk_doc_id" in combined
+    assert combined.count("IF NOT EXISTS") == 3
+    assert "FOR (d:Document)" in combined
+    assert "FOR (c:Chunk)" in combined
+    assert "apoc" not in combined.lower()
+
+
+def test_upsert_document_merges_without_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    driver = _GraphDriver()
+    store = _bind_graph(monkeypatch, driver)
+    first = _skeleton_chunk('chunk"1', index=0, start=0, end=2)
+    second = _skeleton_chunk("chunk-2", index=1, start=2, end=4)
+    doc = _skeleton_doc(first, second)
+
+    assert store.upsert_document(doc) == 2
+    assert store.upsert_document(doc) == 2
+
+    assert driver.session_obj.write_calls == 2
+    assert len(driver.session_obj.queries) == 2
+    query, params = driver.session_obj.queries[0]
+    assert driver.session_obj.queries[1][1] == params
+    assert "MERGE (d:Document" in query
+    assert "MERGE (c:Chunk" in query
+    assert "HAS_CHUNK" in query
+    assert "NEXT_CHUNK" in query
+    assert "DETACH DELETE" in query
+    assert "OPTIONAL MATCH" in query
+    assert "apoc" not in query.lower()
+    assert "CREATE (" not in query
+    assert first.text not in query
+    assert first.chunk_id not in query
+    assert params["doc_id"] == first.doc_id
+    assert params["source"] == first.source
+    assert params["keep_ids"] == [first.chunk_id, second.chunk_id]
+    assert params["chunks"] == [
+        {"chunk_id": first.chunk_id, "index": 0, "start": 0, "end": 2},
+        {"chunk_id": second.chunk_id, "index": 1, "start": 2, "end": 4},
+    ]
+    assert "text" not in params["chunks"][0]
+
+
+def test_upsert_document_accepts_a_single_chunk(monkeypatch: pytest.MonkeyPatch) -> None:
+    driver = _GraphDriver()
+    store = _bind_graph(monkeypatch, driver)
+    chunk = _skeleton_chunk("only")
+
+    assert store.upsert_document(_skeleton_doc(chunk)) == 1
+
+    _query, params = driver.session_obj.queries[0]
+    assert params["keep_ids"] == ["only"]
+    assert driver.session_obj.write_calls == 1
+
+
+def test_delete_document_detaches_chunks_and_document(monkeypatch: pytest.MonkeyPatch) -> None:
+    driver = _GraphDriver()
+    store = _bind_graph(monkeypatch, driver)
+
+    store.delete_document('doc"1')
+
+    assert driver.session_obj.write_calls == 1
+    assert driver.session_obj.read_calls == 0
+    query, params = driver.session_obj.queries[0]
+    assert "DETACH DELETE" in query
+    assert "Chunk" in query
+    assert "Document" in query
+    assert params == {"doc_id": 'doc"1'}
+    assert 'doc"1' not in query
+
+
+def test_neighbor_chunk_ids_maps_rows(monkeypatch: pytest.MonkeyPatch) -> None:
+    driver = _GraphDriver(
+        rows=[
+            {"chunk_id": "c1", "prev_chunk_id": None, "next_chunk_id": "c2"},
+            {"chunk_id": "c2", "prev_chunk_id": "c1", "next_chunk_id": None},
+        ]
+    )
+    store = _bind_graph(monkeypatch, driver)
+
+    found = store.neighbor_chunk_ids(["c1", "c3"])
+
+    assert found == {"c1": (None, "c2"), "c2": ("c1", None)}
+    assert driver.session_obj.read_calls == 1
+    assert driver.session_obj.write_calls == 0
+    query, params = driver.session_obj.queries[0]
+    assert "NEXT_CHUNK" in query
+    assert "UNWIND $chunk_ids" in query
+    assert params == {"chunk_ids": ["c1", "c3"]}
+
+
+def test_neighbor_chunk_ids_rejects_duplicate_rows(monkeypatch: pytest.MonkeyPatch) -> None:
+    driver = _GraphDriver(
+        rows=[
+            {"chunk_id": "c", "prev_chunk_id": "a", "next_chunk_id": "b"},
+            {"chunk_id": "c", "prev_chunk_id": "a2", "next_chunk_id": "b2"},
+        ]
+    )
+    store = _bind_graph(monkeypatch, driver)
+
+    with pytest.raises(GraphStoreError, match="不唯一"):
+        store.neighbor_chunk_ids(["c"])
+
+
+def test_neighbor_chunk_ids_empty_does_not_open_driver(monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(*_args, **_kwargs):
+        raise AssertionError("不应连接 Neo4j")
+
+    monkeypatch.setattr("masskb.graph_store.GraphDatabase.driver", boom)
+    store = GraphStore(Settings())
+
+    assert store.neighbor_chunk_ids([]) == {}
+    assert store._driver is None
