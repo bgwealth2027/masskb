@@ -8,7 +8,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](pyproject.toml)
 
-MassKB 是一层检索中间件，目标是把向量检索、知识图谱和智能代理放在同一条调用链上。当前版本是 **0.1.0**。仓库里已有可安装的 Python 包、Qdrant 与 Neo4j 的 Docker Compose、离线单元测试，以及在 `main` 上运行的 GitHub Actions。UTF-8 的 `.txt` / `.md` 可以在本地切成稳定分块。`masskb ingest` 把这些分块写入 Qdrant，并在向量写成功后同步 Neo4j 文档骨架；`--dry-run` 只做预览。`masskb search` 默认用同一套 Embedding 模型做近邻检索，把命中的原文打成 JSON，并附上前后分块 id。加上 `--hybrid` 时，把稠密名次和 Qdrant 稀疏向量 `bm25` 的名次在进程内融合；加上 `--rewrite` 时，用 `LLM_MODEL` 在检索前把查询改写成一条检索文本；加上 `--rerank` 时，用 `LLM_MODEL` 对已经截断的命中做 listwise 重排；加上 `--answer` 时，用 `LLM_MODEL` 根据命中分块生成回答，引用只能来自这些命中的 `chunk_id`。四个开关默认关闭。`ingest --entities` 可以把人物和概念提及写入 Neo4j，默认关闭。只读 HTTP 是可选额外依赖：安装 `.[api]` 后，`masskb serve` 提供 `GET /health`、`POST /search` 与 `POST /ask`。`masskb ask` 与 `POST /ask` 提供默认不运行的工具循环。模型最多 3 步，只能调用现有检索和健康检查，再按本轮见过的 `chunk_id` 收束回答。`search` 与 `POST /search` 不变。没有会话、鉴权或入库接口。安装本包后，`MassKB` 可以调用已经启动的 `masskb serve`。客户端不导入检索管线，不启动服务，也不入库。
+MassKB 是一层检索中间件，目标是把向量检索、知识图谱和智能代理放在同一条调用链上。当前版本是 **0.1.0**。仓库里已有可安装的 Python 包、Qdrant、Neo4j 与只读应用服务的 Docker Compose、离线单元测试，以及在 `main` 上运行的 GitHub Actions。UTF-8 的 `.txt` / `.md` 可以在本地切成稳定分块。`masskb ingest` 把这些分块写入 Qdrant，并在向量写成功后同步 Neo4j 文档骨架；`--dry-run` 只做预览。`masskb search` 默认用同一套 Embedding 模型做近邻检索，把命中的原文打成 JSON，并附上前后分块 id。加上 `--hybrid` 时，把稠密名次和 Qdrant 稀疏向量 `bm25` 的名次在进程内融合；加上 `--rewrite` 时，用 `LLM_MODEL` 在检索前把查询改写成一条检索文本；加上 `--rerank` 时，用 `LLM_MODEL` 对已经截断的命中做 listwise 重排；加上 `--answer` 时，用 `LLM_MODEL` 根据命中分块生成回答，引用只能来自这些命中的 `chunk_id`。四个开关默认关闭。`ingest --entities` 可以把人物和概念提及写入 Neo4j，默认关闭。只读 HTTP 是可选额外依赖：安装 `.[api]` 后，`masskb serve` 提供 `GET /health`、`POST /search` 与 `POST /ask`。`masskb ask` 与 `POST /ask` 提供默认不运行的工具循环。模型最多 3 步，只能调用现有检索和健康检查，再按本轮见过的 `chunk_id` 收束回答。`search` 与 `POST /search` 不变。没有会话、鉴权或入库接口。安装本包后，`MassKB` 可以调用已经启动的 `masskb serve`。客户端不导入检索管线，不启动服务，也不入库。
 
 ## 目录
 
@@ -30,7 +30,7 @@ MassKB 是一层检索中间件，目标是把向量检索、知识图谱和智�
 | 向量检索 | 对文本做语义相似度查找，并可选地融合关键字名次、再用大模型重排 | `VectorStore` 连接 Qdrant。入库写入 `masskb_chunks` 的未命名余弦向量，以及名为 `bm25` 的稀疏向量。默认 `search` 仍是余弦近邻；`--hybrid` 在进程内做倒数排名融合。`--rerank` 在截断之后用 `LLM_MODEL` 做 listwise 重排，默认关闭，不增加依赖 |
 | 知识图谱 | 保存文档与分块的骨架，并读取前后邻；可选地记下人物和概念提及 | `GraphStore` 连接 Neo4j。健康检查只做 Bolt 连通性；入库 MERGE `Document` / `Chunk`，检索读取一跳 `NEXT_CHUNK`。`ingest --entities` 再 MERGE `Person` / `Concept` 和 `MENTIONS` |
 | 带引用的回答 | 用大模型根据命中分块组织回答 | `search --answer` 调用 `LLM_MODEL`。引用必须是本次命中的 `chunk_id`。默认关闭。提示词仍使用用户原文。没有工具调用循环 |
-| 只读 HTTP | 把健康检查、检索和工具循环暴露到本机 | 可选 extra `[api]`。`masskb serve` 默认监听 `127.0.0.1:8080`，调用现有的 `healthcheck()`、`search()` 与 `ask()`。核心安装不含 FastAPI。没有鉴权，也没有入库接口 |
+| 只读 HTTP | 把健康检查、检索和工具循环暴露到本机 | 可选 extra `[api]`。`masskb serve` 默认监听 `127.0.0.1:8080`，调用现有的 `healthcheck()`、`search()` 与 `ask()`。Compose 的应用服务传入 `--host 0.0.0.0`，并把端口发布到宿主机的 `127.0.0.1:8080`。核心安装不含 FastAPI。没有鉴权，也没有入库接口 |
 | Python 客户端 | 调用已经启动的只读 HTTP | `MassKB` 在核心安装里，使用已有的 `httpx`。只覆盖 `GET /health`、`POST /search`、`POST /ask`。不导入 `RetrievalPipeline`。FastAPI 仍只在 `[api]` |
 
 向量由 OpenAI 兼容的 Embedding API 生成。核心依赖是 `qdrant-client`、`neo4j`、`openai`、`python-dotenv`、`httpx`、`pydantic`。可选 extra `[api]` 才安装 `fastapi` 与 `uvicorn`。安装清单里没有 `sentence-transformers` 或 `torch`。本地切分不使用这些客户端。
@@ -39,7 +39,7 @@ MassKB 是一层检索中间件，目标是把向量检索、知识图谱和智�
 
 ### 当前运行时
 
-Docker Compose 只启动 Qdrant 和 Neo4j。Python 包跑在宿主机的虚拟环境里，直接访问本机端口。Embedding 请求发往 `LLM_BASE_URL`（默认 `https://api.openai.com/v1`）。健康检查不调用 Embedding API。`ingest --dry-run` 只在进程内切分本地文件，不访问外部服务。不带 `--dry-run` 的 `ingest` 会请求 Embedding API，把稠密向量和稀疏向量写入同一个 Qdrant 点，再把该文档的骨架写入 Neo4j。加上 `--entities` 时，骨架成功后再按分块请求 `LLM_MODEL`，把人物和概念提及写入 Neo4j。`search` 默认先请求 Embedding API。加上 `--rewrite` 时，先用 `LLM_MODEL` 把查询改写成一条检索文本，再对该文本请求 Embedding；改写失败则仍用原文。然后在 Qdrant 里做近邻查询，并按命中的 `chunk_id` 读取前后邻。检索不读取人物和概念。`--hybrid` 会再查一次稀疏向量，编码用的是同一条检索文本，并在补邻之前于进程内融合。`--rerank` 在截成 `top_k` 之后、补邻之前，用 `LLM_MODEL` 做 listwise 重排，提示词仍是用户原文。`--answer` 在补邻之后才请求聊天补全，提示词也仍是用户原文。改写失败时改用原文继续检索。Neo4j、稀疏腿、重排或回答失败时，已经拿到的命中仍然输出。检索不写入 Qdrant。`masskb serve` 在同一进程里提供 `GET /health`、`POST /search` 和 `POST /ask`，默认只绑 `127.0.0.1:8080`。健康检查和检索这两条路由复用上面的实现，不写入 Qdrant，也没有入库接口。`masskb ask` 与 `POST /ask` 默认不运行；打开后，模型最多 3 步，只能调用现有的 `search()` 和 `healthcheck()`。整次 ask 持有与检索相同的那把进程锁，循环结束才释放。
+Docker Compose 启动 Qdrant、Neo4j，以及只跑 `masskb serve` 的应用容器。宿主机虚拟环境仍然可以直接跑 CLI，并访问本机端口。Embedding 请求发往 `LLM_BASE_URL`（默认 `https://api.openai.com/v1`）。健康检查不调用 Embedding API。`ingest --dry-run` 只在进程内切分本地文件，不访问外部服务。不带 `--dry-run` 的 `ingest` 会请求 Embedding API，把稠密向量和稀疏向量写入同一个 Qdrant 点，再把该文档的骨架写入 Neo4j。加上 `--entities` 时，骨架成功后再按分块请求 `LLM_MODEL`，把人物和概念提及写入 Neo4j。`search` 默认先请求 Embedding API。加上 `--rewrite` 时，先用 `LLM_MODEL` 把查询改写成一条检索文本，再对该文本请求 Embedding；改写失败则仍用原文。然后在 Qdrant 里做近邻查询，并按命中的 `chunk_id` 读取前后邻。检索不读取人物和概念。`--hybrid` 会再查一次稀疏向量，编码用的是同一条检索文本，并在补邻之前于进程内融合。`--rerank` 在截成 `top_k` 之后、补邻之前，用 `LLM_MODEL` 做 listwise 重排，提示词仍是用户原文。`--answer` 在补邻之后才请求聊天补全，提示词也仍是用户原文。改写失败时改用原文继续检索。Neo4j、稀疏腿、重排或回答失败时，已经拿到的命中仍然输出。检索不写入 Qdrant。`masskb serve` 在同一进程里提供 `GET /health`、`POST /search` 和 `POST /ask`，默认只绑 `127.0.0.1:8080`。健康检查和检索这两条路由复用上面的实现，不写入 Qdrant，也没有入库接口。`masskb ask` 与 `POST /ask` 默认不运行；打开后，模型最多 3 步，只能调用现有的 `search()` 和 `healthcheck()`。整次 ask 持有与检索相同的那把进程锁，循环结束才释放。
 
 ```mermaid
 flowchart LR
@@ -74,17 +74,17 @@ flowchart LR
 | 编排 | `RetrievalPipeline` | `ingest()` 先写稠密和稀疏向量，再同步文档骨架；`search()` 默认做近邻检索并补前后邻，可选改写、融合、重排和回答；`healthcheck()` 汇总两个数据库的状态；`ask()` 在最多 3 步内调用这两项 |
 | 只读 HTTP | `masskb serve` | 可选 extra `[api]`（FastAPI 与 uvicorn）。默认 `127.0.0.1:8080`。进程内一把锁串行调用 `healthcheck()`、`search()` 和整次 `ask()` |
 | Python 客户端 | `MassKB` | 随核心安装提供，不新增依赖。调用已经启动的 `masskb serve`，不导入管线，不启动服务 |
-| 部署 | `docker-compose.yml` | 数据卷：`qdrant_data`、`neo4j_data`、`neo4j_logs`。没有应用容器 |
+| 部署 | `Dockerfile` 与 `docker-compose.yml` | 服务 `app`（容器名 `masskb-app`，镜像 `masskb-app:local`）只跑 `masskb serve`。数据卷仍是 `qdrant_data`、`neo4j_data`、`neo4j_logs` |
 
 ### 目标架构图
 
-设计图放在 [`docs/architecture/`](docs/architecture/README.md)，源文件是 draw.io，可用 [diagrams.net](https://app.diagrams.net/) 打开。这些图描述的是目标形态。图中的完整 REST、独立检索引擎、应用容器和本地嵌入推理容器仍未落地。进程内有界工具循环已由 `masskb ask` 落地，只调用现有检索与健康检查。图中的意图理解分叉、图谱工具、独立 Agent 服务和完整 SDK 仍是目标。Python 只读客户端已覆盖 `GET /health`、`POST /search` 与 `POST /ask`。代码里另有可选的本地只读 HTTP：`masskb serve` 提供健康检查、检索和 `POST /ask`。关键字检索是 Qdrant 稀疏向量，融合在进程内。向量入库、文档骨架与查询以 [当前状态](#当前状态) 为准。
+设计图放在 [`docs/architecture/`](docs/architecture/README.md)，源文件是 draw.io，可用 [diagrams.net](https://app.diagrams.net/) 打开。这些图描述的是目标形态。应用容器已落地为这三条只读路由。图中的完整 REST、独立检索引擎和本地嵌入推理容器仍未落地。进程内有界工具循环已由 `masskb ask` 落地，只调用现有检索与健康检查。图中的意图理解分叉、图谱工具、独立 Agent 服务和完整 SDK 仍是目标。Python 只读客户端已覆盖 `GET /health`、`POST /search` 与 `POST /ask`。代码里另有可选的本地只读 HTTP：`masskb serve` 提供健康检查、检索和 `POST /ask`。关键字检索是 Qdrant 稀疏向量，融合在进程内。向量入库、文档骨架与查询以 [当前状态](#当前状态) 为准。
 
 | 文件 | 图名 | 图里有什么 |
 |------|------|------------|
 | [01-总体架构.drawio](docs/architecture/01-总体架构.drawio) | 总体架构 | 检索层、图谱层、智能层，以及面向集成方的 SDK / REST |
 | [02-数据流.drawio](docs/architecture/02-数据流.drawio) | 数据流 | 索引与图谱构建、查询路径。图中向量模型写作 bge-m3；代码默认模型是 `text-embedding-3-small` |
-| [03-部署架构.drawio](docs/architecture/03-部署架构.drawio) | 部署架构 | Compose 网络。图中还有应用容器和可选嵌入容器；当前 Compose 文件没有这两项 |
+| [03-部署架构.drawio](docs/architecture/03-部署架构.drawio) | 部署架构 | Compose 网络含 Qdrant、Neo4j 和只读应用服务。图中的可选嵌入容器仍不在 Compose 文件里 |
 | [04-集成与社区.drawio](docs/architecture/04-集成与社区.drawio) | 集成与社区 | 第三方经 SDK / API 集成，以及 Fork → PR → CI → 合并。Python 只读客户端已覆盖现有三条路由。图中的完整 SDK、多语言 SDK 和完整 REST 仍是目标；`masskb serve` 只是本机只读包装。CI 已跑离线测试 |
 
 ## 当前状态
@@ -109,12 +109,13 @@ flowchart LR
 | 重排 | 已实现 | `search --rerank` 默认关闭。在稠密或 RRF 截成 `top_k` 之后、补邻和回答之前，用 `LLM_MODEL` 做 listwise 重排。成功时 `score_kind` 为 `rerank`，`score` 为 `1/名次`。不新增依赖，也不重排融合前的候选。提示词使用用户原文 |
 | 查询改写 | 已实现 | `search --rewrite` 与 `POST /search` 的 `rewrite` 默认关闭。检索前用 `LLM_MODEL` 把查询改写成一条文本，供 embedding 和 bm25 使用。失败则用原文检索，退出码仍为 0。JSON 里的 `query` 始终是用户原文。重排和回答的提示词也使用原文 |
 | 只读 HTTP | 已实现 | 可选 extra `[api]`。`masskb serve` 提供 `GET /health`、`POST /search` 与 `POST /ask`。前两条响应与 CLI 的健康检查字典和 `search` JSON 一致。默认只绑 `127.0.0.1`，无鉴权。不提供 ingest |
+| 应用容器 | 已实现 | `Dockerfile` 与 Compose 服务 `app`。容器内执行 `masskb serve --host 0.0.0.0 --port 8080`，宿主机只发布 `127.0.0.1:8080`。不入库、无鉴权、不含嵌入推理 |
 | Agent | 已实现（第一版，默认不运行） | `masskb ask` 与 `POST /ask`。模型在最多 3 步内调用已有的 `search` 与 `healthcheck`，再给出带 `chunk_id` 引用的回答。默认不进入 `search`。没有图谱查询、人物概念读取、别名合并、会话或多用户 |
 | Python 客户端 | 已实现（第一版） | `masskb.client.MassKB` 调用 `GET /health`、`POST /search`、`POST /ask`。与这三条 HTTP JSON 一致。不导入 `RetrievalPipeline`。不提供入库、鉴权或会话 |
 
 ## 安装与运行
 
-需要 Python 3.10 或更高版本（CI 使用 3.12）以及 Docker Compose。Python 包不在容器里运行。本地切分预览不需要启动容器，也不需要 API Key。写入向量和执行检索时需要 Qdrant 和真实的 `OPENAI_API_KEY`。同步文档骨架和补前后分块时还需要 Neo4j；检索在 Neo4j 不可用时仍返回向量命中。
+需要 Python 3.10 或更高版本（CI 使用 3.12）以及 Docker Compose。应用容器只跑 `masskb serve`。CLI、入库和离线测试仍在宿主机。本地切分预览不需要启动容器，也不需要 API Key。写入向量和执行检索时需要 Qdrant 和真实的 `OPENAI_API_KEY`。同步文档骨架和补前后分块时还需要 Neo4j；检索在 Neo4j 不可用时仍返回向量命中。
 
 ### 1. 克隆
 
@@ -125,10 +126,21 @@ cd masskb
 
 ### 2. 启动 Qdrant 与 Neo4j
 
+只要数据库、CLI 仍在宿主机时：
+
 ```bash
-docker compose up -d
+docker compose up -d qdrant neo4j
 docker compose ps
 ```
+
+连同只读应用容器：
+
+```bash
+docker compose up -d --build
+curl -sS http://127.0.0.1:8080/health
+```
+
+应用容器执行 `masskb serve --host 0.0.0.0 --port 8080`，端口只发布到宿主机的 `127.0.0.1:8080`。不要在宿主机同时再跑一个 `masskb serve`。入库仍用宿主机上的 `masskb ingest`。
 
 | 服务 | 地址 |
 |------|------|
@@ -137,7 +149,7 @@ docker compose ps
 | Neo4j Browser | http://localhost:7474 |
 | Neo4j Bolt | `bolt://localhost:7687` |
 
-Compose 里的开发凭据是 `NEO4J_AUTH=neo4j/masskb-dev-pass`。这是本地示例密码，不要直接用于共享或生产环境。首次启动 Neo4j 时会拉取 APOC，健康检查的 `start_period` 是 40 秒。
+Compose 里的开发凭据默认是 `neo4j/masskb-dev-pass`（未设置 `NEO4J_DEV_PASSWORD` 时）。这是本地示例密码，不要直接用于共享或生产环境。应用容器的 `NEO4J_PASSWORD` 使用同一个默认值。首次启动 Neo4j 时会拉取 APOC，健康检查的 `start_period` 是 40 秒。
 
 ### 3. 准备 `.env`
 
@@ -145,7 +157,7 @@ Compose 里的开发凭据是 `NEO4J_AUTH=neo4j/masskb-dev-pass`。这是本地�
 cp .env.example .env
 ```
 
-至少把 `NEO4J_PASSWORD` 改成与 Compose 一致的 `masskb-dev-pass`。`.env.example` 里的 `your-neo4j-password-here` 和 `sk-your-api-key-here` 都只是占位符。没有真实 `OPENAI_API_KEY` 时，数据库健康检查仍然可以执行；`EmbeddingClient` 在真正请求前会拒绝占位 Key。`.env` 已被 `.gitignore` 排除。
+至少把 `NEO4J_PASSWORD` 改成与 Compose 一致的 `masskb-dev-pass`。应用容器不读取这一行，它使用 Compose 的 `NEO4J_DEV_PASSWORD`（默认 `masskb-dev-pass`）。若设置了 `NEO4J_DEV_PASSWORD`，这里也要写成同一个值。`.env.example` 里的 `your-neo4j-password-here` 和 `sk-your-api-key-here` 都只是占位符。没有真实 `OPENAI_API_KEY` 时，数据库健康检查仍然可以执行；`EmbeddingClient` 在真正请求前会拒绝占位 Key。容器会原样收到 `.env` 里的 `OPENAI_API_KEY`；占位符仍视为未配置。`.env` 已被 `.gitignore` 排除。
 
 ### 4. 创建虚拟环境并安装
 
@@ -245,7 +257,7 @@ python -m pip install -e ".[api]"
 masskb serve
 ```
 
-默认监听 `http://127.0.0.1:8080`。`--host` 与 `--port` 只在命令行上，不进入 `Settings`，也没有新的环境变量。未安装 `[api]` 时命令以退出码 1 结束，并提示执行 `pip install -e ".[api]"`。不带子命令时仍然是健康检查。
+默认监听 `http://127.0.0.1:8080`。`--host` 与 `--port` 只在命令行上，不进入 `Settings`，也没有新的环境变量。Compose 的应用服务传入 `--host 0.0.0.0`，端口只发布到宿主机的 `127.0.0.1:8080`。不要在宿主机同时再跑一个 `masskb serve`，否则会占用同一个端口。未安装 `[api]` 时命令以退出码 1 结束，并提示执行 `pip install -e ".[api]"`。不带子命令时仍然是健康检查。
 
 ```bash
 curl -sS http://127.0.0.1:8080/health
@@ -318,6 +330,8 @@ python -m pytest
 
 导入 `masskb.config` 时会加载仓库根目录的 `.env`，并把 `localhost`、`127.0.0.1` 和 `::1` 写入 `NO_PROXY` 与 `no_proxy`，避免本机 Docker 端口被系统 HTTP 代理截走。
 
+宿主机 `.env` 继续使用下表的 localhost 地址。应用容器不读 `QDRANT_URL` 和 `NEO4J_URI` 这两行；Compose 把它们写成 `http://qdrant:6333` 和 `bolt://neo4j:7687`。`NEO4J_DEV_PASSWORD` 只参与 Compose 插值，不是 `Settings` 字段。未设置时 Neo4j 与应用容器都使用 `masskb-dev-pass`。
+
 | 变量 | 未设置时的代码默认值 | 说明 |
 |------|----------------------|------|
 | `QDRANT_URL` | `http://localhost:6333` | Qdrant HTTP 地址 |
@@ -335,7 +349,9 @@ python -m pytest
 
 ```
 masskb/
-├── docker-compose.yml          # Qdrant + Neo4j
+├── Dockerfile                  # 只读应用镜像：masskb serve
+├── .dockerignore
+├── docker-compose.yml          # Qdrant、Neo4j 与只读应用服务
 ├── pyproject.toml              # 包元数据、依赖、pytest / ruff 配置
 ├── requirements.txt            # 与 pyproject 运行依赖对齐的清单
 ├── .env.example                # 环境变量模板（不含可用密钥）
@@ -409,13 +425,14 @@ masskb/
 | `tests/test_api.py` | `GET /health`、`POST /search` 与 `POST /ask` 的状态码、`asdict` 正文、校验失败、软失败和 `close()`。不绑定端口。`rewrite` 默认 false。`POST /search` 不接受 `agent` 字段 |
 | `tests/test_client.py` | `MassKB` 的请求体、JSON 解析、422/503、软失败和 `close()`。`MockTransport` 不访问网络。`ASGITransport` 对照现有 `create_app` 的 JSON。导入客户端不会加载管线 |
 | `tests/test_cli.py` | CLI 退出码、默认子命令、帮助文本、`scripts/healthcheck.py`，dry-run 不创建外部客户端，不带 `--dry-run` 时的写入输出，以及 `search` 的 JSON（含前后 `chunk_id`、`graph`、`hybrid`、`answer`、`rerank` 和 `rewrite`）。`ask` 的 JSON、开关转发和步数越界。`--entities` 只在打开时多打印计数。`serve` 懒加载 uvicorn，缺依赖时退出码为 1 |
+| `tests/test_app_image.py` | Dockerfile、`.dockerignore` 与 Compose 服务 `app` 的静态契约。不启动 Docker，不读取密钥 |
 
 工作流文件是 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)。触发条件：
 
 - 推送到 `main`
 - 任意 Pull Request
 
-作业在 `ubuntu-latest` 上使用 Python 3.12，执行 `pip install -e ".[dev,api]"` 和 `python -m pytest`。CI 不启动 Docker，也不运行 `ruff`。本地若要检查风格，可在安装开发依赖后执行 `ruff check`。
+作业在 `ubuntu-latest` 上使用 Python 3.12，执行 `pip install -e ".[dev,api]"` 和 `python -m pytest`。CI 不启动 Docker，也不构建应用镜像，也不运行 `ruff`。本地若要检查风格，可在安装开发依赖后执行 `ruff check`。
 
 ## 许可证
 

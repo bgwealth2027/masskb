@@ -22,7 +22,7 @@ services:
       - "7474:7474"
       - "7687:7687"
     environment:
-      NEO4J_AUTH: neo4j/masskb-dev-pass
+      NEO4J_AUTH: "neo4j/${NEO4J_DEV_PASSWORD:-masskb-dev-pass}"
       NEO4J_PLUGINS: '["apoc"]'
     volumes:
       - neo4j_data:/data
@@ -34,6 +34,35 @@ services:
       timeout: 10s
       retries: 10
       start_period: 40s
+
+  app:
+    image: masskb-app:local
+    build: .
+    container_name: masskb-app
+    command: ["masskb", "serve", "--host", "0.0.0.0", "--port", "8080"]
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      QDRANT_URL: http://qdrant:6333
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: "${NEO4J_DEV_PASSWORD:-masskb-dev-pass}"
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      LLM_BASE_URL: "${LLM_BASE_URL:-https://api.openai.com/v1}"
+      EMBEDDING_MODEL: "${EMBEDDING_MODEL:-text-embedding-3-small}"
+      LLM_MODEL: "${LLM_MODEL:-gpt-4o-mini}"
+    depends_on:
+      qdrant:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health')"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
 
 volumes:
   qdrant_data:
