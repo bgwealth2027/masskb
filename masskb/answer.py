@@ -56,7 +56,10 @@ def no_hits_answer() -> AnswerStatus:
 
 
 class ChatClient:
-    """OpenAI 兼容聊天。与 Embedding 共用 Key 和 base_url，模型用 LLM_MODEL。"""
+    """OpenAI 兼容聊天。使用 LLM_BASE_URL 与真实 API Key，模型用 LLM_MODEL。
+
+    不读取 EMBEDDING_BASE_URL。嵌入地址只供 EmbeddingClient 使用。
+    """
 
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()

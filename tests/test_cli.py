@@ -14,6 +14,7 @@ import pytest
 
 from masskb.__main__ import main
 from masskb.answer import AnswerStatus
+from masskb.config import Settings
 from masskb.pipeline import (
     AgentStep,
     AskResult,
@@ -74,6 +75,31 @@ def test_healthcheck_success(
     payload = json.loads(out.split("---", 1)[1])
     assert payload["ok"] is True
     assert payload["qdrant"]["collections"] == ["docs"]
+    assert closed == ["closed"]
+
+
+def test_healthcheck_notes_dedicated_embedding_url(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    closed: list[str] = []
+
+    class Pipeline:
+        def __init__(self) -> None:
+            self.settings = Settings(embedding_base_url="http://127.0.0.1:8081/v1")
+
+        def healthcheck(self) -> dict:
+            return _result(ok=True, openai=False)
+
+        def close(self) -> None:
+            closed.append("closed")
+
+    monkeypatch.setattr("masskb.__main__.RetrievalPipeline", Pipeline)
+
+    assert main(["healthcheck"]) == 0
+    out = capsys.readouterr().out
+    assert "OPENAI_API_KEY 未配置真实值" in out
+    assert "嵌入地址已单独配置（本检查未调用）" in out
     assert closed == ["closed"]
 
 
