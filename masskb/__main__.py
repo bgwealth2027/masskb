@@ -5,8 +5,18 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from pathlib import Path
 
+from masskb.ingest import (
+    DEFAULT_CHUNK_OVERLAP,
+    DEFAULT_CHUNK_SIZE,
+    IngestError,
+    IngestReport,
+    ingest_path,
+)
 from masskb.pipeline import RetrievalPipeline
+
+_PREVIEW_CHARS = 80
 
 
 def cmd_healthcheck(_: argparse.Namespace) -> int:
@@ -41,12 +51,111 @@ def cmd_healthcheck(_: argparse.Namespace) -> int:
     return 0 if result.get("ok") else 1
 
 
+def _preview_text(text: str, limit: int = _PREVIEW_CHARS) -> str:
+    flat = " ".join(text.split())
+    if len(flat) <= limit:
+        return flat
+    return flat[: limit - 1] + "…"
+
+
+def _format_report(report: IngestReport, *, dry_run: bool, preview_limit: int) -> str:
+    header = "=== MassKB Ingest (dry-run) ===" if dry_run else "=== MassKB Ingest ==="
+    lines = [
+        header,
+        f"files: {report.file_count}",
+        f"chunks: {report.chunk_count}",
+        "---",
+    ]
+    for doc in report.files:
+        lines.append(f"source: {doc.source}")
+        lines.append(f"doc_id: {doc.doc_id}")
+        lines.append(f"file_chunks: {len(doc.chunks)}")
+        shown = doc.chunks[:preview_limit]
+        for chunk in shown:
+            lines.append(
+                f"[{chunk.index}] chunk_id={chunk.chunk_id} "
+                f"start={chunk.start} end={chunk.end}"
+            )
+            lines.append(f"    {_preview_text(chunk.text)}")
+        hidden = len(doc.chunks) - len(shown)
+        if hidden:
+            lines.append(f"... 还有 {hidden} 个分块未展示")
+    if dry_run:
+        lines.append("[INFO] dry-run：未连接 Qdrant、Neo4j 或 OpenAI。")
+    else:
+        lines.append("[INFO] 未写入向量库：当前版本不会连接 Qdrant、Neo4j 或 OpenAI。")
+    return "\n".join(lines)
+
+
+def cmd_ingest(args: argparse.Namespace) -> int:
+    """本地切分并打印预览。不创建 Qdrant / Neo4j / OpenAI 客户端。"""
+    if args.preview < 0:
+        print("[FAIL] preview 不能为负", file=sys.stderr)
+        return 1
+    path = Path(args.path).expanduser()
+    root = Path(args.root).expanduser() if args.root is not None else None
+    try:
+        report = ingest_path(
+            path,
+            root=root,
+            chunk_size=args.chunk_size,
+            overlap=args.overlap,
+        )
+    except IngestError as exc:
+        print(f"[FAIL] {exc}", file=sys.stderr)
+        return 1
+    print(
+        _format_report(
+            report,
+            dry_run=bool(args.dry_run),
+            preview_limit=args.preview,
+        )
+    )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="masskb", description="MassKB 检索中间件 CLI")
     sub = parser.add_subparsers(dest="command")
 
     health = sub.add_parser("healthcheck", help="检查 Qdrant + Neo4j 连通性")
     health.set_defaults(func=cmd_healthcheck)
+
+    ingest = sub.add_parser(
+        "ingest",
+        help="本地切分 UTF-8 的 .txt/.md 并预览（不写向量库）",
+    )
+    ingest.add_argument("path", type=Path, help="要切分的 .txt/.md 文件或目录")
+    ingest.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="只做本地预览，不连接 Qdrant / Neo4j / OpenAI",
+    )
+    ingest.add_argument(
+        "--root",
+        type=Path,
+        default=None,
+        help="计算 doc_id 的路径根；默认仓库根（仓库外文件用绝对路径）",
+    )
+    ingest.add_argument(
+        "--chunk-size",
+        type=int,
+        default=DEFAULT_CHUNK_SIZE,
+        help=f"超长段落的字符窗口（默认 {DEFAULT_CHUNK_SIZE}）",
+    )
+    ingest.add_argument(
+        "--overlap",
+        type=int,
+        default=DEFAULT_CHUNK_OVERLAP,
+        help=f"相邻窗口重叠的字符数（默认 {DEFAULT_CHUNK_OVERLAP}）",
+    )
+    ingest.add_argument(
+        "--preview",
+        type=int,
+        default=3,
+        help="每个文件最多展示的分块条数（默认 3）",
+    )
+    ingest.set_defaults(func=cmd_ingest)
 
     return parser
 

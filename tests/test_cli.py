@@ -107,6 +107,152 @@ def test_help(capsys: pytest.CaptureFixture[str]) -> None:
     assert "healthcheck" in capsys.readouterr().out
 
 
+def _forbid_external_clients(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    created: list[str] = []
+
+    def forbid(name: str):
+        def _boom(*_args, **_kwargs):
+            created.append(name)
+            raise AssertionError(f"不应创建 {name}")
+
+        return _boom
+
+    monkeypatch.setattr("masskb.__main__.RetrievalPipeline", forbid("RetrievalPipeline"))
+    monkeypatch.setattr("masskb.vector_store.VectorStore", forbid("VectorStore"))
+    monkeypatch.setattr("masskb.vector_store.QdrantClient", forbid("QdrantClient"))
+    monkeypatch.setattr("masskb.graph_store.GraphStore", forbid("GraphStore"))
+    monkeypatch.setattr("masskb.graph_store.GraphDatabase.driver", forbid("Neo4jDriver"))
+    monkeypatch.setattr("masskb.embeddings.EmbeddingClient", forbid("EmbeddingClient"))
+    monkeypatch.setattr("masskb.embeddings.OpenAI", forbid("OpenAI"))
+    monkeypatch.setattr("masskb.config.get_settings", forbid("get_settings"))
+    return created
+
+
+def test_ingest_dry_run_prints_counts_without_clients(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root = tmp_path / "corpus"
+    root.mkdir()
+    (root / "note.md").write_text("# 标题\n\n" + ("甲" * 120), encoding="utf-8")
+    (root / "skip.py").write_text("x = 1\n", encoding="utf-8")
+    created = _forbid_external_clients(monkeypatch)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.chdir(tmp_path)
+
+    code = main(
+        [
+            "ingest",
+            "corpus",
+            "--dry-run",
+            "--root",
+            str(root),
+            "--chunk-size",
+            "50",
+            "--overlap",
+            "10",
+            "--preview",
+            "1",
+        ]
+    )
+
+    assert code == 0
+    assert created == []
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    out = captured.out
+    assert out.startswith("=== MassKB Ingest (dry-run) ===\n")
+    assert "files: 1\nchunks: 4\n" in out
+    assert "source: note.md" in out
+    assert "# 标题" in out
+    assert "... 还有 3 个分块未展示" in out
+    assert "[INFO] dry-run：未连接 Qdrant、Neo4j 或 OpenAI。" in out
+    assert "未写入向量库" not in out
+
+
+def test_ingest_without_dry_run_still_does_not_create_clients(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    path = tmp_path / "a.txt"
+    path.write_text("hello\n", encoding="utf-8")
+    created = _forbid_external_clients(monkeypatch)
+
+    assert main(["ingest", str(path), "--root", str(tmp_path)]) == 0
+
+    assert created == []
+    out = capsys.readouterr().out
+    assert out.startswith("=== MassKB Ingest ===\n")
+    assert "files: 1\nchunks: 1\n" in out
+    assert "hello" in out
+    assert "(dry-run)" not in out
+    assert "[INFO] 未写入向量库：当前版本不会连接 Qdrant、Neo4j 或 OpenAI。" in out
+
+
+def test_ingest_dry_run_doc_id_stable_across_cwd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root = tmp_path / "root"
+    nested = root / "sub"
+    nested.mkdir(parents=True)
+    target = nested / "a.md"
+    target.write_text("hello\n", encoding="utf-8")
+    _forbid_external_clients(monkeypatch)
+
+    monkeypatch.chdir(tmp_path)
+    assert main(["ingest", str(target), "--dry-run", "--root", str(root)]) == 0
+    first = capsys.readouterr().out
+
+    monkeypatch.chdir(nested)
+    assert main(["ingest", "a.md", "--dry-run", "--root", str(root)]) == 0
+    second = capsys.readouterr().out
+
+    assert "source: sub/a.md" in first
+    assert "source: sub/a.md" in second
+    doc_line = next(line for line in first.splitlines() if line.startswith("doc_id:"))
+    chunk_line = next(line for line in first.splitlines() if "chunk_id=" in line)
+    assert doc_line in second
+    assert chunk_line in second
+
+
+def test_ingest_rejects_bad_input(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    py_file = tmp_path / "a.py"
+    py_file.write_text("print(1)\n", encoding="utf-8")
+    assert main(["ingest", str(py_file), "--dry-run"]) == 1
+    assert ".txt" in capsys.readouterr().err
+
+    missing = tmp_path / "missing.md"
+    assert main(["ingest", str(missing), "--dry-run"]) == 1
+    assert "不存在" in capsys.readouterr().err
+
+    bad = tmp_path / "bad.txt"
+    bad.write_bytes("中文".encode("gbk"))
+    assert main(["ingest", str(bad), "--dry-run"]) == 1
+    assert "UTF-8" in capsys.readouterr().err
+
+    ok = tmp_path / "ok.txt"
+    ok.write_text("hi\n", encoding="utf-8")
+    assert main(["ingest", str(ok), "--dry-run", "--chunk-size", "8", "--overlap", "8"]) == 1
+    assert "overlap" in capsys.readouterr().err
+    assert main(["ingest", str(ok), "--dry-run", "--preview", "-1"]) == 1
+
+
+def test_ingest_help(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as exc:
+        main(["ingest", "--help"])
+    assert exc.value.code == 0
+    out = capsys.readouterr().out
+    assert "--dry-run" in out
+    assert "chunk-size" in out
+
+
 def test_script_entrypoint(monkeypatch: pytest.MonkeyPatch) -> None:
     closed: list[str] = []
     _patch(monkeypatch, _result(ok=True, openai=False), closed)
