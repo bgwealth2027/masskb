@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from dataclasses import asdict
 from pathlib import Path
 
 from masskb.ingest import (
@@ -146,6 +147,21 @@ def cmd_ingest(args: argparse.Namespace) -> int:
         pipeline.close()
 
 
+def cmd_search(args: argparse.Namespace) -> int:
+    """查询向量近邻，并把 JSON 打到 stdout。失败信息只写 stderr。"""
+    pipeline = RetrievalPipeline()
+    try:
+        try:
+            result = pipeline.search(args.query, top_k=args.top_k, doc_id=args.doc_id)
+        except Exception as exc:  # noqa: BLE001 — CLI 把检索失败转成退出码
+            print(f"[FAIL] {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(asdict(result), ensure_ascii=False, indent=2))
+        return 0
+    finally:
+        pipeline.close()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="masskb", description="MassKB 检索中间件 CLI")
     sub = parser.add_subparsers(dest="command")
@@ -188,6 +204,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="每个文件最多展示的分块条数（默认 3）",
     )
     ingest.set_defaults(func=cmd_ingest)
+
+    search = sub.add_parser(
+        "search",
+        help="用与入库相同的模型做 Qdrant 近邻检索，并把 JSON 打到 stdout",
+    )
+    search.add_argument("query", help="查询文本")
+    search.add_argument(
+        "--top-k",
+        type=int,
+        default=5,
+        help="返回的命中条数（默认 5）",
+    )
+    search.add_argument(
+        "--doc-id",
+        default=None,
+        help="只检索该 doc_id；不传则搜索整个集合",
+    )
+    search.set_defaults(func=cmd_search)
 
     return parser
 

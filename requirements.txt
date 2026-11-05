@@ -1,5 +1,5 @@
 # MassKB 核心依赖（embedding 走 OpenAI-compatible API，不装 sentence-transformers / torch）
-qdrant-client>=1.9.0
+qdrant-client>=1.13.0
 neo4j>=5.14.0
 openai>=1.40.0
 python-dotenv>=1.0.0

@@ -8,7 +8,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](pyproject.toml)
 
-MassKB 是一层检索中间件，目标是把向量检索、知识图谱和智能代理放在同一条调用链上。当前版本是 **0.1.0**。仓库里已有可安装的 Python 包、Qdrant 与 Neo4j 的 Docker Compose、离线单元测试，以及在 `main` 上运行的 GitHub Actions。UTF-8 的 `.txt` / `.md` 可以在本地切成稳定分块。`masskb ingest` 把这些分块写入 Qdrant；`--dry-run` 只做预览。混合检索仍未完成，调用 `RetrievalPipeline.search` 会抛出 `NotImplementedError`。
+MassKB 是一层检索中间件，目标是把向量检索、知识图谱和智能代理放在同一条调用链上。当前版本是 **0.1.0**。仓库里已有可安装的 Python 包、Qdrant 与 Neo4j 的 Docker Compose、离线单元测试，以及在 `main` 上运行的 GitHub Actions。UTF-8 的 `.txt` / `.md` 可以在本地切成稳定分块。`masskb ingest` 把这些分块写入 Qdrant；`--dry-run` 只做预览。`masskb search` 用同一套 Embedding 模型做近邻检索，并把命中的原文打成 JSON。图谱写入、BM25、混合检索、RAG、REST API 和 Agent 仍未做。
 
 ## 目录
 
@@ -27,7 +27,7 @@ MassKB 是一层检索中间件，目标是把向量检索、知识图谱和智�
 
 | 组成部分 | 目标职责 | 本仓库里的落点 |
 |----------|----------|----------------|
-| 向量检索 | 对文本做语义相似度查找 | `VectorStore` 连接 Qdrant。已能建集合并写入分块；相似度查询仍未做 |
+| 向量检索 | 对文本做语义相似度查找 | `VectorStore` 连接 Qdrant。入库写入 `masskb_chunks`；`search` 用同一 Embedding 模型做余弦近邻查询 |
 | 知识图谱 | 保存实体与关系，并支持图查询 | `GraphStore` 连接 Neo4j，目前只做 Bolt 连通性检查 |
 | 智能代理 | 用大模型改写查询、调度检索并组织回答 | 配置项已预留；没有对话客户端，也没有工具调用循环 |
 
@@ -37,7 +37,7 @@ MassKB 是一层检索中间件，目标是把向量检索、知识图谱和智�
 
 ### 当前运行时
 
-Docker Compose 只启动 Qdrant 和 Neo4j。Python 包跑在宿主机的虚拟环境里，直接访问本机端口。Embedding 请求发往 `LLM_BASE_URL`（默认 `https://api.openai.com/v1`）。健康检查不调用 Embedding API。`ingest --dry-run` 只在进程内切分本地文件，不访问外部服务。不带 `--dry-run` 的 `ingest` 会请求 Embedding API，并把向量写入 Qdrant，不连接 Neo4j。
+Docker Compose 只启动 Qdrant 和 Neo4j。Python 包跑在宿主机的虚拟环境里，直接访问本机端口。Embedding 请求发往 `LLM_BASE_URL`（默认 `https://api.openai.com/v1`）。健康检查不调用 Embedding API。`ingest --dry-run` 只在进程内切分本地文件，不访问外部服务。不带 `--dry-run` 的 `ingest` 会请求 Embedding API，并把向量写入 Qdrant，不连接 Neo4j。`search` 会先请求 Embedding API，再在 Qdrant 里做近邻查询，不连接 Neo4j，也不写入。
 
 ```mermaid
 flowchart LR
@@ -48,6 +48,7 @@ flowchart LR
 
   pkg -->|"healthcheck"| qdrant
   pkg -->|"ingest 写入"| qdrant
+  pkg -->|"search 查询"| qdrant
   pkg -->|"healthcheck"| neo4j
   pkg -->|"EmbeddingClient"| api
 ```
@@ -58,12 +59,12 @@ flowchart LR
 | Neo4j 5 | `neo4j:5` | Browser `7474`，Bolt `7687`；容器名 `masskb-neo4j`；Compose 会安装 APOC，业务代码尚未调用 |
 | Embedding / LLM | OpenAI 兼容 HTTP API | `EmbeddingClient` 会请求 embeddings；`LLM_MODEL` 已读入配置，没有对应的对话调用 |
 | 本地切分 | `masskb.ingest` | 空行分段，超长段按字符窗口切开。`ingest` 默认把分块写入 Qdrant；`--dry-run` 只预览 |
-| 编排 | `RetrievalPipeline` | `ingest()` 写入向量；`healthcheck()` 汇总两个数据库的状态；`search()` 未实现 |
+| 编排 | `RetrievalPipeline` | `ingest()` 写入向量；`search()` 做近邻检索；`healthcheck()` 汇总两个数据库的状态 |
 | 部署 | `docker-compose.yml` | 数据卷：`qdrant_data`、`neo4j_data`、`neo4j_logs` |
 
 ### 目标架构图
 
-设计图放在 [`docs/architecture/`](docs/architecture/README.md)，源文件是 draw.io，可用 [diagrams.net](https://app.diagrams.net/) 打开。这些图描述的是目标形态。图中的 REST API、BM25、混合检索、Agent 工具调用、应用容器和本地嵌入推理容器仍未落地；向量入库以 [当前状态](#当前状态) 为准。
+设计图放在 [`docs/architecture/`](docs/architecture/README.md)，源文件是 draw.io，可用 [diagrams.net](https://app.diagrams.net/) 打开。这些图描述的是目标形态。图中的 REST API、BM25、混合检索、Agent 工具调用、应用容器和本地嵌入推理容器仍未落地；向量入库与向量查询以 [当前状态](#当前状态) 为准。
 
 | 文件 | 图名 | 图里有什么 |
 |------|------|------------|
@@ -74,24 +75,24 @@ flowchart LR
 
 ## 当前状态
 
-仓库里已有核心包、本地文本切分、Qdrant 向量入库、离线测试和 CI。向量检索仍未做，下表只统计当前代码。
+仓库里已有核心包、本地文本切分、Qdrant 向量入库与近邻检索、离线测试和 CI。图谱、BM25、混合检索和 Agent 仍未做，下表只统计当前代码。
 
 | 能力 | 状态 | 说明 |
 |------|------|------|
 | 环境配置 | 已实现 | `masskb.config.Settings` 读取仓库根目录 `.env` 与环境变量 |
 | Embedding 客户端 | 已实现 | `EmbeddingClient.embed` / `embed_one`；占位 API Key 会直接报错，测试里客户端被 mock |
-| Qdrant 封装 | 部分实现 | 健康检查、建集合、批量 upsert、按 `doc_id` 删除；没有相似度查询 |
+| Qdrant 封装 | 已实现 | 健康检查、建集合、批量 upsert、按 `doc_id` 删除、余弦近邻查询。查询不创建集合 |
 | Neo4j 封装 | 部分实现 | `verify_connectivity` 与 `RETURN 1`；没有实体模型或业务 Cypher |
 | 健康检查 CLI | 已实现 | `masskb healthcheck`、`python -m masskb`、`scripts/healthcheck.py` |
 | 文本切分 | 已实现 | UTF-8 `.txt` / `.md` 切成带稳定 `doc_id`、`chunk_id` 和字符偏移的分块。`masskb ingest --dry-run` 只打印预览，不连接 Qdrant、Neo4j 或 OpenAI |
 | 向量入库 | 已实现 | 默认集合 `masskb_chunks`，余弦距离，1536 维。写入前探测一次向量维度，不一致则中止且不写。重复运行按 point id 覆盖，并按 `doc_id` 删除该文档的过期点 |
 | 离线测试与 CI | 已实现 | `tests/` 不连接真实服务；`.github/workflows/ci.yml` 在 `main` 推送和 Pull Request 上运行 |
-| `RetrievalPipeline.search` | 未实现 | 调用即抛出 `NotImplementedError` |
+| 向量检索 | 已实现 | `RetrievalPipeline.search` 与 `masskb search`。同一 Embedding 模型，返回分数、原文、路径、`chunk_id` 和字符偏移。集合不存在或没有命中时得到空列表 |
 | 混合检索、图谱构建、Agent、REST API | 未实现 | 只出现在 `docs/architecture/` 的设计图中 |
 
 ## 安装与运行
 
-需要 Python 3.10 或更高版本（CI 使用 3.12）以及 Docker Compose。Python 包不在容器里运行。本地切分预览不需要启动容器，也不需要 API Key。写入向量时需要 Qdrant 和真实的 `OPENAI_API_KEY`。
+需要 Python 3.10 或更高版本（CI 使用 3.12）以及 Docker Compose。Python 包不在容器里运行。本地切分预览不需要启动容器，也不需要 API Key。写入向量和执行检索时需要 Qdrant 和真实的 `OPENAI_API_KEY`。
 
 ### 1. 克隆
 
@@ -179,7 +180,23 @@ python -m masskb ingest path/to/dir
 - 重复运行会重新请求 embedding。本阶段不按正文哈希跳过已写入的分块。
 - 成功时输出文件数、分块数、短预览，以及 `collection`、`vector_size` 和 `upserted`。这一步不连接 Neo4j，也不做检索。
 
-### 7. 运行测试
+### 7. 向量检索
+
+`search` 把查询文本交给与入库相同的 `EmbeddingClient`，再在集合 `masskb_chunks` 里做余弦近邻查询。结果以 JSON 打到标准输出，不做截断。这一步不连接 Neo4j，也不写入 Qdrant。
+
+```bash
+python -m masskb search "质量"
+python -m masskb search "质量" --top-k 3 --doc-id <doc_id>
+```
+
+- 默认返回 5 条。`--top-k` 必须是正整数。
+- `--doc-id` 可选，只使用入库时已经建好的 `doc_id` 关键字索引。不传则搜索整个集合。
+- 每条命中包含 `score`、`text`、`source`、`chunk_id`、`doc_id`、`index`、`start` 和 `end`。`score` 是 Qdrant 的余弦相似度，越大越近。`chunk_id` 是入库 payload 里的十六进制 id，不是 Qdrant 的 point id。
+- 查询使用当前的 `EMBEDDING_MODEL`，需要和入库时是同一个 1536 维模型。
+- 集合不存在、集合里没有点，或过滤后没有命中时，`hits` 为空数组，进程退出码为 0。Qdrant 连不上、API Key 缺失或只是占位符、向量维度或集合配置与约定不符时，错误打到标准错误，退出码为 1。
+- 空集合仍会先请求一次 embedding，因此缺 Key 和空库可以区分开。
+
+### 8. 运行测试
 
 ```bash
 python -m pytest
@@ -202,7 +219,7 @@ python -m pytest
 | `EMBEDDING_MODEL` | `text-embedding-3-small` | `.env.example` 中为注释项 |
 | `LLM_MODEL` | `gpt-4o-mini` | 已读入配置；当前没有聊天或代理调用 |
 
-向量入库使用代码常量：集合名 `masskb_chunks`，余弦距离，维度 1536。不新增环境变量。把 `EMBEDDING_MODEL` 换成非 1536 维的模型时，本次 ingest 会在写入前中止。
+向量入库和检索使用代码常量：集合名 `masskb_chunks`，余弦距离，维度 1536。不新增环境变量。把 `EMBEDDING_MODEL` 换成非 1536 维的模型时，本次 ingest 会在写入前中止，`search` 也会在查询前中止。
 
 ## 项目结构
 
@@ -216,13 +233,13 @@ masskb/
 ├── README.md
 ├── masskb/
 │   ├── __init__.py             # 版本号 0.1.0
-│   ├── __main__.py             # CLI：默认 healthcheck，另有 ingest
+│   ├── __main__.py             # CLI：默认 healthcheck，另有 ingest 与 search
 │   ├── ingest.py               # 本地切分：稳定 id 与字符偏移
 │   ├── config.py               # Settings
 │   ├── embeddings.py           # OpenAI 兼容 Embedding
-│   ├── vector_store.py         # Qdrant：健康检查与向量写入
+│   ├── vector_store.py         # Qdrant：健康检查、向量写入与近邻查询
 │   ├── graph_store.py          # Neo4j 驱动
-│   └── pipeline.py             # 编排；ingest 写入向量，search 未实现
+│   └── pipeline.py             # 编排；ingest 写入向量，search 只读近邻
 ├── scripts/healthcheck.py      # 可在未安装包时运行
 ├── tests/                      # 离线单元测试
 ├── docs/architecture/          # 目标架构图（drawio）及说明
@@ -239,11 +256,11 @@ masskb/
 |------|------|
 | `masskb/config.py` | 读取配置；判断 API Key 是否为占位符 |
 | `masskb/embeddings.py` | 按返回的 `index` 排序后给出向量 |
-| `masskb/vector_store.py` | 懒加载 `QdrantClient`（`prefer_grpc=False`）；建集合、批量 upsert、按 `doc_id` 删除 |
+| `masskb/vector_store.py` | 懒加载 `QdrantClient`（`prefer_grpc=False`）；建集合、批量 upsert、按 `doc_id` 删除、近邻查询 |
 | `masskb/graph_store.py` | 懒加载 Bolt 驱动 |
-| `masskb/pipeline.py` | 组装向量、图谱与 Embedding 客户端；`ingest` 写入 Qdrant，`search` 未实现 |
+| `masskb/pipeline.py` | 组装向量、图谱与 Embedding 客户端；`ingest` 写入 Qdrant，`search` 只读近邻 |
 | `masskb/ingest.py` | 本地切分；计算与工作目录无关的 `doc_id` / `chunk_id`。不创建外部客户端 |
-| `masskb/__main__.py` | `masskb` 控制台脚本的入口：`healthcheck` 与 `ingest` |
+| `masskb/__main__.py` | `masskb` 控制台脚本的入口：`healthcheck`、`ingest` 与 `search` |
 
 ## 测试与持续集成
 
@@ -251,10 +268,10 @@ masskb/
 |----------|----------|
 | `tests/test_config.py` | 版本号、API Key 判断、环境变量、配置缓存、本机 `NO_PROXY` |
 | `tests/test_embeddings.py` | 空输入、缺少真实 Key、客户端构造、按 index 排序 |
-| `tests/test_stores.py` | 两个存储的健康检查成功、失败和 `close`；集合创建、配置不一致、分批 upsert、按 `doc_id` 删除 |
-| `tests/test_pipeline.py` | 离线健康检查、任一侧失败、`search` 抛出 `NotImplementedError`；向量写入的探测、维度中止、分批、重复写入与空文件 |
+| `tests/test_stores.py` | 两个存储的健康检查成功、失败和 `close`；集合创建、配置不一致、分批 upsert、按 `doc_id` 删除、近邻查询 |
+| `tests/test_pipeline.py` | 离线健康检查、任一侧失败；向量写入的探测、维度中止、分批、重复写入与空文件；检索的空集合、过滤、维度与缺 Key |
 | `tests/test_ingest.py` | 空文件、短文件、超长段、重叠、Markdown 标题、同一路径重复切分 id 不变 |
-| `tests/test_cli.py` | CLI 退出码、默认子命令、帮助文本、`scripts/healthcheck.py`，dry-run 不创建外部客户端，以及不带 `--dry-run` 时的写入输出 |
+| `tests/test_cli.py` | CLI 退出码、默认子命令、帮助文本、`scripts/healthcheck.py`，dry-run 不创建外部客户端，不带 `--dry-run` 时的写入输出，以及 `search` 的 JSON |
 
 工作流文件是 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)。触发条件：
 

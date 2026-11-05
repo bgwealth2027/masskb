@@ -1,10 +1,11 @@
-"""检索编排冒烟：健康检查走真实 Pipeline，后端客户端全部 mock。"""
+"""检索编排冒烟：健康检查、写入和检索走真实 Pipeline，后端客户端全部 mock。"""
 
 from __future__ import annotations
 
 from pathlib import Path
 
 import pytest
+from qdrant_client.http.exceptions import UnexpectedResponse
 
 from masskb.config import Settings
 from masskb.ingest import ingest_path
@@ -84,11 +85,269 @@ def test_pipeline_healthcheck_fails_if_either_backend_fails() -> None:
     pipeline.close()
 
 
-def test_search_is_not_implemented() -> None:
-    pipeline = RetrievalPipeline(Settings())
-    with pytest.raises(NotImplementedError, match="检索编排尚未实现"):
-        pipeline.search("质量", top_k=3)
+def _search_pipeline(
+    monkeypatch: pytest.MonkeyPatch,
+    embeddings: _Embeddings,
+    *,
+    present: bool = True,
+    raw: list[dict] | None = None,
+    seen: dict | None = None,
+    search_error: Exception | None = None,
+    require_error: Exception | None = None,
+) -> tuple[RetrievalPipeline, list[str]]:
+    _forbid_backends(monkeypatch)
+    pipeline = RetrievalPipeline(
+        Settings(openai_api_key="sk-live-example", embedding_model="embed-test")
+    )
+    pipeline.embeddings.embed_one = embeddings.embed_one
+    calls: list[str] = []
+
+    def has_collection(name: str = "masskb_chunks") -> bool:
+        calls.append("has_collection")
+        assert name == "masskb_chunks"
+        return present
+
+    def require_compatible_collection(name: str = "masskb_chunks", **kwargs) -> None:
+        calls.append("require_compatible_collection")
+        assert name == "masskb_chunks"
+        if require_error is not None:
+            raise require_error
+
+    def search(vector, *, top_k: int = 5, doc_id: str | None = None, name: str = "masskb_chunks"):
+        calls.append("search")
+        assert name == "masskb_chunks"
+        if seen is not None:
+            seen["vector"] = list(vector)
+            seen["top_k"] = top_k
+            seen["doc_id"] = doc_id
+        if search_error is not None:
+            raise search_error
+        return [] if raw is None else raw
+
+    def upsert_points(*_args, **_kwargs) -> None:
+        calls.append("upsert_points")
+        raise AssertionError("搜索不应 upsert")
+
+    def delete_by_doc_id(*_args, **_kwargs) -> None:
+        calls.append("delete_by_doc_id")
+        raise AssertionError("搜索不应删除")
+
+    pipeline.vector_store.has_collection = has_collection
+    pipeline.vector_store.require_compatible_collection = require_compatible_collection
+    pipeline.vector_store.search = search
+    pipeline.vector_store.upsert_points = upsert_points
+    pipeline.vector_store.delete_by_doc_id = delete_by_doc_id
+    return pipeline, calls
+
+
+def test_search_embeds_query_and_maps_hits(monkeypatch: pytest.MonkeyPatch) -> None:
+    embeddings = _Embeddings()
+    seen: dict = {}
+    raw = [
+        {
+            "score": 0.2,
+            "payload": {
+                "text": "第二段",
+                "source": "b.md",
+                "chunk_id": "c2",
+                "doc_id": "d2",
+                "index": 1,
+                "start": 4,
+                "end": 9,
+            },
+        },
+        {
+            "score": 0.9,
+            "payload": {
+                "text": "第一段",
+                "source": "a.md",
+                "chunk_id": "c1",
+                "doc_id": "d1",
+                "index": 0,
+                "start": 0,
+                "end": 4,
+            },
+        },
+    ]
+    pipeline, calls = _search_pipeline(monkeypatch, embeddings, raw=raw, seen=seen)
+
+    result = pipeline.search("  质量  ", top_k=2)
     pipeline.close()
+
+    assert embeddings.probes == ["  质量  "]
+    assert "masskb" not in embeddings.probes
+    assert seen == {"vector": [0.1] * 1536, "top_k": 2, "doc_id": None}
+    assert calls == ["has_collection", "require_compatible_collection", "search"]
+    assert pipeline.graph_store._driver is None
+    assert result.query == "  质量  "
+    assert result.top_k == 2
+    assert result.collection == "masskb_chunks"
+    assert result.embedding_model == "embed-test"
+    assert result.doc_id is None
+    assert [hit.score for hit in result.hits] == [0.2, 0.9]
+    assert [hit.text for hit in result.hits] == ["第二段", "第一段"]
+    assert result.hits[0].source == "b.md"
+    assert result.hits[0].chunk_id == "c2"
+    assert result.hits[0].doc_id == "d2"
+    assert result.hits[0].index == 1
+    assert result.hits[0].start == 4
+    assert result.hits[0].end == 9
+
+
+def test_search_missing_collection_returns_empty_after_embed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    embeddings = _Embeddings()
+    pipeline, calls = _search_pipeline(monkeypatch, embeddings, present=False)
+
+    result = pipeline.search("质量")
+    pipeline.close()
+
+    assert embeddings.probes == ["质量"]
+    assert calls == ["has_collection"]
+    assert result.hits == ()
+    assert result.collection == "masskb_chunks"
+    assert result.embedding_model == "embed-test"
+    assert result.doc_id is None
+    assert result.top_k == 5
+
+
+def test_search_empty_points_return_empty_hits(monkeypatch: pytest.MonkeyPatch) -> None:
+    pipeline, calls = _search_pipeline(monkeypatch, _Embeddings(), raw=[])
+
+    result = pipeline.search("质量", top_k=3)
+    pipeline.close()
+
+    assert result.hits == ()
+    assert result.top_k == 3
+    assert calls == ["has_collection", "require_compatible_collection", "search"]
+
+
+def test_search_forwards_doc_id_and_empty_filter_is_not_an_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: dict = {}
+    pipeline, _calls = _search_pipeline(monkeypatch, _Embeddings(), raw=[], seen=seen)
+
+    result = pipeline.search("质量", doc_id="abc")
+    pipeline.close()
+
+    assert seen["doc_id"] == "abc"
+    assert result.doc_id == "abc"
+    assert result.hits == ()
+
+
+def test_search_aborts_when_query_dimension_mismatches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    embeddings = _Embeddings(dim=2)
+    pipeline, calls = _search_pipeline(monkeypatch, embeddings)
+
+    with pytest.raises(DimensionMismatchError, match="未执行检索"):
+        pipeline.search("质量")
+
+    assert calls == []
+    pipeline.close()
+
+
+def test_search_missing_api_key_does_not_open_qdrant(monkeypatch: pytest.MonkeyPatch) -> None:
+    created = _forbid_backends(monkeypatch)
+    pipeline = RetrievalPipeline(Settings(openai_api_key="sk-your-api-key-here"))
+
+    with pytest.raises(RuntimeError, match="OPENAI_API_KEY"):
+        pipeline.search("质量")
+
+    assert created == []
+    pipeline.close()
+
+
+def test_search_aborts_when_collection_config_mismatches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pipeline, calls = _search_pipeline(
+        monkeypatch,
+        _Embeddings(),
+        require_error=CollectionConfigError("mismatch"),
+    )
+
+    with pytest.raises(CollectionConfigError, match="mismatch"):
+        pipeline.search("质量")
+
+    assert calls == ["has_collection", "require_compatible_collection"]
+    pipeline.close()
+
+
+def test_search_rejects_blank_input_before_embed(monkeypatch: pytest.MonkeyPatch) -> None:
+    embeddings = _Embeddings()
+    pipeline, calls = _search_pipeline(monkeypatch, embeddings)
+
+    for query in ("", "   "):
+        with pytest.raises(ValueError, match="查询不能为空"):
+            pipeline.search(query)
+    for top_k in (0, -1, True):
+        with pytest.raises(ValueError, match="top_k 必须为正整数"):
+            pipeline.search("质量", top_k=top_k)
+    for doc_id in ("", "   "):
+        with pytest.raises(ValueError, match="doc_id 不能为空"):
+            pipeline.search("质量", doc_id=doc_id)
+
+    assert embeddings.probes == []
+    assert calls == []
+    pipeline.close()
+
+
+def test_search_keeps_hit_when_text_is_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    raw = [{"score": 0.4, "payload": {"source": "a.md", "chunk_id": "c", "start": 1, "end": 2}}]
+    pipeline, _calls = _search_pipeline(monkeypatch, _Embeddings(), raw=raw)
+
+    hit = pipeline.search("质量").hits[0]
+    pipeline.close()
+
+    assert hit.score == 0.4
+    assert hit.text is None
+    assert hit.doc_id is None
+    assert hit.index is None
+    assert hit.source == "a.md"
+    assert hit.chunk_id == "c"
+    assert hit.start == 1
+    assert hit.end == 2
+
+
+def test_search_missing_collection_after_check_returns_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pipeline, calls = _search_pipeline(
+        monkeypatch,
+        _Embeddings(),
+        search_error=UnexpectedResponse(404, "Not Found", b"missing", None),
+    )
+
+    result = pipeline.search("质量")
+    pipeline.close()
+
+    assert result.hits == ()
+    assert calls == ["has_collection", "require_compatible_collection", "search"]
+
+
+def test_search_propagates_qdrant_errors_other_than_missing_collection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    missing_store, _calls = _search_pipeline(monkeypatch, _Embeddings())
+    missing_store.vector_store.has_collection = lambda name="masskb_chunks": (_ for _ in ()).throw(
+        ConnectionError("refused")
+    )
+    with pytest.raises(ConnectionError, match="refused"):
+        missing_store.search("质量")
+    missing_store.close()
+
+    server_error, _calls = _search_pipeline(
+        monkeypatch,
+        _Embeddings(),
+        search_error=UnexpectedResponse(500, "Error", b"down", None),
+    )
+    with pytest.raises(UnexpectedResponse):
+        server_error.search("质量")
+    server_error.close()
 
 
 _PAYLOAD_KEYS = {"doc_id", "chunk_id", "source", "index", "start", "end", "text"}

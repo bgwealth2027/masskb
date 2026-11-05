@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from masskb.__main__ import main
-from masskb.pipeline import DimensionMismatchError, IngestWriteResult
+from masskb.pipeline import DimensionMismatchError, IngestWriteResult, SearchHit, SearchResult
 
 _ROOT = Path(__file__).resolve().parents[1]
 
@@ -105,7 +105,9 @@ def test_help(capsys: pytest.CaptureFixture[str]) -> None:
     with pytest.raises(SystemExit) as exc:
         main(["--help"])
     assert exc.value.code == 0
-    assert "healthcheck" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "healthcheck" in out
+    assert "search" in out
 
 
 def _forbid_external_clients(monkeypatch: pytest.MonkeyPatch) -> list[str]:
@@ -325,6 +327,138 @@ def test_ingest_help(capsys: pytest.CaptureFixture[str]) -> None:
     out = capsys.readouterr().out
     assert "--dry-run" in out
     assert "chunk-size" in out
+
+
+def test_search_prints_json_and_closes(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    closed: list[str] = []
+    seen: dict = {}
+
+    class FakePipeline:
+        def search(self, query: str, *, top_k: int = 5, doc_id: str | None = None) -> SearchResult:
+            seen["query"] = query
+            seen["top_k"] = top_k
+            seen["doc_id"] = doc_id
+            return SearchResult(
+                query=query,
+                top_k=top_k,
+                collection="masskb_chunks",
+                embedding_model="embed-test",
+                doc_id=doc_id,
+                hits=(
+                    SearchHit(
+                        score=0.5,
+                        text="原文",
+                        source="a.md",
+                        chunk_id="c",
+                        doc_id="d",
+                        index=0,
+                        start=0,
+                        end=2,
+                    ),
+                ),
+            )
+
+        def close(self) -> None:
+            closed.append("closed")
+
+    monkeypatch.setattr("masskb.__main__.RetrievalPipeline", FakePipeline)
+
+    assert main(["search", "质量", "--top-k", "3", "--doc-id", "abc"]) == 0
+
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    payload = json.loads(captured.out)
+    assert payload == {
+        "query": "质量",
+        "top_k": 3,
+        "collection": "masskb_chunks",
+        "embedding_model": "embed-test",
+        "doc_id": "abc",
+        "hits": [
+            {
+                "score": 0.5,
+                "text": "原文",
+                "source": "a.md",
+                "chunk_id": "c",
+                "doc_id": "d",
+                "index": 0,
+                "start": 0,
+                "end": 2,
+            }
+        ],
+    }
+    assert seen == {"query": "质量", "top_k": 3, "doc_id": "abc"}
+    assert closed == ["closed"]
+
+
+def test_search_empty_hits_exit_zero(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class FakePipeline:
+        def search(self, query: str, *, top_k: int = 5, doc_id: str | None = None) -> SearchResult:
+            return SearchResult(
+                query=query,
+                top_k=top_k,
+                collection="masskb_chunks",
+                embedding_model="text-embedding-3-small",
+                doc_id=doc_id,
+                hits=(),
+            )
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr("masskb.__main__.RetrievalPipeline", FakePipeline)
+
+    assert main(["search", "质量"]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["hits"] == []
+    assert payload["doc_id"] is None
+    assert payload["top_k"] == 5
+    assert payload["query"] == "质量"
+
+
+def test_search_failure_exits_and_closes(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    closed: list[str] = []
+
+    class FakePipeline:
+        def search(self, *_args, **_kwargs):
+            raise RuntimeError("缺少真实 OPENAI_API_KEY")
+
+        def close(self) -> None:
+            closed.append("closed")
+
+    monkeypatch.setattr("masskb.__main__.RetrievalPipeline", FakePipeline)
+
+    assert main(["search", "质量"]) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "[FAIL] 缺少真实 OPENAI_API_KEY" in captured.err
+    assert closed == ["closed"]
+
+
+def test_search_help(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as exc:
+        main(["search", "--help"])
+    assert exc.value.code == 0
+    out = capsys.readouterr().out
+    assert "--top-k" in out
+    assert "--doc-id" in out
+
+
+def test_search_missing_query_exits_2() -> None:
+    with pytest.raises(SystemExit) as exc:
+        main(["search"])
+    assert exc.value.code == 2
 
 
 def test_script_entrypoint(monkeypatch: pytest.MonkeyPatch) -> None:
