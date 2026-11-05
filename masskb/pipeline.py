@@ -1,4 +1,4 @@
-"""检索编排：向量与稀疏写入、文档骨架，以及可选的混合检索、重排和引用回答。"""
+"""检索编排：向量与稀疏写入、文档骨架，以及可选的查询改写、混合检索、重排和引用回答。"""
 
 from __future__ import annotations
 
@@ -36,6 +36,7 @@ from masskb.ingest import (
     ingest_path,
 )
 from masskb.rerank import build_rerank_messages, parse_rerank_order
+from masskb.rewrite import build_rewrite_messages, parse_rewrite
 from masskb.sparse import encode_text
 from masskb.vector_store import (
     DEFAULT_COLLECTION,
@@ -114,6 +115,21 @@ class RerankStatus:
 
 
 @dataclass(frozen=True)
+class RewriteStatus:
+    """这次有没有改写查询。`skipped` 表示没有请求模型。
+
+    成功时 `text` 是拿去 embedding 和稀疏编码的检索文本。
+    `SearchResult.query` 仍是用户原文。
+    """
+
+    ok: bool
+    skipped: bool
+    text: str | None
+    model: str | None
+    error: str | None = None
+
+
+@dataclass(frozen=True)
 class SearchResult:
     """一次向量检索。`doc_id` 是过滤条件，未过滤时为 None。"""
 
@@ -129,6 +145,7 @@ class SearchResult:
     hybrid: HybridStatus | None = None
     answer: AnswerStatus | None = None
     rerank: RerankStatus | None = None
+    rewrite: RewriteStatus | None = None
 
     def __post_init__(self) -> None:
         if self.hybrid is None:
@@ -137,6 +154,8 @@ class SearchResult:
             object.__setattr__(self, "answer", skipped_answer())
         if self.rerank is None:
             object.__setattr__(self, "rerank", _skipped_rerank())
+        if self.rewrite is None:
+            object.__setattr__(self, "rewrite", _skipped_rewrite())
 
 
 @dataclass(frozen=True)
@@ -179,6 +198,7 @@ def _search_result(
     hybrid: HybridStatus | None = None,
     answer: AnswerStatus | None = None,
     rerank: RerankStatus | None = None,
+    rewrite: RewriteStatus | None = None,
 ) -> SearchResult:
     return SearchResult(
         query=query,
@@ -193,6 +213,7 @@ def _search_result(
         hybrid=hybrid,
         answer=answer,
         rerank=rerank,
+        rewrite=rewrite,
     )
 
 
@@ -206,6 +227,10 @@ def _skipped_hybrid() -> HybridStatus:
 
 def _skipped_rerank() -> RerankStatus:
     return RerankStatus(ok=True, skipped=True, error=None, model=None)
+
+
+def _skipped_rewrite() -> RewriteStatus:
+    return RewriteStatus(ok=True, skipped=True, text=None, model=None, error=None)
 
 
 def _no_hits_rerank() -> RerankStatus:
@@ -230,6 +255,7 @@ def _copy_result(
     answer: AnswerStatus | None = None,
     score_kind: str | None = None,
     rerank: RerankStatus | None = None,
+    rewrite: RewriteStatus | None = None,
 ) -> SearchResult:
     return SearchResult(
         query=result.query,
@@ -244,6 +270,7 @@ def _copy_result(
         hybrid=result.hybrid,
         answer=result.answer if answer is None else answer,
         rerank=result.rerank if rerank is None else rerank,
+        rewrite=result.rewrite if rewrite is None else rewrite,
     )
 
 
@@ -484,18 +511,24 @@ class RetrievalPipeline:
         hybrid: bool = False,
         answer: bool = False,
         rerank: bool = False,
+        rewrite: bool = False,
     ) -> SearchResult:
         """用与入库相同的模型做近邻检索，再按 chunk_id 补前后邻。
 
-        先生成查询向量，再看集合是否存在。集合不存在、没有点或过滤后没有命中时，
-        返回空的 `hits`，并且不连接 Neo4j。缺 Key、维度不符、集合配置不符或 Qdrant
-        连不上时抛错。Neo4j 补邻接失败时仍返回向量命中。
-        `hybrid` 为真时，在补邻之前用进程内 RRF 融合 bm25。`rerank` 为真时，
-        在已经截成 `top_k` 之后、补邻之前做 listwise 重排。`answer` 为真时，
-        补邻之后才请求聊天，且只引用本次命中的 chunk_id。三个开关默认关闭。
+        先可选地把查询改写成一条检索文本，再生成查询向量，然后看集合是否存在。
+        集合不存在、没有点或过滤后没有命中时，返回空的 `hits`，并且不连接 Neo4j。
+        缺 Key、维度不符、集合配置不符或 Qdrant 连不上时抛错。
+        Neo4j 补邻接失败时仍返回向量命中。
+        `rewrite` 为真时，改写发生在 embedding 和稀疏编码之前。失败时仍用原文检索。
+        `SearchResult.query` 始终是用户原文。
+        `hybrid` 为真时，在补邻之前用进程内 RRF 融合 bm25。
+        `rerank` 为真时，在已经截成 `top_k` 之后、补邻之前做 listwise 重排。
+        `answer` 为真时，补邻之后才请求聊天，且只引用本次命中的 chunk_id。
+        重排和回答的提示词使用用户原文。四个开关默认关闭。
         """
         _validate_search(query, top_k, doc_id)
-        vector = self.embeddings.embed_one(query)
+        retrieval_text, rewrite_status = self._maybe_rewrite(query, enabled=rewrite)
+        vector = self.embeddings.embed_one(retrieval_text)
         if len(vector) != DEFAULT_VECTOR_SIZE:
             raise DimensionMismatchError(
                 f"向量维度不符：模型 {self.settings.embedding_model} 返回 {len(vector)} 维，"
@@ -512,6 +545,7 @@ class RetrievalPipeline:
                 _skipped_graph(),
                 mode=mode,
                 hybrid=_skipped_hybrid(),
+                rewrite=rewrite_status,
             )
             return self._maybe_answer(
                 self._maybe_rerank(result, enabled=rerank),
@@ -527,7 +561,15 @@ class RetrievalPipeline:
             raw_hits = []
         hits = tuple(_search_hit(item) for item in raw_hits)
         if hybrid:
-            result = self._hybrid_hits(query, top_k, doc_id, hits, limit)
+            result = self._hybrid_hits(
+                query,
+                retrieval_text,
+                top_k,
+                doc_id,
+                hits,
+                limit,
+                rewrite_status,
+            )
         else:
             result = _search_result(
                 self.settings.embedding_model,
@@ -538,6 +580,7 @@ class RetrievalPipeline:
                 _skipped_graph(),
                 mode="dense",
                 hybrid=_skipped_hybrid(),
+                rewrite=rewrite_status,
             )
         return self._maybe_answer(
             self._attach_neighbors(self._maybe_rerank(result, enabled=rerank)),
@@ -668,10 +711,12 @@ class RetrievalPipeline:
     def _hybrid_hits(
         self,
         query: str,
+        retrieval_text: str,
         top_k: int,
         doc_id: str | None,
         hits: tuple[SearchHit, ...],
         limit: int,
+        rewrite: RewriteStatus,
     ) -> SearchResult:
         """有稠密命中时才查稀疏。失败或分词为空时保留余弦命中。"""
         if not hits:
@@ -684,8 +729,9 @@ class RetrievalPipeline:
                 _skipped_graph(),
                 mode="hybrid",
                 hybrid=_skipped_hybrid(),
+                rewrite=rewrite,
             )
-        indices, values = encode_text(query)
+        indices, values = encode_text(retrieval_text)
         if not indices:
             return self._dense_hybrid_result(
                 query,
@@ -693,11 +739,14 @@ class RetrievalPipeline:
                 doc_id,
                 hits,
                 HybridStatus(ok=True, skipped=False, error=None),
+                rewrite,
             )
         try:
             ready = self.vector_store.sparse_ready()
         except Exception as exc:  # noqa: BLE001 — 稀疏槽读失败仍返回稠密命中
-            return self._dense_hybrid_result(query, top_k, doc_id, hits, _hybrid_error(exc))
+            return self._dense_hybrid_result(
+                query, top_k, doc_id, hits, _hybrid_error(exc), rewrite
+            )
         if not ready:
             return self._dense_hybrid_result(
                 query,
@@ -709,6 +758,7 @@ class RetrievalPipeline:
                     skipped=False,
                     error=f"集合 {DEFAULT_COLLECTION} 没有稀疏向量 bm25",
                 ),
+                rewrite,
             )
         try:
             raw_sparse = self.vector_store.search_sparse(
@@ -718,7 +768,9 @@ class RetrievalPipeline:
                 doc_id=doc_id,
             )
         except Exception as exc:  # noqa: BLE001 — 稀疏查询失败仍返回稠密命中
-            return self._dense_hybrid_result(query, top_k, doc_id, hits, _hybrid_error(exc))
+            return self._dense_hybrid_result(
+                query, top_k, doc_id, hits, _hybrid_error(exc), rewrite
+            )
         sparse_hits = tuple(_search_hit(item) for item in raw_sparse)
         fused = reciprocal_rank_fusion(
             _ranked_pairs(hits),
@@ -743,6 +795,7 @@ class RetrievalPipeline:
                 rrf_k=RRF_K,
                 candidate_k=limit,
             ),
+            rewrite=rewrite,
         )
 
     def _dense_hybrid_result(
@@ -752,6 +805,7 @@ class RetrievalPipeline:
         doc_id: str | None,
         hits: tuple[SearchHit, ...],
         hybrid: HybridStatus,
+        rewrite: RewriteStatus,
     ) -> SearchResult:
         return _search_result(
             self.settings.embedding_model,
@@ -763,7 +817,46 @@ class RetrievalPipeline:
             mode="hybrid",
             score_kind="cosine",
             hybrid=hybrid,
+            rewrite=rewrite,
         )
+
+    def _maybe_rewrite(self, query: str, *, enabled: bool) -> tuple[str, RewriteStatus]:
+        """关闭时不创建聊天客户端。失败时退回原文。"""
+        if not enabled:
+            return query, _skipped_rewrite()
+        try:
+            system, user = build_rewrite_messages(query)
+            raw = self._complete_rewrite(system, user)
+            parsed = parse_rewrite(raw)
+        except Exception as exc:  # noqa: BLE001 — 改写失败仍用原文检索
+            status = RewriteStatus(
+                ok=False,
+                skipped=False,
+                text=None,
+                model=self.settings.llm_model,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            return query, status
+        if not parsed.ok or parsed.text is None:
+            status = RewriteStatus(
+                ok=False,
+                skipped=False,
+                text=None,
+                model=self.settings.llm_model,
+                error=parsed.error,
+            )
+            return query, status
+        status = RewriteStatus(
+            ok=True,
+            skipped=False,
+            text=parsed.text,
+            model=self.settings.llm_model,
+            error=None,
+        )
+        return parsed.text, status
+
+    def _complete_rewrite(self, system: str, user: str) -> str:
+        return ChatClient(self.settings).complete(system, user, max_tokens=256)
 
     def _maybe_rerank(self, result: SearchResult, *, enabled: bool) -> SearchResult:
         """在补邻之前重排已经截断的命中。关闭或没有可排序命中时不创建聊天客户端。"""

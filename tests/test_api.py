@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 
 from masskb.answer import AnswerStatus
 from masskb.api import create_app
-from masskb.pipeline import GraphStatus, RerankStatus, SearchHit, SearchResult
+from masskb.pipeline import GraphStatus, RerankStatus, RewriteStatus, SearchHit, SearchResult
 
 
 def _hit() -> SearchHit:
@@ -90,6 +90,7 @@ def test_post_search_matches_cli_json() -> None:
         "hybrid": False,
         "answer": False,
         "rerank": False,
+        "rewrite": False,
     }
 
 
@@ -102,6 +103,7 @@ def test_post_search_forwards_flags_without_trimming_query() -> None:
         "hybrid": True,
         "answer": True,
         "rerank": True,
+        "rewrite": True,
     }
     with TestClient(create_app(pipeline)) as client:  # type: ignore[arg-type]
         response = client.post("/search", json=body)
@@ -114,6 +116,7 @@ def test_post_search_forwards_flags_without_trimming_query() -> None:
         "hybrid": True,
         "answer": True,
         "rerank": True,
+        "rewrite": True,
     }
     assert response.json()["query"] == " 质量 "
     assert response.json()["doc_id"] == "abc"
@@ -136,6 +139,13 @@ def test_post_search_soft_failures_stay_200() -> None:
             error="invalid_json",
             model="gpt-4o-mini",
         ),
+        rewrite=RewriteStatus(
+            ok=False,
+            skipped=False,
+            text=None,
+            model="gpt-4o-mini",
+            error="invalid_json",
+        ),
     )
     pipeline = _Pipeline(result)
     with TestClient(create_app(pipeline)) as client:  # type: ignore[arg-type]
@@ -150,6 +160,9 @@ def test_post_search_soft_failures_stay_200() -> None:
     assert payload["answer"]["error"] == "uncited"
     assert payload["rerank"]["ok"] is False
     assert payload["rerank"]["error"] == "invalid_json"
+    assert payload["rewrite"]["ok"] is False
+    assert payload["rewrite"]["error"] == "invalid_json"
+    assert payload["rewrite"]["text"] is None
 
 
 def test_post_search_empty_hits() -> None:
