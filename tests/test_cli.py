@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -116,6 +119,7 @@ def test_help(capsys: pytest.CaptureFixture[str]) -> None:
     out = capsys.readouterr().out
     assert "healthcheck" in out
     assert "search" in out
+    assert "serve" in out
 
 
 def _forbid_external_clients(monkeypatch: pytest.MonkeyPatch) -> list[str]:
@@ -787,6 +791,85 @@ def test_search_missing_query_exits_2() -> None:
     with pytest.raises(SystemExit) as exc:
         main(["search"])
     assert exc.value.code == 2
+
+
+def test_serve_help(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as exc:
+        main(["serve", "--help"])
+    assert exc.value.code == 0
+    out = capsys.readouterr().out
+    assert "--host" in out
+    assert "--port" in out
+    assert "[api]" in out
+
+
+def test_serve_rejects_port_out_of_range() -> None:
+    with pytest.raises(SystemExit) as exc:
+        main(["serve", "--port", "0"])
+    assert exc.value.code == 2
+
+
+def test_serve_runs_uvicorn_with_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: dict[str, object] = {}
+
+    def fake_run(app: object, host: str, port: int) -> None:
+        seen["app"] = app
+        seen["host"] = host
+        seen["port"] = port
+
+    import uvicorn
+
+    monkeypatch.setattr(uvicorn, "run", fake_run)
+    assert main(["serve"]) == 0
+
+    from masskb.api import app
+
+    assert seen["app"] is app
+    assert seen["host"] == "127.0.0.1"
+    assert seen["port"] == 8080
+
+    assert main(["serve", "--host", "0.0.0.0", "--port", "9000"]) == 0
+    assert seen["host"] == "0.0.0.0"
+    assert seen["port"] == 9000
+
+
+def test_serve_missing_extra_exits_with_hint(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    real_import = __import__
+
+    def blocked(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "uvicorn":
+            raise ImportError("blocked")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr("builtins.__import__", blocked)
+    assert main(["serve"]) == 1
+    err = capsys.readouterr().err
+    assert "[FAIL]" in err
+    assert '.[api]' in err
+
+
+def test_importing_cli_does_not_import_fastapi() -> None:
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
+    code = (
+        "import sys\n"
+        "import masskb.__main__\n"
+        "assert 'fastapi' not in sys.modules\n"
+        "assert 'uvicorn' not in sys.modules\n"
+        "assert 'masskb.api' not in sys.modules\n"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        check=False,
+        cwd=_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
 
 
 def test_script_entrypoint(monkeypatch: pytest.MonkeyPatch) -> None:
