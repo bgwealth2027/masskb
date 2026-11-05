@@ -75,16 +75,22 @@ class ChatClient:
             )
         return self._client
 
-    def complete(self, system: str, user: str) -> str:
-        """请求一次补全。不设置 response_format，以便兼容只实现聊天的网关。"""
-        response = self.client.chat.completions.create(
-            model=self.settings.llm_model,
-            temperature=0,
-            messages=[
+    def complete(self, system: str, user: str, *, max_tokens: int | None = None) -> str:
+        """请求一次补全。不设置 response_format，以便兼容只实现聊天的网关。
+
+        `max_tokens` 为 None 时不把该参数传给网关。回答路径保持这个默认。
+        """
+        payload: dict[str, object] = {
+            "model": self.settings.llm_model,
+            "temperature": 0,
+            "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-        )
+        }
+        if max_tokens is not None:
+            payload["max_tokens"] = max_tokens
+        response = self.client.chat.completions.create(**payload)
         content = response.choices[0].message.content
         return content or ""
 

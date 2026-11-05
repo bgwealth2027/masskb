@@ -97,8 +97,33 @@ def test_chat_client_uses_llm_model_without_response_format(
     assert sent["model"] == "chat-test"
     assert sent["temperature"] == 0
     assert "response_format" not in sent
+    assert "max_tokens" not in sent
     assert sent["messages"][0] == {"role": "system", "content": "系统"}
     assert sent["messages"][1] == {"role": "user", "content": "用户"}
+
+
+def test_chat_client_forwards_max_tokens_when_set(monkeypatch: pytest.MonkeyPatch) -> None:
+    created: list[SimpleNamespace] = []
+
+    def factory(**_kwargs):
+        completions = SimpleNamespace(kwargs=None)
+
+        def create(**sent):
+            completions.kwargs = sent
+            message = SimpleNamespace(content="ok")
+            return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+
+        completions.create = create
+        client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+        created.append(client)
+        return client
+
+    monkeypatch.setattr("masskb.answer.OpenAI", factory)
+    settings = Settings(openai_api_key="sk-live-example", llm_model="chat-test")
+
+    assert ChatClient(settings).complete("系统", "用户", max_tokens=256) == "ok"
+
+    assert created[0].chat.completions.kwargs["max_tokens"] == 256
 
 
 def test_chat_client_missing_key_does_not_construct_openai(

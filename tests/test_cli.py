@@ -191,7 +191,16 @@ def test_ingest_without_dry_run_writes_and_closes(
     closed: list[str] = []
 
     class FakePipeline:
-        def ingest(self, source: Path, *, root: Path | None = None, chunk_size: int = 800, overlap: int = 100):
+        def ingest(
+            self,
+            source: Path,
+            *,
+            root: Path | None = None,
+            chunk_size: int = 800,
+            overlap: int = 100,
+            entities: bool = False,
+        ):
+            assert entities is False
             from masskb.ingest import ingest_path
 
             report = ingest_path(source, root=root, chunk_size=chunk_size, overlap=overlap)
@@ -224,6 +233,8 @@ def test_ingest_without_dry_run_writes_and_closes(
     assert "graph_documents: 1" in out
     assert "graph_chunks: 1" in out
     assert "[INFO] 已写入 Qdrant 集合 masskb_chunks，并同步 Neo4j 文档骨架。未执行检索。" in out
+    assert "entities:" not in out
+    assert "graph_persons:" not in out
     assert closed == ["closed"]
 
 
@@ -339,6 +350,7 @@ def test_ingest_help(capsys: pytest.CaptureFixture[str]) -> None:
     assert exc.value.code == 0
     out = capsys.readouterr().out
     assert "--dry-run" in out
+    assert "--entities" in out
     assert "chunk-size" in out
     assert "文档骨架" in out
 
@@ -573,6 +585,106 @@ def test_search_answer_failure_prints_json_and_exits_zero(
     assert payload["answer"]["ok"] is False
     assert payload["answer"]["error"] == "uncited"
     assert payload["answer"]["text"] is None
+
+
+def test_ingest_entities_prints_counts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    path = tmp_path / "a.txt"
+    path.write_text("孔子\n", encoding="utf-8")
+    seen: dict = {}
+
+    class FakePipeline:
+        def ingest(
+            self,
+            source: Path,
+            *,
+            root: Path | None = None,
+            chunk_size: int = 800,
+            overlap: int = 100,
+            entities: bool = False,
+        ):
+            from masskb.ingest import ingest_path
+
+            seen["entities"] = entities
+            report = ingest_path(source, root=root, chunk_size=chunk_size, overlap=overlap)
+            return IngestWriteResult(
+                report=report,
+                collection="masskb_chunks",
+                vector_size=1536,
+                points_upserted=report.chunk_count,
+                graph_documents=1,
+                graph_chunks=report.chunk_count,
+                graph_skipped=False,
+                entities_skipped=False,
+                graph_persons=1,
+                graph_concepts=1,
+                graph_mentions=2,
+                entities_dropped=3,
+            )
+
+        def close(self) -> None:
+            seen["closed"] = True
+
+    monkeypatch.setattr("masskb.__main__.RetrievalPipeline", FakePipeline)
+
+    assert main(["ingest", str(path), "--root", str(tmp_path), "--entities"]) == 0
+
+    out = capsys.readouterr().out
+    assert seen["entities"] is True
+    assert seen["closed"] is True
+    assert "entities: on" in out
+    assert "graph_persons: 1" in out
+    assert "graph_concepts: 1" in out
+    assert "graph_mentions: 2" in out
+    assert "entities_dropped: 3" in out
+    assert "并替换本批文档的人物/概念提及" in out
+    assert "并同步 Neo4j 文档骨架。未执行检索。" not in out
+
+
+def test_ingest_dry_run_with_entities_creates_no_clients(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    path = tmp_path / "a.txt"
+    path.write_text("孔子\n", encoding="utf-8")
+    created = _forbid_external_clients(monkeypatch)
+
+    assert main(["ingest", str(path), "--dry-run", "--entities", "--root", str(tmp_path)]) == 0
+
+    out = capsys.readouterr().out
+    assert created == []
+    assert "[INFO] dry-run：未连接 Qdrant、Neo4j 或 OpenAI。" in out
+    assert "[INFO] --entities 在 dry-run 中不抽取。" in out
+    assert "entities: on" not in out
+
+
+def test_ingest_entities_failure_exits_and_closes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    path = tmp_path / "a.txt"
+    path.write_text("孔子\n", encoding="utf-8")
+    closed: list[str] = []
+
+    class FakePipeline:
+        def ingest(self, *_args, **_kwargs):
+            from masskb.pipeline import EntitySyncError
+
+            raise EntitySyncError("文档 d 的 Qdrant 与文档骨架已保留，实体未写入，可重试。")
+
+        def close(self) -> None:
+            closed.append("closed")
+
+    monkeypatch.setattr("masskb.__main__.RetrievalPipeline", FakePipeline)
+
+    assert main(["ingest", str(path), "--entities"]) == 1
+    assert "骨架已保留" in capsys.readouterr().err
+    assert closed == ["closed"]
 
 
 def test_search_missing_query_exits_2() -> None:

@@ -65,6 +65,7 @@ def _format_report(
     dry_run: bool,
     preview_limit: int,
     written: IngestWriteResult | None = None,
+    entities: bool = False,
 ) -> str:
     header = "=== MassKB Ingest (dry-run) ===" if dry_run else "=== MassKB Ingest ==="
     lines = [
@@ -89,6 +90,8 @@ def _format_report(
             lines.append(f"... 还有 {hidden} 个分块未展示")
     if dry_run:
         lines.append("[INFO] dry-run：未连接 Qdrant、Neo4j 或 OpenAI。")
+        if entities:
+            lines.append("[INFO] --entities 在 dry-run 中不抽取。")
     elif written is not None:
         if report.files:
             lines.append("---")
@@ -98,12 +101,23 @@ def _format_report(
         lines.append(f"upserted: {written.points_upserted}")
         lines.append(f"graph_documents: {written.graph_documents}")
         lines.append(f"graph_chunks: {written.graph_chunks}")
+        if not written.entities_skipped:
+            lines.append("entities: on")
+            lines.append(f"graph_persons: {written.graph_persons}")
+            lines.append(f"graph_concepts: {written.graph_concepts}")
+            lines.append(f"graph_mentions: {written.graph_mentions}")
+            lines.append(f"entities_dropped: {written.entities_dropped}")
         if written.graph_skipped:
             lines.append("[INFO] 没有可写入的分块，且集合不存在。未连接 Neo4j，未执行检索。")
-        else:
+        elif written.entities_skipped:
             lines.append(
                 f"[INFO] 已写入 Qdrant 集合 {written.collection}，"
                 "并同步 Neo4j 文档骨架。未执行检索。"
+            )
+        else:
+            lines.append(
+                f"[INFO] 已写入 Qdrant 集合 {written.collection}，"
+                "已同步 Neo4j 文档骨架，并替换本批文档的人物/概念提及。未执行检索。"
             )
     return "\n".join(lines)
 
@@ -126,7 +140,14 @@ def cmd_ingest(args: argparse.Namespace) -> int:
         print(f"[FAIL] {exc}", file=sys.stderr)
         return 1
     if args.dry_run:
-        print(_format_report(report, dry_run=True, preview_limit=args.preview))
+        print(
+            _format_report(
+                report,
+                dry_run=True,
+                preview_limit=args.preview,
+                entities=args.entities,
+            )
+        )
         return 0
 
     pipeline = RetrievalPipeline()
@@ -137,6 +158,7 @@ def cmd_ingest(args: argparse.Namespace) -> int:
                 root=root,
                 chunk_size=args.chunk_size,
                 overlap=args.overlap,
+                entities=args.entities,
             )
         except Exception as exc:  # noqa: BLE001 — CLI 把写入失败转成退出码
             print(f"[FAIL] {exc}", file=sys.stderr)
@@ -147,6 +169,7 @@ def cmd_ingest(args: argparse.Namespace) -> int:
                 dry_run=False,
                 preview_limit=args.preview,
                 written=result,
+                entities=args.entities,
             )
         )
         return 0
@@ -216,6 +239,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=3,
         help="每个文件最多展示的分块条数（默认 3）",
+    )
+    ingest.add_argument(
+        "--entities",
+        action="store_true",
+        help="用 LLM_MODEL 抽取人物与概念并写入 Neo4j；默认关闭",
     )
     ingest.set_defaults(func=cmd_ingest)
 
