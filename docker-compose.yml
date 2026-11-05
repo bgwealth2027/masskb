@@ -50,6 +50,8 @@ services:
       OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
       LLM_BASE_URL: "${LLM_BASE_URL:-https://api.openai.com/v1}"
       EMBEDDING_MODEL: "${EMBEDDING_MODEL:-text-embedding-3-small}"
+      EMBEDDING_BASE_URL: "${COMPOSE_EMBEDDING_BASE_URL:-}"
+      EMBEDDING_DIMENSIONS: "${EMBEDDING_DIMENSIONS:-1536}"
       LLM_MODEL: "${LLM_MODEL:-gpt-4o-mini}"
     depends_on:
       qdrant:
@@ -64,7 +66,30 @@ services:
       retries: 5
       start_period: 30s
 
+  embed:
+    profiles:
+      - embed
+    image: masskb-embed:local
+    build: ./embed
+    container_name: masskb-embed
+    environment:
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-BAAI/bge-small-zh-v1.5}
+      HF_HOME: /cache
+      HF_TOKEN: ${HF_TOKEN:-}
+    ports:
+      - "127.0.0.1:8081:8080"
+    volumes:
+      - embed_cache:/cache
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 120s
+
 volumes:
   qdrant_data:
   neo4j_data:
   neo4j_logs:
+  embed_cache:

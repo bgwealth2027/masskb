@@ -37,7 +37,9 @@ def test_get_settings_reads_environment(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setenv("NEO4J_PASSWORD", "secret")
     monkeypatch.setenv("OPENAI_API_KEY", "sk-live-example")
     monkeypatch.setenv("LLM_BASE_URL", "https://llm.example/v1")
+    monkeypatch.setenv("EMBEDDING_BASE_URL", "http://embed.test/v1")
     monkeypatch.setenv("EMBEDDING_MODEL", "embed-test")
+    monkeypatch.setenv("EMBEDDING_DIMENSIONS", "512")
     monkeypatch.setenv("LLM_MODEL", "chat-test")
 
     settings = get_settings()
@@ -48,7 +50,9 @@ def test_get_settings_reads_environment(monkeypatch: pytest.MonkeyPatch) -> None
     assert settings.neo4j_password == "secret"
     assert settings.openai_api_key == "sk-live-example"
     assert settings.llm_base_url == "https://llm.example/v1"
+    assert settings.embedding_base_url == "http://embed.test/v1"
     assert settings.embedding_model == "embed-test"
+    assert settings.embedding_dimensions == 512
     assert settings.llm_model == "chat-test"
     assert settings.has_real_openai_key is True
 
@@ -61,7 +65,9 @@ def test_get_settings_defaults_when_unset(monkeypatch: pytest.MonkeyPatch) -> No
         "NEO4J_PASSWORD",
         "OPENAI_API_KEY",
         "LLM_BASE_URL",
+        "EMBEDDING_BASE_URL",
         "EMBEDDING_MODEL",
+        "EMBEDDING_DIMENSIONS",
         "LLM_MODEL",
     ):
         monkeypatch.delenv(name, raising=False)
@@ -74,9 +80,26 @@ def test_get_settings_defaults_when_unset(monkeypatch: pytest.MonkeyPatch) -> No
     assert settings.neo4j_password == ""
     assert settings.openai_api_key == ""
     assert settings.llm_base_url == "https://api.openai.com/v1"
+    assert settings.embedding_base_url == ""
     assert settings.embedding_model == "text-embedding-3-small"
+    assert settings.embedding_dimensions == 1536
     assert settings.llm_model == "gpt-4o-mini"
     assert settings.has_real_openai_key is False
+
+
+def test_blank_embedding_base_url_is_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("EMBEDDING_BASE_URL", "   ")
+    assert get_settings().embedding_base_url == ""
+
+
+@pytest.mark.parametrize("raw", ["0", "-1", "no", "1.5", ""])
+def test_get_settings_rejects_bad_embedding_dimensions(
+    monkeypatch: pytest.MonkeyPatch,
+    raw: str,
+) -> None:
+    monkeypatch.setenv("EMBEDDING_DIMENSIONS", raw)
+    with pytest.raises(ValueError, match="EMBEDDING_DIMENSIONS"):
+        get_settings()
 
 
 def test_get_settings_is_cached(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -33,13 +33,13 @@ MassKB 是一层检索中间件，目标是把向量检索、知识图谱和智�
 | 本机 HTTP | 把健康检查、检索、工具循环和路径入库暴露到本机 | 可选 extra `[api]`。`masskb serve` 默认监听 `127.0.0.1:8080`，调用现有的 `healthcheck()`、`search()`、`ask()` 与 `ingest()`。`POST /ingest` 读取服务端上的路径。Compose 的应用服务传入 `--host 0.0.0.0`，并把端口发布到宿主机的 `127.0.0.1:8080`。核心安装不含 FastAPI。没有鉴权，也没有上传接口 |
 | Python 客户端 | 调用已经启动的本机 HTTP | `MassKB` 在核心安装里，使用已有的 `httpx`。覆盖 `GET /health`、`POST /search`、`POST /ask`、`POST /ingest`。不导入 `RetrievalPipeline`。FastAPI 仍只在 `[api]` |
 
-向量由 OpenAI 兼容的 Embedding API 生成。核心依赖是 `qdrant-client`、`neo4j`、`openai`、`python-dotenv`、`httpx`、`pydantic`。可选 extra `[api]` 才安装 `fastapi` 与 `uvicorn`。安装清单里没有 `sentence-transformers` 或 `torch`。本地切分不使用这些客户端。
+向量由 OpenAI 兼容的 Embedding API 生成。核心依赖是 `qdrant-client`、`neo4j`、`openai`、`python-dotenv`、`httpx`、`pydantic`。可选 extra `[api]` 才安装 `fastapi` 与 `uvicorn`。安装清单里没有 `sentence-transformers`、`torch` 或 `fastembed`。可选嵌入边车单独钉死 `fastembed`，不进入这个安装清单。本地切分不使用这些客户端。
 
 ## 架构
 
 ### 当前运行时
 
-Docker Compose 启动 Qdrant、Neo4j，以及只跑 `masskb serve` 的应用容器。宿主机虚拟环境仍然可以直接跑 CLI，并访问本机端口。Embedding 请求发往 `LLM_BASE_URL`（默认 `https://api.openai.com/v1`）。健康检查不调用 Embedding API。`ingest --dry-run` 只在进程内切分本地文件，不访问外部服务。不带 `--dry-run` 的 `ingest` 会请求 Embedding API，把稠密向量和稀疏向量写入同一个 Qdrant 点，再把该文档的骨架写入 Neo4j。加上 `--entities` 时，骨架成功后再按分块请求 `LLM_MODEL`，把人物和概念提及写入 Neo4j。`search` 默认先请求 Embedding API。加上 `--rewrite` 时，先用 `LLM_MODEL` 把查询改写成一条检索文本，再对该文本请求 Embedding；改写失败则仍用原文。然后在 Qdrant 里做近邻查询，并按命中的 `chunk_id` 读取前后邻。检索不读取人物和概念。`--hybrid` 会再查一次稀疏向量，编码用的是同一条检索文本，并在补邻之前于进程内融合。`--rerank` 在截成 `top_k` 之后、补邻之前，用 `LLM_MODEL` 做 listwise 重排，提示词仍是用户原文。`--answer` 在补邻之后才请求聊天补全，提示词也仍是用户原文。改写失败时改用原文继续检索。Neo4j、稀疏腿、重排或回答失败时，已经拿到的命中仍然输出。检索不写入 Qdrant。`masskb serve` 在同一进程里提供 `GET /health`、`POST /search`、`POST /ask` 和 `POST /ingest`，默认只绑 `127.0.0.1:8080`。健康检查和检索不写入 Qdrant。`POST /ingest` 读取服务端路径：`dry_run` 只做本地切分，否则调用现有的 `ingest()`。`masskb ask` 与 `POST /ask` 默认不运行；打开后，模型最多 3 步，只能调用现有的 `search()` 和 `healthcheck()`。健康检查、检索、整次 ask 和整次入库共用一把进程锁，调用结束才释放。
+Docker Compose 启动 Qdrant、Neo4j，以及只跑 `masskb serve` 的应用容器。宿主机虚拟环境仍然可以直接跑 CLI，并访问本机端口。默认时 Embedding 请求发往 `LLM_BASE_URL`（默认 `https://api.openai.com/v1`）。设置 `EMBEDDING_BASE_URL` 后，只有 `EmbeddingClient` 改走该地址；改写、重排、回答、实体抽取和 `ask` 仍使用 `LLM_BASE_URL`。健康检查不调用 Embedding API。`ingest --dry-run` 只在进程内切分本地文件，不访问外部服务。不带 `--dry-run` 的 `ingest` 会请求 Embedding API，把稠密向量和稀疏向量写入同一个 Qdrant 点，再把该文档的骨架写入 Neo4j。加上 `--entities` 时，骨架成功后再按分块请求 `LLM_MODEL`，把人物和概念提及写入 Neo4j。`search` 默认先请求 Embedding API。加上 `--rewrite` 时，先用 `LLM_MODEL` 把查询改写成一条检索文本，再对该文本请求 Embedding；改写失败则仍用原文。然后在 Qdrant 里做近邻查询，并按命中的 `chunk_id` 读取前后邻。检索不读取人物和概念。`--hybrid` 会再查一次稀疏向量，编码用的是同一条检索文本，并在补邻之前于进程内融合。`--rerank` 在截成 `top_k` 之后、补邻之前，用 `LLM_MODEL` 做 listwise 重排，提示词仍是用户原文。`--answer` 在补邻之后才请求聊天补全，提示词也仍是用户原文。改写失败时改用原文继续检索。Neo4j、稀疏腿、重排或回答失败时，已经拿到的命中仍然输出。检索不写入 Qdrant。`masskb serve` 在同一进程里提供 `GET /health`、`POST /search`、`POST /ask` 和 `POST /ingest`，默认只绑 `127.0.0.1:8080`。健康检查和检索不写入 Qdrant。`POST /ingest` 读取服务端路径：`dry_run` 只做本地切分，否则调用现有的 `ingest()`。`masskb ask` 与 `POST /ask` 默认不运行；打开后，模型最多 3 步，只能调用现有的 `search()` 和 `healthcheck()`。健康检查、检索、整次 ask 和整次入库共用一把进程锁，调用结束才释放。
 
 ```mermaid
 flowchart LR
@@ -47,7 +47,8 @@ flowchart LR
   pkg["masskb 包\n宿主机虚拟环境"]
   qdrant["Qdrant\nlocalhost:6333"]
   neo4j["Neo4j Bolt\nlocalhost:7687"]
-  api["OpenAI 兼容 API\nEmbedding / 可选聊天"]
+  api["OpenAI 兼容 API\n默认 Embedding / 聊天"]
+  embed["本机嵌入（可选）\nprofile embed"]
 
   client -->|"masskb serve\n127.0.0.1:8080"| pkg
   client -->|"masskb ask\nPOST /ask"| pkg
@@ -58,7 +59,8 @@ flowchart LR
   pkg -->|"healthcheck"| neo4j
   pkg -->|"ingest 骨架"| neo4j
   pkg -->|"search 邻接"| neo4j
-  pkg -->|"EmbeddingClient"| api
+  pkg -->|"默认 EmbeddingClient"| api
+  pkg -->|"EMBEDDING_BASE_URL"| embed
   pkg -->|"search --rewrite"| api
   pkg -->|"search --rerank"| api
   pkg -->|"search --answer"| api
@@ -69,23 +71,23 @@ flowchart LR
 |------|------|------|
 | Qdrant | `qdrant/qdrant:latest` | HTTP `6333`，gRPC `6334`；容器名 `masskb-qdrant` |
 | Neo4j 5 | `neo4j:5` | Browser `7474`，Bolt `7687`；容器名 `masskb-neo4j`；Compose 会安装 APOC，业务代码尚未调用 |
-| Embedding / LLM | OpenAI 兼容 HTTP API | `EmbeddingClient` 请求 embeddings。`LLM_MODEL` 用于 `search --rewrite`、`search --answer`、`search --rerank`、`ingest --entities` 和 `masskb ask` |
+| Embedding / LLM | OpenAI 兼容 HTTP API | `EmbeddingClient` 请求 embeddings。默认与聊天共用 `LLM_BASE_URL`。可选 profile `embed` 提供本机 CPU ONNX 嵌入，需单独设置 `EMBEDDING_BASE_URL` 与 `EMBEDDING_DIMENSIONS`。`LLM_MODEL` 用于 `search --rewrite`、`search --answer`、`search --rerank`、`ingest --entities` 和 `masskb ask` |
 | 本地切分 | `masskb.ingest` | 空行分段，超长段按字符窗口切开。`ingest` 默认把分块写入 Qdrant；`--dry-run` 只预览 |
 | 稀疏编码 | `masskb.sparse` | 进程内把正文编成 `bm25` 稀疏向量。中文用二字组，不另起检索引擎 |
 | 编排 | `RetrievalPipeline` | `ingest()` 先写稠密和稀疏向量，再同步文档骨架；`search()` 默认做近邻检索并补前后邻，可选改写、融合、重排和回答；`healthcheck()` 汇总两个数据库的状态；`ask()` 在最多 3 步内调用这两项 |
 | 本机 HTTP | `masskb serve` | 可选 extra `[api]`（FastAPI 与 uvicorn）。默认 `127.0.0.1:8080`。进程内一把锁串行调用 `healthcheck()`、`search()`、整次 `ask()` 和整次 `ingest()` |
 | Python 客户端 | `MassKB` | 随核心安装提供，不新增依赖。调用已经启动的 `masskb serve`，不导入管线，不启动服务 |
-| 部署 | `Dockerfile` 与 `docker-compose.yml` | 服务 `app`（容器名 `masskb-app`，镜像 `masskb-app:local`）只跑 `masskb serve`。数据卷仍是 `qdrant_data`、`neo4j_data`、`neo4j_logs` |
+| 部署 | `Dockerfile` 与 `docker-compose.yml` | 服务 `app`（容器名 `masskb-app`，镜像 `masskb-app:local`）只跑 `masskb serve`。可选服务 `embed`（profile `embed`，镜像 `masskb-embed:local`）不在默认 `up` 中。数据卷是 `qdrant_data`、`neo4j_data`、`neo4j_logs`，启用该 profile 时另有 `embed_cache` |
 
 ### 目标架构图
 
-设计图放在 [`docs/architecture/`](docs/architecture/README.md)，源文件是 draw.io，可用 [diagrams.net](https://app.diagrams.net/) 打开。这些图描述的是目标形态。应用容器仍只执行 `masskb serve`。HTTP 现为 `GET /health`、`POST /search`、`POST /ask` 与 `POST /ingest`。图中的完整 REST、独立检索引擎和本地嵌入推理容器仍未落地。进程内有界工具循环已由 `masskb ask` 落地，只调用现有检索与健康检查。图中的意图理解分叉、图谱工具、独立 Agent 服务和完整 SDK 仍是目标。Python 客户端已覆盖这四条路由。`masskb serve` 提供健康检查、检索、`POST /ask` 和路径入库。关键字检索是 Qdrant 稀疏向量，融合在进程内。向量入库、文档骨架与查询以 [当前状态](#当前状态) 为准。
+设计图放在 [`docs/architecture/`](docs/architecture/README.md)，源文件是 draw.io，可用 [diagrams.net](https://app.diagrams.net/) 打开。这些图描述的是目标形态。应用容器仍只执行 `masskb serve`。HTTP 现为 `GET /health`、`POST /search`、`POST /ask` 与 `POST /ingest`。图中的完整 REST 和独立检索引擎仍未落地。本地嵌入推理已有可选 Compose profile `embed`，默认不启动；图中的 bge-m3 与 GPU 仍是目标。进程内有界工具循环已由 `masskb ask` 落地，只调用现有检索与健康检查。图中的意图理解分叉、图谱工具、独立 Agent 服务和完整 SDK 仍是目标。Python 客户端已覆盖这四条路由。`masskb serve` 提供健康检查、检索、`POST /ask` 和路径入库。关键字检索是 Qdrant 稀疏向量，融合在进程内。向量入库、文档骨架与查询以 [当前状态](#当前状态) 为准。
 
 | 文件 | 图名 | 图里有什么 |
 |------|------|------------|
 | [01-总体架构.drawio](docs/architecture/01-总体架构.drawio) | 总体架构 | 检索层、图谱层、智能层，以及面向集成方的 SDK / REST |
-| [02-数据流.drawio](docs/architecture/02-数据流.drawio) | 数据流 | 索引与图谱构建、查询路径。图中向量模型写作 bge-m3；代码默认模型是 `text-embedding-3-small` |
-| [03-部署架构.drawio](docs/architecture/03-部署架构.drawio) | 部署架构 | Compose 网络含 Qdrant、Neo4j 和应用服务。图中的可选嵌入容器仍不在 Compose 文件里。应用服务不挂语料卷 |
+| [02-数据流.drawio](docs/architecture/02-数据流.drawio) | 数据流 | 索引与图谱构建、查询路径。图中向量模型写作 bge-m3；代码默认模型是 `text-embedding-3-small`。可选 profile 的默认模型是 `BAAI/bge-small-zh-v1.5`（512 维） |
+| [03-部署架构.drawio](docs/architecture/03-部署架构.drawio) | 部署架构 | Compose 网络含 Qdrant、Neo4j 和应用服务。可选嵌入容器在 profile `embed`，默认 `up` 不启动。应用服务不挂语料卷。图中的 bge-m3 与 GPU 仍是目标 |
 | [04-集成与社区.drawio](docs/architecture/04-集成与社区.drawio) | 集成与社区 | 第三方经 SDK / API 集成，以及 Fork → PR → CI → 合并。Python 客户端已覆盖现有四条路由。图中的完整 SDK、多语言 SDK 和完整 REST 仍是目标；`masskb serve` 是本机 HTTP，含一条路径入库。CI 已跑离线测试 |
 
 ## 当前状态
@@ -95,12 +97,12 @@ flowchart LR
 | 能力 | 状态 | 说明 |
 |------|------|------|
 | 环境配置 | 已实现 | `masskb.config.Settings` 读取仓库根目录 `.env` 与环境变量 |
-| Embedding 客户端 | 已实现 | `EmbeddingClient.embed` / `embed_one`；占位 API Key 会直接报错，测试里客户端被 mock |
+| Embedding 客户端 | 已实现 | `EmbeddingClient.embed` / `embed_one`。占位 API Key 在走 `LLM_BASE_URL` 时会直接报错。设置 `EMBEDDING_BASE_URL` 后，嵌入不再要求真实 Key。测试里客户端被 mock |
 | Qdrant 封装 | 已实现 | 健康检查、建集合、批量 upsert、按 `doc_id` 删除、余弦近邻查询，以及 `bm25` 稀疏槽。查询不创建集合 |
 | Neo4j 封装 | 已实现 | 健康检查仍是 `verify_connectivity` 与 `RETURN 1`。另有文档骨架的约束、MERGE、删除和前后邻读取 |
 | 健康检查 CLI | 已实现 | `masskb healthcheck`、`python -m masskb`、`scripts/healthcheck.py` |
 | 文本切分 | 已实现 | UTF-8 `.txt` / `.md` 切成带稳定 `doc_id`、`chunk_id` 和字符偏移的分块。`masskb ingest --dry-run` 只打印预览，不连接 Qdrant、Neo4j 或 OpenAI |
-| 向量入库 | 已实现 | 默认集合 `masskb_chunks`，未命名余弦向量 1536 维，另有稀疏向量 `bm25`（IDF）。写入前探测一次向量维度，不一致则中止且不写。重复运行按 point id 覆盖稠密和稀疏向量，并按 `doc_id` 删除该文档的过期点。每个文档的向量步骤成功后再同步 Neo4j |
+| 向量入库 | 已实现 | 默认集合 `masskb_chunks`，未命名余弦向量默认 1536 维（`EMBEDDING_DIMENSIONS`），另有稀疏向量 `bm25`（IDF）。写入前探测一次向量维度，不一致则中止且不写。重复运行按 point id 覆盖稠密和稀疏向量，并按 `doc_id` 删除该文档的过期点。每个文档的向量步骤成功后再同步 Neo4j |
 | 离线测试与 CI | 已实现 | `tests/` 不连接真实服务；`.github/workflows/ci.yml` 在 `main` 推送和 Pull Request 上运行 |
 | 向量检索 | 已实现 | `RetrievalPipeline.search` 与 `masskb search`。默认返回余弦分数、原文、路径、`chunk_id`、字符偏移，以及 `prev_chunk_id` / `next_chunk_id`。集合不存在或没有命中时得到空列表 |
 | 混合检索 | 已实现 | `search --hybrid`。稠密与 `bm25` 各取一列名次，在进程内按 RRF（k=60）融合。默认关闭，因此默认的 `score` 仍是余弦相似度 |
@@ -110,13 +112,14 @@ flowchart LR
 | 重排 | 已实现 | `search --rerank` 默认关闭。在稠密或 RRF 截成 `top_k` 之后、补邻和回答之前，用 `LLM_MODEL` 做 listwise 重排。成功时 `score_kind` 为 `rerank`，`score` 为 `1/名次`。不新增依赖，也不重排融合前的候选。提示词使用用户原文 |
 | 查询改写 | 已实现 | `search --rewrite` 与 `POST /search` 的 `rewrite` 默认关闭。检索前用 `LLM_MODEL` 把查询改写成一条文本，供 embedding 和 bm25 使用。失败则用原文检索，退出码仍为 0。JSON 里的 `query` 始终是用户原文。重排和回答的提示词也使用原文 |
 | 本机 HTTP | 已实现 | 可选 extra `[api]`。`masskb serve` 提供 `GET /health`、`POST /search`、`POST /ask` 与 `POST /ingest`。健康检查和检索的响应与 CLI 的健康检查字典和 `search` JSON 一致。写入成功的正文是 `asdict(IngestWriteResult)`；`dry_run` 只切分，不连接 Qdrant、Neo4j 或 OpenAI。默认只绑 `127.0.0.1`，无鉴权。没有上传接口 |
-| 应用容器 | 已实现 | `Dockerfile` 与 Compose 服务 `app`。容器内执行 `masskb serve --host 0.0.0.0 --port 8080`，宿主机只发布 `127.0.0.1:8080`。不含嵌入推理。不挂载语料卷，容器内入库只能看到该用户可见的路径 |
+| 应用容器 | 已实现 | `Dockerfile` 与 Compose 服务 `app`。容器内执行 `masskb serve --host 0.0.0.0 --port 8080`，宿主机只发布 `127.0.0.1:8080`。不含嵌入运行时。可选嵌入是旁边的 profile `embed`，不在这个镜像里。不挂载语料卷，容器内入库只能看到该用户可见的路径 |
+| 本机嵌入推理 | 已实现（可选，默认关闭） | Compose profile `embed`，镜像 `masskb-embed:local`。CPU ONNX（fastembed），不进入应用镜像，不进入核心依赖。默认不启动。启用后须同时设置模型与维度，并在新集合上重新入库 |
 | Agent | 已实现（第一版，默认不运行） | `masskb ask` 与 `POST /ask`。模型在最多 3 步内调用已有的 `search` 与 `healthcheck`，再给出带 `chunk_id` 引用的回答。默认不进入 `search`。没有图谱查询、人物概念读取、别名合并、会话或多用户 |
 | Python 客户端 | 已实现（第一版） | `masskb.client.MassKB` 调用 `GET /health`、`POST /search`、`POST /ask`、`POST /ingest`。与这些 HTTP JSON 一致。不导入 `RetrievalPipeline`。不提供鉴权或会话 |
 
 ## 安装与运行
 
-需要 Python 3.10 或更高版本（CI 使用 3.12）以及 Docker Compose。应用容器只跑 `masskb serve`。CLI、入库和离线测试仍在宿主机。本地切分预览不需要启动容器，也不需要 API Key。写入向量和执行检索时需要 Qdrant 和真实的 `OPENAI_API_KEY`。同步文档骨架和补前后分块时还需要 Neo4j；检索在 Neo4j 不可用时仍返回向量命中。
+需要 Python 3.10 或更高版本（CI 使用 3.12）以及 Docker Compose。应用容器只跑 `masskb serve`。CLI、入库和离线测试仍在宿主机。本地切分预览不需要启动容器，也不需要 API Key。写入向量和执行检索时需要 Qdrant，以及真实的 `OPENAI_API_KEY` 或已设置的 `EMBEDDING_BASE_URL`。问答、改写、重排、实体抽取和 `ask` 仍需要真实 Key。同步文档骨架和补前后分块时还需要 Neo4j；检索在 Neo4j 不可用时仍返回向量命中。
 
 ### 1. 克隆
 
@@ -185,7 +188,7 @@ python -m masskb healthcheck
 python scripts/healthcheck.py
 ```
 
-Qdrant 与 Neo4j 都成功时，输出里各有一行 `[OK]`，进程退出码为 0，并附上 JSON 结果。任一数据库失败则退出码为 1。检查过程不会请求 Embedding API；Key 未配置时会多一行 `[INFO]`，这一行不改变退出码。
+Qdrant 与 Neo4j 都成功时，输出里各有一行 `[OK]`，进程退出码为 0，并附上 JSON 结果。任一数据库失败则退出码为 1。检查过程不会请求 Embedding API；Key 未配置时会多一行 `[INFO]`，这一行不改变退出码。配置了单独的嵌入地址时，这一行会说明问答暂不可用、嵌入地址已配置，本次仍不调用。
 
 ### 6. 本地切分与向量写入
 
@@ -198,7 +201,7 @@ python -m masskb ingest path/to/file.md --dry-run
 python -m masskb ingest path/to/dir --dry-run
 ```
 
-写入向量（需要已启动的 Qdrant，以及真实的 `OPENAI_API_KEY`）：
+写入向量（需要已启动的 Qdrant；默认还需要真实的 `OPENAI_API_KEY`。若已设置 `EMBEDDING_BASE_URL`，嵌入不再要求该 Key）：
 
 ```bash
 python -m masskb ingest path/to/file.md
@@ -209,9 +212,9 @@ python -m masskb ingest path/to/file.md --entities
 - 只接受 UTF-8 的 `.txt` 与 `.md`。传入目录时会递归收集这两种文件，其他文件跳过。
 - 先按空行分段，短段不合并。某一段超过字符窗口（默认 800）时，再按窗口切分，相邻块重叠 100 个字符。
 - `doc_id` 是路径键的 SHA-256；`chunk_id` 是 `doc_id` 与字符起止偏移的 SHA-256。仓库内文件默认相对仓库根目录（可用 `--root` 指定别的根），因此同一文件在不同工作目录下得到相同 id。偏移相对换行已规范成 LF 的文本。
-- 集合名是 `masskb_chunks`。稠密向量不命名，距离是余弦，维度是 1536，对应默认模型 `text-embedding-3-small`。同一点上还有名为 `bm25` 的稀疏向量，modifier 是 IDF。这些都是代码常量，不是新的环境变量。
+- 集合名是 `masskb_chunks`。稠密向量不命名，距离是余弦，维度默认是 1536，对应默认模型 `text-embedding-3-small`。可用 `EMBEDDING_DIMENSIONS` 覆盖。同一点上还有名为 `bm25` 的稀疏向量，modifier 是 IDF。集合名、距离和稀疏槽名是代码常量。
 - 稀疏向量在进程内生成：中文按重叠二字组，英文和数字按长度至少为 2 的词，下标是 crc32，值是饱和词频。IDF 由 Qdrant 在查询时乘上。这是 BM25 风格的词频加 IDF，不是带篇幅归一的完整 Okapi BM25，也没有服务端 `Qdrant/bm25` 推理。
-- 写入前会用一句固定文本探测一次向量维度。维度不是 1536，或已有集合的维度、距离与约定不一致时，命令中止，不创建集合（探测失败时），也不 upsert、不删除。
+- 写入前会用一句固定文本探测一次向量维度。维度不是配置值（默认 1536），或已有集合的维度、距离与约定不一致时，命令中止，不创建集合（探测失败时），也不 upsert、不删除。不会自动删除已有集合。
 - 已有集合如果只有稠密向量、没有 `bm25` 槽，ingest 会在写入前失败，并且不会删除该集合。Qdrant 需要 1.10 及以上才有稀疏向量和 IDF。本仓库的 `qdrant/qdrant:latest` 在 2026-11 的文档主版本是 1.20，新拉的镜像满足这一点；这个标签本身不固定。Phase 4 已经写入的集合要先删掉 `masskb_chunks`，再对全部语料重新 ingest。这次路径没有覆盖到的旧文件会随集合一起消失。
 - 每个分块的 point id 是 `chunk_id` 的 UUID5。同一分块再次写入会覆盖该点上的稠密向量、稀疏向量和 payload。文件重新切分后，该 `doc_id` 下不在本次 id 集合里的点会被删掉。
 - 一次 ingest 只处理这次路径里出现的文档，不会删除目录中已经不存在的文件留在库里的旧点或旧骨架。
@@ -245,7 +248,7 @@ python -m masskb search "质量" --hybrid --answer
 - `--rerank` 作用在已经截成 `top_k` 的命中上，发生在补邻和 `--answer` 之前。提示词只含用户原文和这些命中的 `chunk_id` 与正文。成功时 `mode` 不变，`score_kind` 为 `rerank`，`score` 改为 `1/名次`（第 1 条是 `1.0`，第 2 条是 `0.5`），`dense_score`、`sparse_score`、`dense_rank`、`sparse_rank` 保留重排前的值。纯稠密路径这四项仍是 `null`，原来的余弦不再留在 `score` 里。未知 `chunk_id` 会丢掉，没被点到的 id 按原顺序接在后面。没有可排序的命中时不调用模型，`rerank.error` 为 `no_hits`。JSON 非法或聊天失败时保持原顺序和原分数，`rerank.ok` 为 `false`，进程退出码为 0。关闭该开关时 `rerank.skipped` 为 `true`，不会创建聊天客户端。
 - 结果里有 `graph`，包含 `ok`、`skipped` 和 `error`。没有命中时不连接 Neo4j，也不发稀疏查询，`graph.skipped` 为 `true`。Neo4j 补邻接失败时，`hits` 仍在，邻接字段为 `null`，`graph.ok` 为 `false`，进程退出码为 0。
 - `--answer` 成功时，`answer.text` 是回答，`answer.citations` 是本次命中 `chunk_id` 的子集，`answer.model` 是 `LLM_MODEL`。没有命中、模型输出不是合法 JSON，或引用都被丢掉时，`answer.text` 为 `null`，命中列表仍然保留，进程退出码为 0。关闭该开关时 `answer.skipped` 为 `true`，不会创建聊天客户端。
-- 查询使用当前的 `EMBEDDING_MODEL`，需要和入库时是同一个 1536 维模型。
+- 查询使用当前的 `EMBEDDING_MODEL`，需要和入库时是同一个模型，并且维度等于 `EMBEDDING_DIMENSIONS`（默认 1536）。
 - 集合不存在、集合里没有点，或过滤后没有命中时，`hits` 为空数组，进程退出码为 0。Qdrant 连不上、API Key 缺失或只是占位符、向量维度或集合配置与约定不符时，错误打到标准错误，退出码为 1。
 - 空集合仍会先请求一次 embedding，因此缺 Key 和空库可以区分开。
 
@@ -337,7 +340,7 @@ python -m pip install -e ".[dev,api]"
 python -m pytest
 ```
 
-测试不连接 Qdrant、Neo4j，也不会访问 OpenAI，也不绑定端口。HTTP 测试使用 `TestClient`。
+测试不连接 Qdrant、Neo4j，也不会访问 OpenAI，也不绑定端口，不下载嵌入模型，也不需要 GPU。HTTP 测试使用 `TestClient`。
 
 ## 配置
 
@@ -352,11 +355,14 @@ python -m pytest
 | `NEO4J_USER` | `neo4j` | 与 Compose 中的用户名一致 |
 | `NEO4J_PASSWORD` | 空字符串 | 本地 Compose 请填 `masskb-dev-pass` |
 | `OPENAI_API_KEY` | 空字符串 | 以 `sk-your-` 开头的占位值视为未配置 |
-| `LLM_BASE_URL` | `https://api.openai.com/v1` | OpenAI 兼容网关。Embedding、`search --answer`、`search --rerank` 和 `masskb ask` 的聊天补全都使用它 |
-| `EMBEDDING_MODEL` | `text-embedding-3-small` | `.env.example` 中为注释项 |
-| `LLM_MODEL` | `gpt-4o-mini` | 用于 `search --rewrite`、`search --answer`、`search --rerank`、`ingest --entities` 和 `masskb ask`。`ask` 最多 3 步，默认不运行 |
+| `LLM_BASE_URL` | `https://api.openai.com/v1` | OpenAI 兼容网关。聊天补全使用它。未设置 `EMBEDDING_BASE_URL` 时，Embedding 也使用它 |
+| `EMBEDDING_BASE_URL` | 空字符串 | 空则 Embedding 继续用 `LLM_BASE_URL`。设置后只有 `EmbeddingClient` 使用它，且不再要求真实 `OPENAI_API_KEY`。占位 Key 可以留着；边车不校验 Authorization |
+| `EMBEDDING_MODEL` | `text-embedding-3-small` | `.env.example` 中为注释项。启用本机嵌入时改为边车已加载的模型名 |
+| `EMBEDDING_DIMENSIONS` | `1536` | 稠密向量维度。须与 `EMBEDDING_MODEL` 的输出宽度一致 |
+| `COMPOSE_EMBEDDING_BASE_URL` | 空，不是 `Settings` 字段 | 只由 Compose 写入应用容器的 `EMBEDDING_BASE_URL`。宿主机 CLI 仍读 `EMBEDDING_BASE_URL` |
+| `LLM_MODEL` | `gpt-4o-mini` | 用于 `search --rewrite`、`search --answer`、`search --rerank`、`ingest --entities` 和 `masskb ask`。`ask` 最多 3 步，默认不运行。仍走 `LLM_BASE_URL`，仍要求真实 Key |
 
-向量入库和检索使用代码常量：集合名 `masskb_chunks`，未命名余弦向量维度 1536，稀疏向量名 `bm25`。文档骨架、混合检索、查询改写、重排、回答、本机 HTTP 和工具循环都不新增环境变量。`POST /ingest` 也不新增环境变量。Python 客户端的 `base_url` 和 `timeout` 只来自 `MassKB(...)` 参数。`max_steps` 只来自 `ask --max-steps` 与 `POST /ask` 的请求体。`chunk_size` 与 `overlap` 来自 CLI 参数或 `POST /ingest` 的请求体，默认 800 和 100。`masskb serve` 的地址只来自 `--host` 与 `--port`。把 `EMBEDDING_MODEL` 换成非 1536 维的模型时，本次 ingest 会在写入前中止，`search` 也会在查询前中止。
+向量入库和检索的集合名是代码常量 `masskb_chunks`，未命名余弦向量维度默认 1536，稀疏向量名是 `bm25`。维度由 `EMBEDDING_DIMENSIONS` 配置。文档骨架、混合检索、查询改写、重排、回答、本机 HTTP 和工具循环不新增环境变量。`POST /ingest` 不新增请求字段。Python 客户端的 `base_url` 和 `timeout` 只来自 `MassKB(...)` 参数。`max_steps` 只来自 `ask --max-steps` 与 `POST /ask` 的请求体。`chunk_size` 与 `overlap` 来自 CLI 参数或 `POST /ingest` 的请求体，默认 800 和 100。`masskb serve` 的地址只来自 `--host` 与 `--port`。`EMBEDDING_MODEL` 与 `EMBEDDING_DIMENSIONS` 必须成对，并与入库时一致。不一致时本次 ingest 会在写入前中止，`search` 也会在查询前中止。换模型或维度前要删除集合 `masskb_chunks` 再全量重新 ingest，程序不会自动删集合。
 
 ## 项目结构
 
@@ -364,7 +370,12 @@ python -m pytest
 masskb/
 ├── Dockerfile                  # 应用镜像：只跑 masskb serve
 ├── .dockerignore
-├── docker-compose.yml          # Qdrant、Neo4j 与应用服务（只跑 masskb serve）
+├── docker-compose.yml          # Qdrant、Neo4j、应用服务，以及可选 profile embed
+├── embed/                      # 可选 CPU ONNX 嵌入边车；不进入应用镜像
+│   ├── .dockerignore
+│   ├── Dockerfile
+│   ├── requirements.txt        # 钉死 fastembed
+│   └── server.py
 ├── pyproject.toml              # 包元数据、依赖、pytest / ruff 配置
 ├── requirements.txt            # 与 pyproject 运行依赖对齐的清单
 ├── .env.example                # 环境变量模板（不含可用密钥）

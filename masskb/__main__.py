@@ -43,8 +43,17 @@ def cmd_healthcheck(_: argparse.Namespace) -> int:
     else:
         print(f"[FAIL] Neo4j   {result['neo4j'].get('error')}")
 
+    settings = getattr(pipeline, "settings", None)
+    embedding_url = ""
+    if settings is not None:
+        embedding_url = (getattr(settings, "embedding_base_url", "") or "").strip()
     if result.get("openai_key_configured"):
         print("[INFO] OPENAI_API_KEY 已配置（本检查未调用 embedding）")
+    elif embedding_url:
+        print(
+            "[INFO] OPENAI_API_KEY 未配置真实值 — 问答暂不可用；"
+            "嵌入地址已单独配置（本检查未调用）"
+        )
     else:
         print("[INFO] OPENAI_API_KEY 未配置真实值 — embedding/问答暂不可用（不阻塞本检查）")
 

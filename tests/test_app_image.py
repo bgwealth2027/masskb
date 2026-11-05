@@ -49,6 +49,7 @@ def test_dockerfile_runs_readonly_serve() -> None:
     forbidden = (
         "sentence-transformers",
         "torch",
+        "fastembed",
         "requirements.txt",
         "sk-",
         "OPENAI_API_KEY=",
@@ -85,7 +86,50 @@ def test_compose_app_service_contract() -> None:
     )
     assert f"NEO4J_PASSWORD: {_DEV_PASSWORD}" in app or f'"{_DEV_PASSWORD}"' in app
     assert "OPENAI_API_KEY: ${OPENAI_API_KEY:-}" in app or '"${OPENAI_API_KEY:-}"' in app
+    assert 'EMBEDDING_BASE_URL: "${COMPOSE_EMBEDDING_BASE_URL:-}"' in app
+    assert 'EMBEDDING_DIMENSIONS: "${EMBEDDING_DIMENSIONS:-1536}"' in app
+    assert "http://embed" not in app
     assert "sk-" not in text
     assert "env_file" not in text
     assert "ingest" not in text
-    assert "bge" not in text.lower()
+    assert "torch" not in text.lower()
+    assert "sentence-transformers" not in text.lower()
+    assert "fastembed" not in text.lower()
+    assert "bge-m3" not in text.lower()
+
+
+def test_compose_embed_profile_is_optional() -> None:
+    text = _read("docker-compose.yml")
+    blocks = _service_blocks(text)
+    assert set(blocks) >= {"qdrant", "neo4j", "app", "embed"}
+    embed = blocks["embed"]
+    app = blocks["app"]
+    assert "profiles:" in embed
+    assert "embed" in embed
+    assert "image: masskb-embed:local" in embed
+    assert "build: ./embed" in embed
+    assert "container_name: masskb-embed" in embed
+    assert "127.0.0.1:8081:8080" in embed
+    assert "BAAI/bge-small-zh-v1.5" in embed
+    assert "HF_TOKEN: ${HF_TOKEN:-}" in embed
+    assert "hf_" not in text
+    assert "embed_cache" in embed
+    assert app.count("condition: service_healthy") == 2
+    assert "bge-small-zh" not in app
+    assert "bge-small-zh" not in blocks["qdrant"]
+    assert "bge-small-zh" not in blocks["neo4j"]
+    assert "bge-m3" not in text.lower()
+
+
+def test_embed_dockerfile_is_separate_from_the_app() -> None:
+    text = _read("embed/Dockerfile")
+    assert text.startswith("FROM python:3.12-slim\n")
+    assert "requirements.txt" in text
+    assert "USER embed" in text
+    assert "useradd" in text
+    assert "chown embed:embed /cache" in text
+    lowered = text.lower()
+    for item in ("torch", "sentence-transformers", "masskb", "sk-", ".env"):
+        assert item not in lowered
+    assert "hf_" not in text
+    assert ".env" in _read("embed/.dockerignore").splitlines()

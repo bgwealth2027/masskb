@@ -39,13 +39,36 @@ class Settings(BaseModel):
     neo4j_password: str = Field(default="")
     openai_api_key: str = Field(default="")
     llm_base_url: str = Field(default="https://api.openai.com/v1")
+    embedding_base_url: str = Field(default="")
     embedding_model: str = Field(default="text-embedding-3-small")
+    embedding_dimensions: int = Field(default=1536, ge=1)
     llm_model: str = Field(default="gpt-4o-mini")
 
     @property
     def has_real_openai_key(self) -> bool:
         key = (self.openai_api_key or "").strip()
         return bool(key) and key != "sk-your-api-key-here" and not key.startswith("sk-your-")
+
+
+def _embedding_base_url() -> str:
+    """空白视为未设置，嵌入继续走 LLM_BASE_URL。"""
+    return os.getenv("EMBEDDING_BASE_URL", "").strip()
+
+
+def _embedding_dimensions() -> int:
+    """未设置时保持 1536。空字符串、非整数和小于 1 的值直接失败。"""
+    if "EMBEDDING_DIMENSIONS" not in os.environ:
+        return 1536
+    raw = os.environ["EMBEDDING_DIMENSIONS"].strip()
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"EMBEDDING_DIMENSIONS 必须是大于等于 1 的整数，实际为 {raw!r}。"
+        ) from exc
+    if value < 1:
+        raise ValueError(f"EMBEDDING_DIMENSIONS 必须是大于等于 1 的整数，实际为 {value}。")
+    return value
 
 
 @lru_cache(maxsize=1)
@@ -57,6 +80,8 @@ def get_settings() -> Settings:
         neo4j_password=os.getenv("NEO4J_PASSWORD", ""),
         openai_api_key=os.getenv("OPENAI_API_KEY", ""),
         llm_base_url=os.getenv("LLM_BASE_URL", "https://api.openai.com/v1"),
+        embedding_base_url=_embedding_base_url(),
         embedding_model=os.getenv("EMBEDDING_MODEL", "text-embedding-3-small"),
+        embedding_dimensions=_embedding_dimensions(),
         llm_model=os.getenv("LLM_MODEL", "gpt-4o-mini"),
     )

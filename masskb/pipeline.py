@@ -48,7 +48,6 @@ from masskb.rewrite import build_rewrite_messages, parse_rewrite
 from masskb.sparse import encode_text
 from masskb.vector_store import (
     DEFAULT_COLLECTION,
-    DEFAULT_VECTOR_SIZE,
     VectorStore,
     point_id_for_chunk,
 )
@@ -58,7 +57,7 @@ _PROBE_TEXT = "masskb"
 
 
 class DimensionMismatchError(RuntimeError):
-    """探测、分块或查询向量的维度与约定的 1536 不一致。"""
+    """探测、分块或查询向量的维度与配置的维度不一致。默认配置是 1536。"""
 
 
 class GraphSyncError(RuntimeError):
@@ -532,10 +531,10 @@ class RetrievalPipeline:
             return self._clear_docs_if_collection_exists(report, entities=entities)
 
         probe = self.embeddings.embed_one(_PROBE_TEXT)
-        if len(probe) != DEFAULT_VECTOR_SIZE:
+        if len(probe) != self.settings.embedding_dimensions:
             raise self._dimension_error(len(probe), before_collection=True)
 
-        self.vector_store.ensure_collection()
+        self.vector_store.ensure_collection(vector_size=self.settings.embedding_dimensions)
         upserted = 0
         graph_documents = 0
         graph_chunks = 0
@@ -605,10 +604,11 @@ class RetrievalPipeline:
         _validate_search(query, top_k, doc_id)
         retrieval_text, rewrite_status = self._maybe_rewrite(query, enabled=rewrite)
         vector = self.embeddings.embed_one(retrieval_text)
-        if len(vector) != DEFAULT_VECTOR_SIZE:
+        expected = self.settings.embedding_dimensions
+        if len(vector) != expected:
             raise DimensionMismatchError(
                 f"向量维度不符：模型 {self.settings.embedding_model} 返回 {len(vector)} 维，"
-                f"期望 {DEFAULT_VECTOR_SIZE}。未执行检索。"
+                f"期望 {expected}。未执行检索。"
             )
         mode = "hybrid" if hybrid else "dense"
         if not self.vector_store.has_collection():
@@ -627,7 +627,9 @@ class RetrievalPipeline:
                 self._maybe_rerank(result, enabled=rerank),
                 enabled=answer,
             )
-        self.vector_store.require_compatible_collection()
+        self.vector_store.require_compatible_collection(
+            vector_size=self.settings.embedding_dimensions
+        )
         limit = candidate_limit(top_k) if hybrid else top_k
         try:
             raw_hits = self.vector_store.search(vector, top_k=limit, doc_id=doc_id)
@@ -1153,8 +1155,9 @@ class RetrievalPipeline:
                 raise DimensionMismatchError(
                     f"embedding 返回 {len(embedded)} 条，期望 {len(batch)} 条。未写入该文档。"
                 )
+            expected = self.settings.embedding_dimensions
             for vector in embedded:
-                if len(vector) != DEFAULT_VECTOR_SIZE:
+                if len(vector) != expected:
                     raise self._dimension_error(len(vector), before_collection=False)
             vectors.extend(embedded)
         return vectors
@@ -1162,12 +1165,13 @@ class RetrievalPipeline:
     def _dimension_error(self, actual: int, *, before_collection: bool) -> DimensionMismatchError:
         suffix = "未创建集合，也未写入。" if before_collection else "未写入该文档。"
         model = self.settings.embedding_model
+        expected = self.settings.embedding_dimensions
         return DimensionMismatchError(
-            f"向量维度不符：模型 {model} 返回 {actual} 维，期望 {DEFAULT_VECTOR_SIZE}。{suffix}"
+            f"向量维度不符：模型 {model} 返回 {actual} 维，期望 {expected}。{suffix}"
         )
 
-    @staticmethod
     def _result(
+        self,
         report: IngestReport,
         points_upserted: int,
         *,
@@ -1183,7 +1187,7 @@ class RetrievalPipeline:
         return IngestWriteResult(
             report=report,
             collection=DEFAULT_COLLECTION,
-            vector_size=DEFAULT_VECTOR_SIZE,
+            vector_size=self.settings.embedding_dimensions,
             points_upserted=points_upserted,
             graph_documents=graph_documents,
             graph_chunks=graph_chunks,

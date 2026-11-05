@@ -337,6 +337,28 @@ def test_search_aborts_when_query_dimension_mismatches(
     pipeline.close()
 
 
+def test_search_require_uses_configured_dimension(monkeypatch: pytest.MonkeyPatch) -> None:
+    embeddings = _Embeddings(dim=4)
+    pipeline, _calls = _search_pipeline(monkeypatch, embeddings, raw=[])
+    pipeline.settings = Settings(
+        openai_api_key="sk-live-example",
+        embedding_model="embed-test",
+        embedding_dimensions=4,
+    )
+    seen: dict[str, int] = {}
+
+    def require_compatible_collection(name: str = "masskb_chunks", **kwargs: int) -> None:
+        assert name == "masskb_chunks"
+        seen["vector_size"] = kwargs["vector_size"]
+
+    pipeline.vector_store.require_compatible_collection = require_compatible_collection
+    result = pipeline.search("质量")
+    pipeline.close()
+
+    assert seen["vector_size"] == 4
+    assert result.hits == ()
+
+
 def test_search_missing_api_key_does_not_open_qdrant(monkeypatch: pytest.MonkeyPatch) -> None:
     created = _forbid_backends(monkeypatch)
     pipeline = RetrievalPipeline(Settings(openai_api_key="sk-your-api-key-here"))
@@ -449,11 +471,12 @@ _PAYLOAD_KEYS = {"doc_id", "chunk_id", "source", "index", "start", "end", "text"
 
 
 class _MemoryVectors:
-    def __init__(self) -> None:
+    def __init__(self, *, expected_size: int = 1536) -> None:
         self.points: dict[str, dict] = {}
         self.calls: list[str] = []
         self.present = True
         self.ensure_error: Exception | None = None
+        self.expected_size = expected_size
 
     def has_collection(self, name: str = "masskb_chunks") -> bool:
         self.calls.append("has_collection")
@@ -463,7 +486,7 @@ class _MemoryVectors:
     def ensure_collection(self, name: str = "masskb_chunks", *, vector_size: int = 1536) -> None:
         self.calls.append("ensure_collection")
         assert name == "masskb_chunks"
-        assert vector_size == 1536
+        assert vector_size == self.expected_size
         if self.ensure_error is not None:
             raise self.ensure_error
 
@@ -556,10 +579,16 @@ def _pipeline(
     monkeypatch: pytest.MonkeyPatch,
     embeddings: _Embeddings,
     store: _MemoryVectors,
+    *,
+    embedding_dimensions: int = 1536,
 ) -> RetrievalPipeline:
     _forbid_backends(monkeypatch)
     pipeline = RetrievalPipeline(
-        Settings(openai_api_key="sk-live-example", embedding_model="embed-test")
+        Settings(
+            openai_api_key="sk-live-example",
+            embedding_model="embed-test",
+            embedding_dimensions=embedding_dimensions,
+        )
     )
     graph = _MemoryGraph()
     pipeline.embeddings.embed_one = embeddings.embed_one
@@ -660,6 +689,25 @@ def test_ingest_aborts_when_probe_dimension_mismatches(
 
     assert created == []
     pipeline.close()
+
+
+def test_ingest_uses_configured_dimension(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "a.txt"
+    path.write_text("hello\n", encoding="utf-8")
+    embeddings = _Embeddings(dim=4)
+    store = _MemoryVectors(expected_size=4)
+    pipeline = _pipeline(monkeypatch, embeddings, store, embedding_dimensions=4)
+
+    result = pipeline.ingest(path, root=tmp_path)
+    pipeline.close()
+
+    stored = next(iter(store.points.values()))
+    assert result.vector_size == 4
+    assert store.calls.count("ensure_collection") == 1
+    assert len(stored["vector"]) == 4
 
 
 def test_ingest_missing_api_key_does_not_open_qdrant(
