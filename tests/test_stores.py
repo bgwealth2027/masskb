@@ -10,6 +10,7 @@ from qdrant_client.models import Distance, PayloadSchemaType
 from masskb.config import Settings
 from masskb.graph_store import GraphStore
 from masskb.vector_store import (
+    SEARCH_PAYLOAD_FIELDS,
     CollectionConfigError,
     VectorStore,
     point_id_for_chunk,
@@ -208,6 +209,10 @@ class _RecordingQdrant:
     def delete_collection(self, **kwargs):
         self.calls.append(("delete_collection", kwargs))
 
+    def query_points(self, **kwargs):
+        self.calls.append(("query_points", kwargs))
+        return getattr(self, "query_response", SimpleNamespace(points=[]))
+
 
 def _bind_qdrant(monkeypatch: pytest.MonkeyPatch, client: _RecordingQdrant) -> VectorStore:
     monkeypatch.setattr("masskb.vector_store.QdrantClient", lambda **kwargs: client)
@@ -365,3 +370,61 @@ def test_delete_by_doc_id_without_keep_ids_matches_doc_only(
     assert filt.must[0].match.value == "doc-1"
     assert filt.must_not is None
     assert "delete_collection" not in _names(client)
+
+
+class _Score(float):
+    """用来确认分数会被收成内置 float。"""
+
+
+def test_search_queries_nearest_neighbors(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = _RecordingQdrant()
+    client.query_response = SimpleNamespace(
+        points=[
+            SimpleNamespace(score=_Score(0.2), payload={"text": "b", "chunk_id": "c2"}),
+            SimpleNamespace(score=0.9, payload=None),
+        ]
+    )
+    store = _bind_qdrant(monkeypatch, client)
+
+    result = store.search((0.1, 0.2), top_k=3)
+
+    queries = [kwargs for name, kwargs in client.calls if name == "query_points"]
+    assert len(queries) == 1
+    assert queries[0]["collection_name"] == "masskb_chunks"
+    assert queries[0]["query"] == [0.1, 0.2]
+    assert queries[0]["limit"] == 3
+    assert queries[0]["query_filter"] is None
+    assert queries[0]["with_payload"] == list(SEARCH_PAYLOAD_FIELDS)
+    assert queries[0]["with_vectors"] is False
+    assert "using" not in queries[0]
+    assert result == [
+        {"score": 0.2, "payload": {"text": "b", "chunk_id": "c2"}},
+        {"score": 0.9, "payload": {}},
+    ]
+    assert type(result[0]["score"]) is float
+    forbidden = {"create_collection", "upsert", "delete", "delete_collection", "create_payload_index"}
+    assert forbidden.isdisjoint(_names(client))
+
+
+def test_search_filters_by_doc_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = _RecordingQdrant()
+    store = _bind_qdrant(monkeypatch, client)
+
+    assert store.search([0.0], doc_id="doc-1") == []
+
+    filt = client.calls[0][1]["query_filter"]
+    assert filt.must[0].key == "doc_id"
+    assert filt.must[0].match.value == "doc-1"
+    assert filt.must_not is None
+    forbidden = {"create_collection", "upsert", "delete", "delete_collection", "create_payload_index"}
+    assert forbidden.isdisjoint(_names(client))
+
+
+def test_require_compatible_collection_is_read_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = _RecordingQdrant()
+    client.info = _collection_info(SimpleNamespace(size=1536, distance=Distance.COSINE))
+    store = _bind_qdrant(monkeypatch, client)
+
+    store.require_compatible_collection()
+
+    assert _names(client) == ["get_collection"]

@@ -36,8 +36,19 @@ class CollectionConfigError(RuntimeError):
     """集合已存在，但维度、距离或向量形态与约定不一致。"""
 
 
+SEARCH_PAYLOAD_FIELDS = (
+    "doc_id",
+    "chunk_id",
+    "source",
+    "index",
+    "start",
+    "end",
+    "text",
+)
+
+
 class VectorStore:
-    """Qdrant 薄封装：连通性检查、建集合、批量 upsert、按文档删除。"""
+    """Qdrant 薄封装：连通性检查、建集合、批量 upsert、按文档删除、近邻查询。"""
 
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()
@@ -85,7 +96,7 @@ class VectorStore:
     ) -> None:
         """集合不存在则按余弦距离创建；已存在则核对配置。不一致时不改集合。"""
         if self.has_collection(name):
-            self._require_compatible_collection(name, vector_size)
+            self.require_compatible_collection(name, vector_size=vector_size)
         else:
             self.client.create_collection(
                 collection_name=name,
@@ -130,6 +141,43 @@ class VectorStore:
             points_selector=FilterSelector(filter=selector),
             wait=True,
         )
+
+    def require_compatible_collection(
+        self,
+        name: str = DEFAULT_COLLECTION,
+        *,
+        vector_size: int = DEFAULT_VECTOR_SIZE,
+    ) -> None:
+        """核对已有集合的维度与余弦距离。不创建集合，也不建索引。"""
+        self._require_compatible_collection(name, vector_size)
+
+    def search(
+        self,
+        vector: Sequence[float],
+        *,
+        top_k: int = 5,
+        doc_id: str | None = None,
+        name: str = DEFAULT_COLLECTION,
+    ) -> list[dict[str, Any]]:
+        """余弦近邻查询。不创建集合，也不写入。集合不存在时由 Qdrant 报错。"""
+        query_filter = None
+        if doc_id is not None:
+            query_filter = Filter(
+                must=[FieldCondition(key="doc_id", match=MatchValue(value=doc_id))]
+            )
+        response = self.client.query_points(
+            collection_name=name,
+            query=list(vector),
+            query_filter=query_filter,
+            limit=top_k,
+            with_payload=list(SEARCH_PAYLOAD_FIELDS),
+            with_vectors=False,
+        )
+        hits: list[dict[str, Any]] = []
+        for point in response.points:
+            payload = getattr(point, "payload", None)
+            hits.append({"score": float(point.score), "payload": dict(payload or {})})
+        return hits
 
     def close(self) -> None:
         if self._client is not None:

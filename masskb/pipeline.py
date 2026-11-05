@@ -1,4 +1,4 @@
-"""检索编排：向量入库，以及尚未实现的检索入口。"""
+"""检索编排：向量入库，以及同一模型上的近邻检索。"""
 
 from __future__ import annotations
 
@@ -6,6 +6,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from qdrant_client.http.exceptions import UnexpectedResponse
 
 from masskb.config import Settings, get_settings
 from masskb.embeddings import EmbeddingClient
@@ -29,7 +31,33 @@ _PROBE_TEXT = "masskb"
 
 
 class DimensionMismatchError(RuntimeError):
-    """探测或分块向量的维度与约定的 1536 不一致。"""
+    """探测、分块或查询向量的维度与约定的 1536 不一致。"""
+
+
+@dataclass(frozen=True)
+class SearchHit:
+    """一条近邻命中。`score` 来自 Qdrant，其余字段来自入库 payload。"""
+
+    score: float
+    text: str | None
+    source: str | None
+    chunk_id: str | None
+    doc_id: str | None
+    index: int | None
+    start: int | None
+    end: int | None
+
+
+@dataclass(frozen=True)
+class SearchResult:
+    """一次向量检索。`doc_id` 是过滤条件，未过滤时为 None。"""
+
+    query: str
+    top_k: int
+    collection: str
+    embedding_model: str
+    doc_id: str | None
+    hits: tuple[SearchHit, ...]
 
 
 @dataclass(frozen=True)
@@ -40,6 +68,46 @@ class IngestWriteResult:
     collection: str
     vector_size: int
     points_upserted: int
+
+
+def _validate_search(query: str, top_k: int, doc_id: str | None) -> None:
+    if not isinstance(query, str) or query.strip() == "":
+        raise ValueError("查询不能为空")
+    if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k <= 0:
+        raise ValueError(f"top_k 必须为正整数，收到 {top_k!r}")
+    if doc_id is not None and (not isinstance(doc_id, str) or doc_id.strip() == ""):
+        raise ValueError("doc_id 不能为空")
+
+
+def _search_result(
+    embedding_model: str,
+    query: str,
+    top_k: int,
+    doc_id: str | None,
+    hits: tuple[SearchHit, ...],
+) -> SearchResult:
+    return SearchResult(
+        query=query,
+        top_k=top_k,
+        collection=DEFAULT_COLLECTION,
+        embedding_model=embedding_model,
+        doc_id=doc_id,
+        hits=hits,
+    )
+
+
+def _search_hit(raw: dict[str, Any]) -> SearchHit:
+    payload = raw.get("payload") or {}
+    return SearchHit(
+        score=float(raw["score"]),
+        text=payload.get("text"),
+        source=payload.get("source"),
+        chunk_id=payload.get("chunk_id"),
+        doc_id=payload.get("doc_id"),
+        index=payload.get("index"),
+        start=payload.get("start"),
+        end=payload.get("end"),
+    )
 
 
 def _payload(chunk: Chunk) -> dict[str, Any]:
@@ -55,7 +123,7 @@ def _payload(chunk: Chunk) -> dict[str, Any]:
 
 
 class RetrievalPipeline:
-    """组装向量、图谱与 Embedding。`ingest` 只写 Qdrant；`search` 仍未实现。"""
+    """组装向量、图谱与 Embedding。`ingest` 只写 Qdrant；`search` 只读近邻。"""
 
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()
@@ -109,11 +177,36 @@ class RetrievalPipeline:
             upserted += len(ids)
         return self._result(report, upserted)
 
-    def search(self, query: str, *, top_k: int = 5) -> dict[str, Any]:
-        """检索占位：尚未实现真实混合检索。"""
-        raise NotImplementedError(
-            "检索编排尚未实现。请先配置真实 OPENAI_API_KEY，再接入 embedding + Qdrant/Neo4j 查询。"
-        )
+    def search(
+        self,
+        query: str,
+        *,
+        top_k: int = 5,
+        doc_id: str | None = None,
+    ) -> SearchResult:
+        """用与入库相同的模型做近邻检索。不写 Qdrant，也不访问 Neo4j。
+
+        先生成查询向量，再看集合是否存在。集合不存在、没有点或过滤后没有命中时，
+        返回空的 `hits`。缺 Key、维度不符、集合配置不符或 Qdrant 连不上时抛错。
+        """
+        _validate_search(query, top_k, doc_id)
+        vector = self.embeddings.embed_one(query)
+        if len(vector) != DEFAULT_VECTOR_SIZE:
+            raise DimensionMismatchError(
+                f"向量维度不符：模型 {self.settings.embedding_model} 返回 {len(vector)} 维，"
+                f"期望 {DEFAULT_VECTOR_SIZE}。未执行检索。"
+            )
+        if not self.vector_store.has_collection():
+            return _search_result(self.settings.embedding_model, query, top_k, doc_id, ())
+        self.vector_store.require_compatible_collection()
+        try:
+            raw_hits = self.vector_store.search(vector, top_k=top_k, doc_id=doc_id)
+        except UnexpectedResponse as exc:
+            if exc.status_code != 404:
+                raise
+            raw_hits = []
+        hits = tuple(_search_hit(item) for item in raw_hits)
+        return _search_result(self.settings.embedding_model, query, top_k, doc_id, hits)
 
     def close(self) -> None:
         self.vector_store.close()
