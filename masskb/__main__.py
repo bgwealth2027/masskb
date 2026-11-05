@@ -177,6 +177,36 @@ def cmd_ingest(args: argparse.Namespace) -> int:
         pipeline.close()
 
 
+def _listen_port(value: str) -> int:
+    try:
+        port = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("port 必须是 1 到 65535 的整数") from exc
+    if port < 1 or port > 65535:
+        raise argparse.ArgumentTypeError("port 必须是 1 到 65535 的整数")
+    return port
+
+
+def cmd_serve(args: argparse.Namespace) -> int:
+    """启动只读 HTTP。FastAPI 与 uvicorn 在这里才导入。"""
+    try:
+        import uvicorn
+
+        from masskb.api import app
+    except ImportError:
+        print(
+            '[FAIL] 未安装 API 额外依赖。请执行 pip install -e ".[api]"',
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        uvicorn.run(app, host=args.host, port=args.port)
+    except Exception as exc:  # noqa: BLE001 — CLI 把启动失败转成退出码
+        print(f"[FAIL] {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def cmd_search(args: argparse.Namespace) -> int:
     """查询向量近邻，并把 JSON 打到 stdout。向量失败只写 stderr。"""
     pipeline = RetrievalPipeline()
@@ -281,6 +311,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="用 LLM_MODEL 对已截断的 top_k 做 listwise 重排；默认关闭",
     )
     search.set_defaults(func=cmd_search)
+
+    serve = sub.add_parser(
+        "serve",
+        help='启动只读 HTTP（需要 pip install -e ".[api]"）',
+        description=(
+            "启动只读 HTTP：GET /health 与 POST /search。入库仍使用 ingest 子命令。"
+            '需要 pip install -e ".[api]"。'
+        ),
+    )
+    serve.add_argument("--host", default="127.0.0.1", help="监听地址（默认 127.0.0.1）")
+    serve.add_argument(
+        "--port",
+        type=_listen_port,
+        default=8080,
+        help="监听端口（默认 8080）",
+    )
+    serve.set_defaults(func=cmd_serve)
 
     return parser
 
