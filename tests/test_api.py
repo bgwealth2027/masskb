@@ -145,6 +145,7 @@ def test_post_search_matches_cli_json() -> None:
         "answer": False,
         "rerank": False,
         "rewrite": False,
+        "graph_hops": False,
     }
     assert "steps" not in response.json()
     assert "stopped" not in response.json()
@@ -160,6 +161,7 @@ def test_post_search_forwards_flags_without_trimming_query() -> None:
         "answer": True,
         "rerank": True,
         "rewrite": True,
+        "graph_hops": True,
     }
     with TestClient(create_app(pipeline)) as client:  # type: ignore[arg-type]
         response = client.post("/search", json=body)
@@ -173,6 +175,7 @@ def test_post_search_forwards_flags_without_trimming_query() -> None:
         "answer": True,
         "rerank": True,
         "rewrite": True,
+        "graph_hops": True,
     }
     assert response.json()["query"] == " 质量 "
     assert response.json()["doc_id"] == "abc"
@@ -523,6 +526,7 @@ def test_post_ask_matches_cli_json_and_defaults() -> None:
         "hybrid": False,
         "rewrite": False,
         "rerank": False,
+        "graph_hops": False,
         "max_steps": 3,
     }
 
@@ -536,6 +540,7 @@ def test_post_ask_forwards_flags() -> None:
         "hybrid": True,
         "rewrite": True,
         "rerank": True,
+        "graph_hops": True,
         "max_steps": 2,
     }
     with TestClient(create_app(pipeline)) as client:  # type: ignore[arg-type]
@@ -549,6 +554,7 @@ def test_post_ask_forwards_flags() -> None:
         "hybrid": True,
         "rewrite": True,
         "rerank": True,
+        "graph_hops": True,
         "max_steps": 2,
     }
     assert "answer" not in pipeline.seen

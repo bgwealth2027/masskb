@@ -10,6 +10,7 @@ from qdrant_client.http.exceptions import UnexpectedResponse
 
 from masskb.config import Settings
 from masskb.fusion import RRF_K, candidate_limit
+from masskb.graph_store import RelatedChunk
 from masskb.ingest import ingest_path
 from masskb.pipeline import (
     DimensionMismatchError,
@@ -108,6 +109,10 @@ def _search_pipeline(
     require_error: Exception | None = None,
     neighbors: dict | None = None,
     neighbor_error: Exception | None = None,
+    related: tuple | None = None,
+    related_error: Exception | None = None,
+    payloads: dict | None = None,
+    payload_error: Exception | None = None,
 ) -> tuple[RetrievalPipeline, list[str]]:
     _forbid_backends(monkeypatch)
     pipeline = RetrievalPipeline(
@@ -184,8 +189,34 @@ def _search_pipeline(
     pipeline._complete_answer = complete_answer
     pipeline._complete_rerank = complete_rerank
     pipeline._complete_rewrite = complete_rewrite
+    related_calls: list[tuple[list[str], str | None]] = []
+    payload_calls: list[list[str]] = []
+
+    def related_chunks(chunk_ids, *, doc_id):
+        related_calls.append((list(chunk_ids), doc_id))
+        calls.append("related_chunks")
+        if related_error is not None:
+            raise related_error
+        if related is None:
+            raise AssertionError("默认检索不应做图扩展")
+        return related
+
+    def get_by_chunk_ids(chunk_ids, *, name: str = "masskb_chunks"):
+        payload_calls.append(list(chunk_ids))
+        calls.append("get_by_chunk_ids")
+        assert name == "masskb_chunks"
+        if payload_error is not None:
+            raise payload_error
+        if payloads is None:
+            raise AssertionError("默认检索不应按 id 取正文")
+        return payloads
+
     pipeline.graph_store.neighbor_chunk_ids = neighbor_chunk_ids
+    pipeline.graph_store.related_chunks = related_chunks
+    pipeline.vector_store.get_by_chunk_ids = get_by_chunk_ids
     pipeline.neighbor_calls = neighbor_calls  # type: ignore[attr-defined]
+    pipeline.related_calls = related_calls  # type: ignore[attr-defined]
+    pipeline.payload_calls = payload_calls  # type: ignore[attr-defined]
     return pipeline, calls
 
 
@@ -266,6 +297,11 @@ def test_search_embeds_query_and_maps_hits(monkeypatch: pytest.MonkeyPatch) -> N
     assert result.rewrite.skipped is True
     assert result.rewrite.ok is True
     assert result.rewrite.text is None
+    assert result.graph_hops.skipped is True
+    assert result.graph_hops.ok is True
+    assert result.hits[0].graph_via is None
+    assert pipeline.related_calls == []  # type: ignore[attr-defined]
+    assert pipeline.payload_calls == []  # type: ignore[attr-defined]
     assert result.hits[0].dense_score is None
     assert result.hits[0].sparse_rank is None
     assert "search_sparse" not in calls
@@ -2116,6 +2152,250 @@ def test_ingest_entities_chat_error_and_graph_error_keep_points(
     pipeline.close()
 
 
+def _dense(score: float, chunk_id: str, *, text: str = "正文", doc_id: str = "d") -> dict:
+    return {
+        "score": score,
+        "payload": {
+            "text": text,
+            "chunk_id": chunk_id,
+            "doc_id": doc_id,
+            "source": "a.md",
+            "index": 0,
+            "start": 0,
+            "end": 2,
+        },
+    }
+
+
+def test_search_graph_hops_without_chunk_ids_skips_the_graph(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pipeline, calls = _search_pipeline(monkeypatch, _Embeddings(), raw=[])
+
+    result = pipeline.search("质量", graph_hops=True)
+    pipeline.close()
+
+    assert result.hits == ()
+    assert result.graph_hops.ok is True
+    assert result.graph_hops.skipped is False
+    assert result.graph_hops.error == "no_hits"
+    assert result.graph_hops.found is None
+    assert result.graph_hops.expanded is None
+    assert "related_chunks" not in calls
+    assert "get_by_chunk_ids" not in calls
+
+
+def test_search_graph_hops_replaces_the_tail(monkeypatch: pytest.MonkeyPatch) -> None:
+    pipeline, calls = _search_pipeline(
+        monkeypatch,
+        _Embeddings(),
+        raw=[_dense(0.9, "c1", text="种子甲"), _dense(0.2, "c2", text="种子乙")],
+        related=(
+            RelatedChunk("c3", mention_count=2, via_next=False),
+            RelatedChunk("c4", mention_count=1, via_next=True),
+        ),
+        payloads={
+            "c3": {"text": "扩展甲", "chunk_id": "c3", "doc_id": "d", "source": "b.md"},
+        },
+        neighbors={"c1": ("p1", None), "c3": (None, "n3")},
+    )
+
+    result = pipeline.search("质量", top_k=2, graph_hops=True)
+    pipeline.close()
+
+    assert [hit.chunk_id for hit in result.hits] == ["c1", "c3"]
+    assert [hit.score for hit in result.hits] == [0.9, 0.0]
+    assert result.hits[0].text == "种子甲"
+    assert result.hits[0].graph_via is None
+    assert result.hits[1].text == "扩展甲"
+    assert result.hits[1].graph_via == "mention"
+    assert result.hits[1].source == "b.md"
+    assert result.score_kind == "cosine"
+    assert result.graph_hops.ok is True
+    assert result.graph_hops.skipped is False
+    assert result.graph_hops.error is None
+    assert result.graph_hops.found == 2
+    assert result.graph_hops.expanded == 1
+    assert result.hits[0].prev_chunk_id == "p1"
+    assert result.hits[1].next_chunk_id == "n3"
+    assert pipeline.neighbor_calls == [["c1", "c3"]]  # type: ignore[attr-defined]
+    assert calls.index("related_chunks") < calls.index("get_by_chunk_ids")
+    assert "rerank" not in calls
+
+
+def test_search_graph_hops_marks_neighbor_and_appends_when_there_is_room(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pipeline, _calls = _search_pipeline(
+        monkeypatch,
+        _Embeddings(),
+        raw=[_dense(0.4, "c1")],
+        related=(RelatedChunk("near", mention_count=0, via_next=True),),
+        payloads={"near": {"text": "下一块", "chunk_id": "near", "doc_id": "d"}},
+    )
+
+    neighbor = pipeline.search("质量", top_k=5, graph_hops=True)
+    pipeline.close()
+
+    assert [hit.chunk_id for hit in neighbor.hits] == ["c1", "near"]
+    assert neighbor.hits[1].graph_via == "next_chunk"
+    assert neighbor.hits[1].score == 0.0
+    assert neighbor.graph_hops.expanded == 1
+
+    both, _calls = _search_pipeline(
+        monkeypatch,
+        _Embeddings(),
+        raw=[_dense(0.4, "c1"), _dense(0.3, "c2")],
+        related=(RelatedChunk("both", mention_count=1, via_next=True),),
+        payloads={"both": {"text": "又是邻居", "chunk_id": "both", "doc_id": "d"}},
+    )
+    mixed = both.search("质量", top_k=2, graph_hops=True)
+    both.close()
+
+    assert [hit.chunk_id for hit in mixed.hits] == ["c1", "both"]
+    assert mixed.hits[1].graph_via == "mention+next_chunk"
+
+
+def test_search_graph_hops_keeps_the_only_hit_when_top_k_is_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pipeline, calls = _search_pipeline(
+        monkeypatch,
+        _Embeddings(),
+        raw=[_dense(0.8, "only")],
+        related=(RelatedChunk("extra", mention_count=3, via_next=True),),
+        payloads={"extra": {"text": "不该换入", "chunk_id": "extra", "doc_id": "d"}},
+    )
+
+    result = pipeline.search("质量", top_k=1, graph_hops=True)
+    pipeline.close()
+
+    assert [hit.chunk_id for hit in result.hits] == ["only"]
+    assert result.hits[0].score == 0.8
+    assert result.hits[0].graph_via is None
+    assert result.graph_hops.found == 1
+    assert result.graph_hops.expanded == 0
+    assert "get_by_chunk_ids" not in calls
+
+
+def test_search_graph_hops_skips_payloads_outside_the_doc_filter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pipeline, _calls = _search_pipeline(
+        monkeypatch,
+        _Embeddings(),
+        raw=[_dense(0.9, "c1", doc_id="keep"), _dense(0.2, "c2", doc_id="keep")],
+        related=(
+            RelatedChunk("other", mention_count=4, via_next=False),
+            RelatedChunk("blank", mention_count=3, via_next=False),
+            RelatedChunk("same", mention_count=1, via_next=False),
+        ),
+        payloads={
+            "other": {"text": "别的文档", "chunk_id": "other", "doc_id": "nope"},
+            "blank": {"text": "", "chunk_id": "blank", "doc_id": "keep"},
+            "same": {"text": "同文档", "chunk_id": "same", "doc_id": "keep"},
+        },
+    )
+
+    result = pipeline.search("质量", top_k=2, doc_id="keep", graph_hops=True)
+    pipeline.close()
+
+    assert pipeline.related_calls == [(["c1", "c2"], "keep")]  # type: ignore[attr-defined]
+    assert [hit.chunk_id for hit in result.hits] == ["c1", "same"]
+    assert result.hits[1].text == "同文档"
+    assert result.graph_hops.found == 3
+    assert result.graph_hops.expanded == 1
+
+
+def test_search_graph_hops_keeps_vector_hits_when_lookup_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph_down, calls = _search_pipeline(
+        monkeypatch,
+        _Embeddings(),
+        raw=[_dense(0.9, "c1"), _dense(0.2, "c2")],
+        related_error=RuntimeError("bolt"),
+    )
+
+    def complete(_system: str, user: str) -> str:
+        calls.append("rerank")
+        assert "chunk_id: c1" in user
+        assert "chunk_id: c3" not in user
+        return '{"order": ["c2", "c1"]}'
+
+    graph_down._complete_rerank = complete
+    failed = graph_down.search("质量", top_k=2, graph_hops=True, rerank=True)
+    graph_down.close()
+
+    assert [hit.chunk_id for hit in failed.hits] == ["c2", "c1"]
+    assert failed.graph_hops.ok is False
+    assert failed.graph_hops.skipped is False
+    assert failed.graph_hops.error == "RuntimeError: bolt"
+    assert failed.graph_hops.found is None
+    assert "get_by_chunk_ids" not in calls
+    assert calls.index("related_chunks") < calls.index("rerank")
+
+    payload_down, _calls = _search_pipeline(
+        monkeypatch,
+        _Embeddings(),
+        raw=[_dense(0.9, "c1"), _dense(0.2, "c2")],
+        related=(RelatedChunk("c3", mention_count=1, via_next=False),),
+        payload_error=ConnectionError("qdrant"),
+    )
+    kept = payload_down.search("质量", top_k=2, graph_hops=True)
+    payload_down.close()
+
+    assert [hit.chunk_id for hit in kept.hits] == ["c1", "c2"]
+    assert [hit.score for hit in kept.hits] == [0.9, 0.2]
+    assert kept.graph_hops.ok is False
+    assert kept.graph_hops.error == "ConnectionError: qdrant"
+    assert kept.score_kind == "cosine"
+
+
+def test_search_graph_hops_expands_before_rerank_and_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pipeline, calls = _search_pipeline(
+        monkeypatch,
+        _Embeddings(),
+        raw=[_dense(0.9, "c1", text="种子"), _dense(0.2, "c2", text="末位")],
+        related=(RelatedChunk("c3", mention_count=1, via_next=False),),
+        payloads={"c3": {"text": "扩展正文", "chunk_id": "c3", "doc_id": "d"}},
+        neighbors={"c3": (None, "n3"), "c1": ("p1", None)},
+    )
+    seen: dict[str, str] = {}
+
+    def rerank(_system: str, user: str) -> str:
+        calls.append("rerank")
+        seen["rerank"] = user
+        assert pipeline.neighbor_calls == []  # type: ignore[attr-defined]
+        return '{"order": ["c3", "c1"]}'
+
+    def answer(_system: str, user: str) -> str:
+        calls.append("answer")
+        seen["answer"] = user
+        return '{"abstain": false, "answer": "扩展里有", "citations": ["c3"]}'
+
+    pipeline._complete_rerank = rerank
+    pipeline._complete_answer = answer
+
+    result = pipeline.search("质量", top_k=2, graph_hops=True, rerank=True, answer=True)
+    pipeline.close()
+
+    assert calls.index("related_chunks") < calls.index("rerank") < calls.index("answer")
+    assert "扩展正文" in seen["rerank"]
+    assert "末位" not in seen["rerank"]
+    assert [hit.chunk_id for hit in result.hits] == ["c3", "c1"]
+    assert result.hits[0].graph_via == "mention"
+    assert result.hits[0].score == 1.0
+    assert result.hits[1].score == 0.5
+    assert result.score_kind == "rerank"
+    assert result.hits[0].next_chunk_id == "n3"
+    assert "扩展正文" in seen["answer"]
+    assert result.answer.ok is True
+    assert result.answer.citations == ("c3",)
+
+
 def _ask_pipeline() -> RetrievalPipeline:
     return RetrievalPipeline(Settings(llm_model="gpt-test"))
 
@@ -2202,10 +2482,12 @@ def test_ask_search_then_finish_forwards_defaults_and_filters_citations() -> Non
                 "answer": False,
                 "rerank": False,
                 "rewrite": False,
+                "graph_hops": False,
             },
         )
     ]
     assert "质量问题" in messages[0]
+    assert "graph_hops：false" in messages[0]
     assert "命中正文" not in messages[0]
     assert "命中正文" in messages[1]
     assert "keep" in messages[1]
@@ -2251,6 +2533,7 @@ def test_ask_forwards_caller_flags() -> None:
         hybrid=True,
         rewrite=True,
         rerank=True,
+        graph_hops=True,
         max_steps=2,
     )
 
@@ -2262,6 +2545,7 @@ def test_ask_forwards_caller_flags() -> None:
         "answer": False,
         "rerank": True,
         "rewrite": True,
+        "graph_hops": True,
     }
     pipeline.close()
 

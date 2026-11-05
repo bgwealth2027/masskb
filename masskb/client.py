@@ -94,6 +94,7 @@ class SearchHit:
     sparse_score: float | None
     dense_rank: int | None
     sparse_rank: int | None
+    graph_via: str | None
 
 
 @dataclass(frozen=True)
@@ -103,6 +104,17 @@ class GraphStatus:
     ok: bool
     skipped: bool
     error: str | None
+
+
+@dataclass(frozen=True)
+class GraphHopStatus:
+    """这次有没有沿已有边扩展命中。``found`` 与 ``expanded`` 可以是 null。"""
+
+    ok: bool
+    skipped: bool
+    error: str | None
+    found: int | None
+    expanded: int | None
 
 
 @dataclass(frozen=True)
@@ -166,6 +178,7 @@ class SearchResult:
     answer: AnswerStatus
     rerank: RerankStatus
     rewrite: RewriteStatus
+    graph_hops: GraphHopStatus
 
 
 @dataclass(frozen=True)
@@ -196,6 +209,7 @@ class AskResult:
     hybrid: bool
     rewrite: bool
     rerank: bool
+    graph_hops: bool
 
 
 @dataclass(frozen=True)
@@ -408,6 +422,18 @@ def _parse_health(value: object, path: str) -> Health:
     )
 
 
+def _parse_graph_hops(data: dict[str, object], path: str) -> GraphHopStatus:
+    prefix = _join(path, "graph_hops")
+    raw = _expect_dict(_require(data, "graph_hops", path), prefix)
+    return GraphHopStatus(
+        ok=_required_bool(raw, "ok", prefix),
+        skipped=_required_bool(raw, "skipped", prefix),
+        error=_optional_str(raw, "error", prefix),
+        found=_optional_int(raw, "found", prefix),
+        expanded=_optional_int(raw, "expanded", prefix),
+    )
+
+
 def _parse_graph(data: dict[str, object], path: str) -> GraphStatus:
     prefix = _join(path, "graph")
     raw = _expect_dict(_require(data, "graph", path), prefix)
@@ -483,6 +509,7 @@ def _parse_hit(value: object, path: str) -> SearchHit:
         sparse_score=_optional_float(raw, "sparse_score", path),
         dense_rank=_optional_int(raw, "dense_rank", path),
         sparse_rank=_optional_int(raw, "sparse_rank", path),
+        graph_via=_optional_str(raw, "graph_via", path),
     )
 
 
@@ -504,6 +531,7 @@ def _parse_search(value: object, path: str) -> SearchResult:
         answer=_parse_answer(raw, path),
         rerank=_parse_rerank(raw, path),
         rewrite=_parse_rewrite(raw, path),
+        graph_hops=_parse_graph_hops(raw, path),
     )
 
 
@@ -537,6 +565,7 @@ def _parse_ask(value: object) -> AskResult:
         hybrid=_required_bool(raw, "hybrid", ""),
         rewrite=_required_bool(raw, "rewrite", ""),
         rerank=_required_bool(raw, "rerank", ""),
+        graph_hops=_required_bool(raw, "graph_hops", ""),
     )
 
 
@@ -717,6 +746,7 @@ class MassKB:
         answer: bool = False,
         rerank: bool = False,
         rewrite: bool = False,
+        graph_hops: bool = False,
     ) -> SearchResult:
         """``POST /search``。字段与 CLI 相同。
 
@@ -730,6 +760,7 @@ class MassKB:
             "answer": answer,
             "rerank": rerank,
             "rewrite": rewrite,
+            "graph_hops": graph_hops,
         }
         response = self._send("POST", "/search", payload)
         body = _read_body(response)
@@ -745,6 +776,7 @@ class MassKB:
         hybrid: bool = False,
         rewrite: bool = False,
         rerank: bool = False,
+        graph_hops: bool = False,
         max_steps: int = 3,
     ) -> AskResult:
         """``POST /ask``。不发送 ``answer``。``max_steps`` 默认 3。"""
@@ -755,6 +787,7 @@ class MassKB:
             "hybrid": hybrid,
             "rewrite": rewrite,
             "rerank": rerank,
+            "graph_hops": graph_hops,
             "max_steps": max_steps,
         }
         response = self._send("POST", "/ask", payload)
