@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from masskb.__main__ import main
+from masskb.answer import AnswerStatus
 from masskb.pipeline import (
     DimensionMismatchError,
     GraphStatus,
@@ -219,6 +220,7 @@ def test_ingest_without_dry_run_writes_and_closes(
     assert "collection: masskb_chunks" in out
     assert "vector_size: 1536" in out
     assert "upserted: 1" in out
+    assert "sparse: bm25" in out
     assert "graph_documents: 1" in out
     assert "graph_chunks: 1" in out
     assert "[INFO] 已写入 Qdrant 集合 masskb_chunks，并同步 Neo4j 文档骨架。未执行检索。" in out
@@ -349,10 +351,20 @@ def test_search_prints_json_and_closes(
     seen: dict = {}
 
     class FakePipeline:
-        def search(self, query: str, *, top_k: int = 5, doc_id: str | None = None) -> SearchResult:
+        def search(
+            self,
+            query: str,
+            *,
+            top_k: int = 5,
+            doc_id: str | None = None,
+            hybrid: bool = False,
+            answer: bool = False,
+        ) -> SearchResult:
             seen["query"] = query
             seen["top_k"] = top_k
             seen["doc_id"] = doc_id
+            seen["hybrid"] = hybrid
+            seen["answer"] = answer
             return SearchResult(
                 query=query,
                 top_k=top_k,
@@ -404,11 +416,38 @@ def test_search_prints_json_and_closes(
                 "end": 2,
                 "prev_chunk_id": None,
                 "next_chunk_id": "c-next",
+                "dense_score": None,
+                "sparse_score": None,
+                "dense_rank": None,
+                "sparse_rank": None,
             }
         ],
         "graph": {"ok": True, "skipped": False, "error": None},
+        "mode": "dense",
+        "score_kind": "cosine",
+        "hybrid": {
+            "ok": True,
+            "skipped": True,
+            "error": None,
+            "rrf_k": None,
+            "candidate_k": None,
+        },
+        "answer": {
+            "ok": True,
+            "skipped": True,
+            "text": None,
+            "citations": [],
+            "model": None,
+            "error": None,
+        },
     }
-    assert seen == {"query": "质量", "top_k": 3, "doc_id": "abc"}
+    assert seen == {
+        "query": "质量",
+        "top_k": 3,
+        "doc_id": "abc",
+        "hybrid": False,
+        "answer": False,
+    }
     assert closed == ["closed"]
 
 
@@ -417,7 +456,15 @@ def test_search_empty_hits_exit_zero(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     class FakePipeline:
-        def search(self, query: str, *, top_k: int = 5, doc_id: str | None = None) -> SearchResult:
+        def search(
+            self,
+            query: str,
+            *,
+            top_k: int = 5,
+            doc_id: str | None = None,
+            hybrid: bool = False,
+            answer: bool = False,
+        ) -> SearchResult:
             return SearchResult(
                 query=query,
                 top_k=top_k,
@@ -473,7 +520,59 @@ def test_search_help(capsys: pytest.CaptureFixture[str]) -> None:
     out = capsys.readouterr().out
     assert "--top-k" in out
     assert "--doc-id" in out
+    assert "--hybrid" in out
+    assert "--answer" in out
     assert "chunk_id" in out
+
+
+def test_search_answer_failure_prints_json_and_exits_zero(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class FakePipeline:
+        def search(self, *_args, **_kwargs) -> SearchResult:
+            return SearchResult(
+                query="质量",
+                top_k=5,
+                collection="masskb_chunks",
+                embedding_model="embed-test",
+                doc_id=None,
+                hits=(
+                    SearchHit(
+                        score=0.5,
+                        text="原文",
+                        source="a.md",
+                        chunk_id="c",
+                        doc_id="d",
+                        index=0,
+                        start=0,
+                        end=2,
+                        prev_chunk_id=None,
+                        next_chunk_id=None,
+                    ),
+                ),
+                graph=GraphStatus(ok=True, skipped=False),
+                answer=AnswerStatus(
+                    ok=False,
+                    skipped=False,
+                    text=None,
+                    citations=(),
+                    model="gpt-4o-mini",
+                    error="uncited",
+                ),
+            )
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr("masskb.__main__.RetrievalPipeline", FakePipeline)
+
+    assert main(["search", "质量", "--answer"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["hits"][0]["chunk_id"] == "c"
+    assert payload["answer"]["ok"] is False
+    assert payload["answer"]["error"] == "uncited"
+    assert payload["answer"]["text"] is None
 
 
 def test_search_missing_query_exits_2() -> None:
