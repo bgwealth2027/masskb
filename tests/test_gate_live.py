@@ -197,6 +197,11 @@ def test_gate_live_loopback_roundtrip(request: pytest.FixtureRequest, tmp_path: 
         hits = found["hits"]
         assert isinstance(hits, list) and hits
         assert all(set(hit) == {"source", "chunk_id", "text"} for hit in hits)
+        assert hits[0]["source"] == "qingpingguo.md"
+        river_status, river = _request("POST", f"{gate_base}/search", _search_body("蓝河流"))
+        assert river_status == 200, river
+        assert isinstance(river, dict)
+        assert river["hits"][0]["source"] == "lanheliu.md"
         assert any(hit["source"] == "qingpingguo.md" and "虚构果园" in hit["text"] for hit in hits)
         repeated: list[str] = []
         for chunk in sample_chunks:

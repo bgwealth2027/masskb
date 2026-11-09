@@ -19,10 +19,13 @@ from masskb.gate import (
     PUBLIC_SAMPLE_SOURCES,
     GateConfig,
     GateError,
+    TrustedHit,
     bind_gate,
+    finite_score,
     load_sample_catalog,
     normalize_upstream,
     project_sample_hits,
+    rank_trusted_hits,
 )
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -432,6 +435,109 @@ def test_sdk_cannot_treat_gate_health_as_serve_health(stack) -> None:
         client.close()
 
 
+def _trusted(item: object, score: float) -> TrustedHit:
+    return TrustedHit(
+        source=item.source,  # type: ignore[attr-defined]
+        chunk_id=item.chunk_id,  # type: ignore[attr-defined]
+        text=item.text,  # type: ignore[attr-defined]
+        score=score,
+    )
+
+
+def test_scores_merge_desc_with_stable_ties_and_drop_bad_rows() -> None:
+    catalog = load_sample_catalog()
+    low, mid, high, tied = catalog
+    forged = {
+        "source": high.source,
+        "chunk_id": high.chunk_id,
+        "doc_id": high.doc_id,
+        "text": _PRIVATE,
+        "score": 0.99,
+    }
+    missing = {
+        "source": low.source,
+        "chunk_id": low.chunk_id,
+        "doc_id": low.doc_id,
+        "text": low.text,
+    }
+    body = {
+        "hits": [
+            forged,
+            missing,
+            {
+                "source": high.source,
+                "chunk_id": high.chunk_id,
+                "doc_id": high.doc_id,
+                "text": high.text,
+                "score": True,
+            },
+            {
+                "source": high.source,
+                "chunk_id": high.chunk_id,
+                "doc_id": high.doc_id,
+                "text": high.text,
+                "score": float("nan"),
+            },
+            {
+                "source": mid.source,
+                "chunk_id": mid.chunk_id,
+                "doc_id": mid.doc_id,
+                "text": mid.text,
+                "score": 0.2,
+            },
+            {
+                "source": high.source,
+                "chunk_id": high.chunk_id,
+                "doc_id": high.doc_id,
+                "text": high.text,
+                "score": 0.4,
+            },
+            {
+                "source": high.source,
+                "chunk_id": high.chunk_id,
+                "doc_id": high.doc_id,
+                "text": high.text,
+                "score": 0.95,
+            },
+        ]
+    }
+    projected = project_sample_hits(body, catalog)
+    assert projected is not None
+    assert [item.chunk_id for item in projected] == [mid.chunk_id, high.chunk_id, high.chunk_id]
+    assert _PRIVATE not in "".join(item.text for item in projected)
+    other = project_sample_hits(
+        {
+            "hits": [
+                {
+                    "source": tied.source,
+                    "chunk_id": tied.chunk_id,
+                    "doc_id": tied.doc_id,
+                    "text": tied.text,
+                    "score": 0.4,
+                },
+                {
+                    "source": low.source,
+                    "chunk_id": low.chunk_id,
+                    "doc_id": low.doc_id,
+                    "text": low.text,
+                    "score": float("inf"),
+                },
+            ]
+        },
+        catalog,
+    )
+    assert other is not None
+    ranked = rank_trusted_hits([projected, other])
+    assert [item["chunk_id"] for item in ranked] == [high.chunk_id, tied.chunk_id, mid.chunk_id]
+    assert all(set(item) == {"source", "chunk_id", "text"} for item in ranked)
+    assert low.chunk_id not in {item["chunk_id"] for item in ranked}
+    assert finite_score(True) is None
+    assert finite_score(float("nan")) is None
+    assert finite_score("0.9") is None
+    equal = rank_trusted_hits([[_trusted(low, 0.5)], [_trusted(mid, 0.5)]])
+    assert [item["chunk_id"] for item in equal] == [low.chunk_id, mid.chunk_id]
+
+
 def test_private_hit_with_bad_chunk_id_is_dropped() -> None:
     catalog = load_sample_catalog()
     pinned = catalog[0]
@@ -707,3 +813,72 @@ def test_closed_client_does_not_free_the_slot() -> None:
         gate.finish()
         upstream.shutdown()
         upstream.server_close()
+
+
+def test_upstream_stream_closes_when_chunked_body_exceeds_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("masskb.gate.MAX_UPSTREAM_BYTES", 40)
+    tail = threading.Event()
+    written = {"n": 0}
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, fmt: str, *args: object) -> None:
+            return
+
+        def do_POST(self) -> None:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length:
+                self.rfile.read(length)
+            self.close_connection = True
+            self.send_response(200)
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            part = b"a" * 30
+            try:
+                for _ in range(2):
+                    self.wfile.write(f"{len(part):x}\r\n".encode() + part + b"\r\n")
+                    self.wfile.flush()
+                    written["n"] += 1
+                tail.wait(5)
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+                written["n"] += 1
+            except (BrokenPipeError, ConnectionError, TimeoutError):
+                return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    host, up_port = server.server_address[:2]
+    gate = bind_gate(
+        GateConfig(
+            upstream=f"http://{host}:{up_port}",
+            client_wait_seconds=3,
+            upstream_timeout_seconds=3,
+        ),
+        "127.0.0.1",
+        0,
+    )
+    try:
+        started = time.monotonic()
+        status, payload = _status_and_json(
+            _request_bytes(
+                gate.server_address[1],
+                "POST",
+                "/search",
+                json.dumps(_page_body()).encode(),
+            )
+        )
+        elapsed = time.monotonic() - started
+        assert status == 503
+        assert payload == {"detail": "检索失败"}
+        assert elapsed < 2
+        assert gate.admission.inflight == 0
+        assert written["n"] < 3
+    finally:
+        tail.set()
+        gate.finish()
+        server.shutdown()
+        server.server_close()

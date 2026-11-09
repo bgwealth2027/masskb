@@ -28,6 +28,7 @@ class _Switch:
             return {"hits": []}
         requested = json.loads(body.decode("utf-8"))
         doc_id = requested.get("doc_id")
+        query = requested.get("query") if isinstance(requested.get("query"), str) else ""
         return {
             "hits": [
                 {
@@ -35,6 +36,7 @@ class _Switch:
                     "chunk_id": item.chunk_id,
                     "doc_id": item.doc_id,
                     "text": item.text,
+                    "score": 0.9 if query and query in item.text else 0.1,
                 }
                 for item in self.catalog
                 if item.doc_id == doc_id
@@ -128,6 +130,15 @@ def test_browser_page_matches_gate_statuses() -> None:
             assert page.locator("#answer-section").is_hidden()
             first = page.locator("#hits li").all_inner_texts()
             assert len(first) == 4
+            assert "qingpingguo.md" in first[0]
+            submit("蓝河流")
+            page.wait_for_function(
+                "() => document.querySelector('#status').textContent === '检索完成'",
+                timeout=10000,
+            )
+            river = page.locator("#hits li").all_inner_texts()
+            assert "lanheliu.md" in river[0]
+            assert river[0] != first[0]
             submit("青苹果")
             page.wait_for_function(
                 "() => document.querySelector('#status').textContent === '检索完成'",

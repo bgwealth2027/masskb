@@ -10,6 +10,9 @@
 
 对外健康检查只有 ``ok`` 和固定为 false 的 ``openai_key_configured``。
 成功的检索 JSON 只有 ``query`` 和 ``hits`` 里的 ``source``、``chunk_id``、``text``。
+两条纯 dense 查询按命中自己的有限数值 ``score`` 降序合并；分数相同则保留先出现的那条。
+没有分数，或分数是布尔、NaN、无穷，这条命中直接丢掉，不补一个名次。
+目录里没有被上游返回的分块也不会被填回去。
 
 ``client_wait_seconds`` 只决定何时给浏览器回「检索超时」。
 到点不取消上游读取，名额也要等这次读取结束才释放。
@@ -21,6 +24,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import threading
 import time
@@ -303,18 +307,38 @@ def sample_doc_ids(catalog: tuple[SampleChunk, ...]) -> tuple[str, ...]:
     return tuple(ordered)
 
 
+@dataclass(frozen=True)
+class TrustedHit:
+    """一条已经对上样例正文的命中。``score`` 只用于排序，不写进公开 JSON。"""
+
+    source: str
+    chunk_id: str
+    text: str
+    score: float
+
+
+def finite_score(value: object) -> float | None:
+    """只接受有限的整数或浮点。布尔、NaN、无穷和非数字都没有名次。"""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    if not math.isfinite(number):
+        return None
+    return number
+
+
 def project_sample_hits(
     body: object,
     catalog: tuple[SampleChunk, ...],
-) -> list[dict[str, str]] | None:
-    """只收下和目录逐字一致的命中。正文用目录里的那份，不抄上游的其它字段。"""
+) -> list[TrustedHit] | None:
+    """按上游顺序收下和目录逐字一致、且分数可用的命中。"""
     if not isinstance(body, dict):
         return None
     hits = body.get("hits")
     if not isinstance(hits, list):
         return None
     by_id = {item.chunk_id: item for item in catalog}
-    accepted: list[str] = []
+    accepted: list[TrustedHit] = []
     for hit in hits:
         if not isinstance(hit, dict):
             continue
@@ -326,13 +350,34 @@ def project_sample_hits(
             continue
         if hit.get("text") != pinned.text:
             continue
-        if pinned.chunk_id not in accepted:
-            accepted.append(pinned.chunk_id)
-    chosen = set(accepted)
+        score = finite_score(hit.get("score"))
+        if score is None:
+            continue
+        accepted.append(
+            TrustedHit(
+                source=pinned.source,
+                chunk_id=pinned.chunk_id,
+                text=pinned.text,
+                score=score,
+            )
+        )
+    return accepted
+
+
+def rank_trusted_hits(groups: list[list[TrustedHit]]) -> list[dict[str, str]]:
+    """按分数降序合并。分数相同保留先出现的；同一分块只留更高的分数。"""
+    best: dict[str, tuple[TrustedHit, int]] = {}
+    encounter = 0
+    for group in groups:
+        for hit in group:
+            previous = best.get(hit.chunk_id)
+            if previous is None or hit.score > previous[0].score:
+                best[hit.chunk_id] = (hit, encounter)
+            encounter += 1
+    ordered = sorted(best.values(), key=lambda item: (-item[0].score, item[1]))
     return [
-        {"source": item.source, "chunk_id": item.chunk_id, "text": item.text}
-        for item in catalog
-        if item.chunk_id in chosen
+        {"source": hit.source, "chunk_id": hit.chunk_id, "text": hit.text}
+        for hit, _index in ordered
     ]
 
 
@@ -405,13 +450,13 @@ class GateServer(ThreadingHTTPServer):
         headers = {"accept": "application/json"}
         if content is not None:
             headers["content-type"] = "application/json"
-        response = self.http.request(
+        with self.http.stream(
             method,
             f"{self.config.upstream}{route}",
             content=content,
             headers=headers,
-        )
-        return _fetch_reply(response)
+        ) as response:
+            return _fetch_reply(response)
 
     def finish(self) -> None:
         """停止接受连接并关掉客户端。不等待上游的 120 秒上限。"""
@@ -608,7 +653,7 @@ class GateHandler(BaseHTTPRequestHandler):
 def search_pinned(server: GateServer, query: str) -> list[dict[str, str]]:
     """每个预置 ``doc_id`` 只查一次。失败即停止，不重试，也不再查下一个。"""
     catalog = server.catalog
-    accepted: set[str] = set()
+    groups: list[list[TrustedHit]] = []
     for doc_id in sample_doc_ids(catalog):
         payload = json.dumps(
             {
@@ -630,18 +675,23 @@ def search_pinned(server: GateServer, query: str) -> list[dict[str, str]]:
         projected = project_sample_hits(body, catalog)
         if projected is None:
             raise GateError("upstream search shape")
-        accepted.update(item["chunk_id"] for item in projected)
-    return [
-        {"source": item.source, "chunk_id": item.chunk_id, "text": item.text}
-        for item in catalog
-        if item.chunk_id in accepted
-    ]
+        groups.append(projected)
+    return rank_trusted_hits(groups)
 
 
 def _fetch_reply(response: httpx.Response) -> tuple[int, Any]:
-    content = response.content
-    if len(content) > MAX_UPSTREAM_BYTES:
-        raise GateError("upstream body too large")
+    """按块累计上游正文，超过上限就关闭连接，不再把剩余内容读进内存。"""
+    parts: list[bytes] = []
+    total = 0
+    for block in response.iter_bytes():
+        if not block:
+            continue
+        total += len(block)
+        if total > MAX_UPSTREAM_BYTES:
+            response.close()
+            raise GateError("upstream body too large")
+        parts.append(block)
+    content = b"".join(parts)
     if content.strip() == b"":
         return response.status_code, None
     return response.status_code, json.loads(content.decode("utf-8"))
