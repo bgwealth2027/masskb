@@ -682,6 +682,7 @@ def test_upsert_document_merges_without_text(monkeypatch: pytest.MonkeyPatch) ->
     assert "MENTIONS" in query
     assert ":Person" in query
     assert ":Concept" in query
+    assert _keeps_alias_endpoints(query)
     assert "target_id" in query
     assert "apoc" not in query.lower()
     assert "CREATE (" not in query
@@ -724,6 +725,7 @@ def test_delete_document_detaches_chunks_and_document(monkeypatch: pytest.Monkey
     assert "MENTIONS" in query
     assert ":Person" in query
     assert ":Concept" in query
+    assert _keeps_alias_endpoints(query)
     assert params == {"doc_id": 'doc"1'}
     assert 'doc"1' not in query
 
@@ -817,7 +819,8 @@ def test_replace_mentions_merges_and_retires_old_targets(monkeypatch: pytest.Mon
     assert "孔子" not in merge_query
     assert "ALIAS_OF" not in merge_query
     assert "ALIAS_OF" not in clear_query
-    assert "ALIAS_OF" not in orphan_query
+    assert _keeps_alias_endpoints(orphan_query)
+    assert "DETACH DELETE" not in orphan_query
     assert merge_params["mentions"] == [
         {"chunk_id": "c1", "kind": "person", "entity_id": "pid", "name": "孔子"}
     ]
@@ -980,6 +983,13 @@ def test_get_by_chunk_ids_empty_does_not_open_client() -> None:
     assert store._client is None
 
 
+def _keeps_alias_endpoints(query: str) -> bool:
+    """孤儿清理可以删掉空节点，但不能拆掉仍连着别名的表面节点。"""
+    person = "NOT (()-[:MENTIONS]->(person)) AND NOT (person)-[:ALIAS_OF]-()"
+    concept = "NOT (()-[:MENTIONS]->(concept)) AND NOT (concept)-[:ALIAS_OF]-()"
+    return person in query and concept in query and "DETACH DELETE person" not in query
+
+
 def _alias_link(kind: str = "person") -> AliasLink:
     return AliasLink(
         kind=kind,
@@ -1020,14 +1030,21 @@ def test_replace_aliases_touches_only_this_document(monkeypatch: pytest.MonkeyPa
     assert ":Concept" in concept_query
     assert concept_params["doc_id"] == "doc-a"
     assert "apoc" not in person_query.lower()
+    assert _keeps_alias_endpoints(driver.session_obj.queries[3][0])
+    assert driver.session_obj.write_calls == 1
 
     assert store.replace_aliases("doc-b", []) == 0
 
-    clear_query, clear_params = driver.session_obj.queries[-1]
+    doc_b_queries = driver.session_obj.queries[-2:]
+    clear_query, clear_params = doc_b_queries[0]
+    sweep_query, sweep_params = doc_b_queries[1]
     assert clear_params == {"doc_id": "doc-b"}
     assert "doc-a" not in clear_query
     assert "MENTIONS" not in clear_query
-    assert len(driver.session_obj.queries) == 4
+    assert _keeps_alias_endpoints(sweep_query)
+    assert sweep_params == {}
+    assert len(driver.session_obj.queries) == 6
+    assert driver.session_obj.write_calls == 2
 
 
 def test_replace_aliases_rejects_bad_links_before_write(monkeypatch: pytest.MonkeyPatch) -> None:

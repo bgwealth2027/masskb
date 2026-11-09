@@ -68,12 +68,12 @@ CALL {
   UNWIND (CASE WHEN size(stale_targets) = 0 THEN [null] ELSE stale_targets END) AS eid
   WITH eid WHERE eid IS NOT NULL
   OPTIONAL MATCH (person:Person {person_id: eid})
-  WHERE NOT (()-[:MENTIONS]->(person))
-  DETACH DELETE person
+  WHERE NOT (()-[:MENTIONS]->(person)) AND NOT (person)-[:ALIAS_OF]-()
+  DELETE person
   WITH eid
   OPTIONAL MATCH (concept:Concept {concept_id: eid})
-  WHERE NOT (()-[:MENTIONS]->(concept))
-  DETACH DELETE concept
+  WHERE NOT (()-[:MENTIONS]->(concept)) AND NOT (concept)-[:ALIAS_OF]-()
+  DELETE concept
   RETURN count(*) AS removed_orphans
 }
 WITH d
@@ -103,12 +103,12 @@ CALL {
   UNWIND (CASE WHEN size(targets) = 0 THEN [null] ELSE targets END) AS eid
   WITH eid WHERE eid IS NOT NULL
   OPTIONAL MATCH (person:Person {person_id: eid})
-  WHERE NOT (()-[:MENTIONS]->(person))
-  DETACH DELETE person
+  WHERE NOT (()-[:MENTIONS]->(person)) AND NOT (person)-[:ALIAS_OF]-()
+  DELETE person
   WITH eid
   OPTIONAL MATCH (concept:Concept {concept_id: eid})
-  WHERE NOT (()-[:MENTIONS]->(concept))
-  DETACH DELETE concept
+  WHERE NOT (()-[:MENTIONS]->(concept)) AND NOT (concept)-[:ALIAS_OF]-()
+  DELETE concept
   RETURN count(*) AS removed_orphans
 }
 """
@@ -143,15 +143,28 @@ FOREACH (_ IN CASE WHEN row.kind = 'concept' THEN [1] ELSE [] END |
 )
 """
 
+# 没有提及、但还连着别名边的表面节点必须留下。DETACH DELETE 会把 ALIAS_OF 一起拆掉，
+# 而这一步发生在别名事务之前，写入失败也补不回旧边。
 _DELETE_ORPHANS = """
 UNWIND $target_ids AS eid
 OPTIONAL MATCH (person:Person {person_id: eid})
-WHERE NOT (()-[:MENTIONS]->(person))
-DETACH DELETE person
+WHERE NOT (()-[:MENTIONS]->(person)) AND NOT (person)-[:ALIAS_OF]-()
+DELETE person
 WITH eid
 OPTIONAL MATCH (concept:Concept {concept_id: eid})
-WHERE NOT (()-[:MENTIONS]->(concept))
-DETACH DELETE concept
+WHERE NOT (()-[:MENTIONS]->(concept)) AND NOT (concept)-[:ALIAS_OF]-()
+DELETE concept
+"""
+
+# 只在别名事务里清掉两端都已落空的表面节点。和边的删除一起回滚。
+_DELETE_ENTITIES_WITHOUT_MENTIONS_OR_ALIASES = """
+MATCH (person:Person)
+WHERE NOT (()-[:MENTIONS]->(person)) AND NOT (person)-[:ALIAS_OF]-()
+DELETE person
+WITH count(*) AS removed_persons
+MATCH (concept:Concept)
+WHERE NOT (()-[:MENTIONS]->(concept)) AND NOT (concept)-[:ALIAS_OF]-()
+DELETE concept
 """
 
 _NEIGHBORS = """
@@ -479,8 +492,9 @@ class GraphStore:
 
         计数来自校验后的入参，不回读 Neo4j。`chunk_ids` 为空且没有提及时不打开驱动。
         提及指向本次列表之外的分块时抛出 ValueError，不写。
-        同一事务内先删旧边，再 MERGE 节点和边，最后只删除本次旧目标里已经没有入边的
-        Person / Concept。`doc_id` 只用于调用方标识这篇文档，语句不按它扫描其他文档。
+        同一事务内先删旧边，再 MERGE 节点和边，最后只删除本次旧目标里已经没有提及、
+        也没有 ALIAS_OF 的 Person / Concept。仍连着别名边的节点留下，语句不删除别名边。
+        `doc_id` 只用于调用方标识这篇文档，语句不按它扫描其他文档。
         """
         unique: list[str] = []
         seen: set[str] = set()
@@ -534,7 +548,8 @@ class GraphStore:
         """替换该文档写下的 ALIAS_OF。返回准备写入的边数。
 
         空列表也会打开驱动，只删除 `doc_id` 等于本文档的别名边。
-        不改 MENTIONS，不删除节点，也不删除其他文档的别名边。
+        不改 MENTIONS，也不删除其他文档的别名边。
+        同一事务末尾只删除已经既没有提及也没有别名边的表面节点。事务失败时边和节点一起留下。
         端点必须已经是 Person / Concept。本方法不创建表面节点，也不回读确认。
         """
         persons: list[dict[str, str]] = []
@@ -561,6 +576,7 @@ class GraphStore:
                 tx.run(_MERGE_PERSON_ALIASES, links=persons, doc_id=doc_id).consume()
             if concepts:
                 tx.run(_MERGE_CONCEPT_ALIASES, links=concepts, doc_id=doc_id).consume()
+            tx.run(_DELETE_ENTITIES_WITHOUT_MENTIONS_OR_ALIASES).consume()
 
         with self.driver.session() as session:
             session.execute_write(work)
