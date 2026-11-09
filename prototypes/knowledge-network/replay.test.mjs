@@ -106,6 +106,72 @@ test("独立命中之间不添加连边", () => {
   }
 });
 
+test("电流先沿边走，抵达后才点亮终点，末条也会走完", () => {
+  const hours = playback("library-hours");
+  const schedule = replay.scheduleOf(hours);
+  const edges = schedule.events.filter((event) => event.kind === "edge");
+  assert.ok(edges.length >= 2);
+  for (const event of edges) {
+    const before = replay.frameAt(hours, event.at + replay.TRANSIT_MS * 0.2);
+    const later = replay.frameAt(hours, event.at + replay.TRANSIT_MS * 0.75);
+    assert.equal(before.active.edgeId, event.edgeId);
+    assert.equal(later.active.edgeId, event.edgeId);
+    assert.ok(later.active.progress > before.active.progress);
+    assert.equal(before.lit.includes(event.target), false);
+    assert.equal(later.lit.includes(event.target), false);
+    assert.equal(before.lit.includes(event.source), true);
+    assert.deepEqual(before.lit, later.lit);
+    const arrived = replay.frameAt(hours, event.until);
+    assert.equal(arrived.lit.includes(event.target), true);
+    assert.equal(arrived.retainedEdgeIds.includes(event.edgeId), true);
+  }
+  const last = edges[edges.length - 1];
+  const midLast = replay.frameAt(hours, last.at + replay.TRANSIT_MS / 2);
+  assert.equal(midLast.done, false);
+  assert.equal(midLast.active.edgeId, last.edgeId);
+  assert.equal(midLast.lit.includes(last.target), false);
+  const done = replay.frameAt(hours, schedule.duration);
+  assert.equal(done.done, true);
+  assert.equal(done.active, null);
+  assert.equal(done.lit.includes(last.target), true);
+  assert.deepEqual(done.retainedEdgeIds, hours.evidenceEdgeIds);
+});
+
+test("暂停冻结在途进度，恢复后继续，减少动画终点不变", () => {
+  const hours = playback("library-hours");
+  const first = replay.scheduleOf(hours).events.find((event) => event.kind === "edge");
+  let now = 0;
+  const player = replay.createPlayer(hours, () => now);
+  player.play();
+  now = first.at + replay.TRANSIT_MS * 0.3;
+  const mid = player.frame();
+  assert.equal(mid.active.edgeId, first.edgeId);
+  assert.equal(mid.lit.includes(first.target), false);
+  player.pause();
+  now += 5000;
+  const held = player.frame();
+  assert.equal(held.phase, "paused");
+  assert.equal(held.active.progress, mid.active.progress);
+  assert.deepEqual(held.lit, mid.lit);
+  assert.equal(held.active.edgeId, first.edgeId);
+  player.play();
+  now += replay.TRANSIT_MS * 0.4;
+  const resumed = player.frame();
+  assert.equal(resumed.active.edgeId, first.edgeId);
+  assert.ok(resumed.active.progress > held.active.progress);
+  assert.equal(resumed.lit.includes(first.target), false);
+  const played = first.at + replay.TRANSIT_MS * 0.7;
+  now += replay.scheduleOf(hours).duration - played + 1;
+  const finished = player.frame();
+  assert.equal(finished.done, true);
+  assert.equal(finished.active, null);
+  assert.deepEqual(finished.lit.slice().sort(), hours.evidenceNodeIds.slice().sort());
+  const reduced = replay.frameAt(hours, replay.scheduleOf(hours).duration);
+  assert.equal(reduced.active, null);
+  assert.deepEqual(reduced.lit.slice().sort(), finished.lit.slice().sort());
+  assert.deepEqual(reduced.retainedEdgeIds, finished.retainedEdgeIds);
+});
+
 test("减少动画的静态结果与播放结束相同", () => {
   for (const item of sample.presets) {
     const plan = replay.buildPlayback(sample, item);

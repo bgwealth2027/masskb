@@ -228,13 +228,128 @@
 
   function staticEquivalent(playback) {
     var animated = runToEnd(playback);
+    var finished = frameAt(playback, scheduleOf(playback).duration);
     return {
       lit: playback.evidenceNodeIds.slice(),
       edges: playback.evidenceEdgeIds.slice(),
       activeEdgeId: null,
       answer: null,
-      sameNodes: sameMembers(animated.lit, playback.evidenceNodeIds),
-      sameEdges: sameMembers(animated.edges, playback.evidenceEdgeIds)
+      sameNodes: sameMembers(animated.lit, playback.evidenceNodeIds) &&
+        sameMembers(finished.lit, playback.evidenceNodeIds),
+      sameEdges: sameMembers(animated.edges, playback.evidenceEdgeIds) &&
+        sameMembers(finished.retainedEdgeIds, playback.evidenceEdgeIds)
+    };
+  }
+
+  var SEED_BEAT_MS = 400;
+  var TRANSIT_MS = 900;
+
+  function scheduleOf(playback) {
+    var events = [];
+    var cursor = 0;
+    (playback.steps || []).forEach(function (step) {
+      if (step.kind === "seed") {
+        events.push({ kind: "seed", at: cursor, nodeId: step.nodeId });
+        cursor += SEED_BEAT_MS;
+        return;
+      }
+      events.push({
+        kind: "edge",
+        at: cursor,
+        until: cursor + TRANSIT_MS,
+        edgeId: step.edgeId,
+        source: step.source,
+        target: step.target,
+        relation: step.relation
+      });
+      cursor += TRANSIT_MS;
+    });
+    return { events: events, duration: cursor, seedBeatMs: SEED_BEAT_MS, transitMs: TRANSIT_MS };
+  }
+
+  function frameAt(playback, elapsed) {
+    var schedule = scheduleOf(playback);
+    var time = Math.max(0, Number(elapsed) || 0);
+    var lit = [];
+    var seen = new Set();
+    var retained = [];
+    var active = null;
+    schedule.events.forEach(function (event) {
+      if (event.kind === "seed") {
+        if (time >= event.at && !seen.has(event.nodeId)) {
+          seen.add(event.nodeId);
+          lit.push(event.nodeId);
+        }
+        return;
+      }
+      if (time >= event.until) {
+        retained.push(event.edgeId);
+        if (!seen.has(event.target)) {
+          seen.add(event.target);
+          lit.push(event.target);
+        }
+        return;
+      }
+      if (time >= event.at) {
+        active = {
+          edgeId: event.edgeId,
+          source: event.source,
+          target: event.target,
+          relation: event.relation,
+          progress: (time - event.at) / (event.until - event.at)
+        };
+      }
+    });
+    var done = time >= schedule.duration;
+    return {
+      lit: lit,
+      retainedEdgeIds: retained,
+      active: done ? null : active,
+      done: done,
+      elapsed: Math.min(time, schedule.duration),
+      duration: schedule.duration
+    };
+  }
+
+  function createPlayer(playback, now) {
+    var elapsedBase = 0;
+    var runningSince = null;
+    var phase = "idle";
+    function clock() {
+      return now();
+    }
+    function playingTime() {
+      if (phase === "playing" && runningSince != null) return elapsedBase + (clock() - runningSince);
+      return elapsedBase;
+    }
+    function frame() {
+      var view = frameAt(playback, playingTime());
+      if (view.done && phase === "playing") {
+        elapsedBase = view.duration;
+        runningSince = null;
+        phase = "done";
+      }
+      view.phase = phase;
+      return view;
+    }
+    return {
+      play: function () {
+        if (phase === "done" || frame().done) {
+          phase = "done";
+          return;
+        }
+        if (phase !== "playing") {
+          runningSince = clock();
+          phase = "playing";
+        }
+      },
+      pause: function () {
+        if (phase !== "playing") return;
+        elapsedBase = playingTime();
+        runningSince = null;
+        phase = "paused";
+      },
+      frame: frame
     };
   }
 
@@ -248,6 +363,11 @@
     buildPlayback: buildPlayback,
     pathTo: pathTo,
     runToEnd: runToEnd,
-    staticEquivalent: staticEquivalent
+    staticEquivalent: staticEquivalent,
+    SEED_BEAT_MS: SEED_BEAT_MS,
+    TRANSIT_MS: TRANSIT_MS,
+    scheduleOf: scheduleOf,
+    frameAt: frameAt,
+    createPlayer: createPlayer
   };
 });

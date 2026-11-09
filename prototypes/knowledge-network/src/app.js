@@ -76,7 +76,7 @@
     .linkDirectionalParticleWidth(2.2)
     .linkDirectionalParticleSpeed(0.02)
     .linkDirectionalParticleColor(function () { return "#ffd8b0"; })
-    .linkCanvasObjectMode(function () { return "before"; })
+    .linkCanvasObjectMode(function () { return "after"; })
     .linkCanvasObject(drawHalo)
     .nodeCanvasObjectMode(function () { return "replace"; })
     .nodeCanvasObject(drawNode)
@@ -262,35 +262,57 @@
   }
 
   function colorForLink(link) {
-    if (link.id === state.activeEdgeId) return "rgba(255, 176, 102, 0.98)";
     if (state.evidenceEdges.has(link.id)) return "rgba(226, 132, 68, 0.92)";
     return "rgba(158, 214, 222, 0.72)";
   }
 
   function widthForLink(link) {
-    if (link.id === state.activeEdgeId) return 2.6;
     if (state.evidenceEdges.has(link.id)) return 1.7;
     return 1.25;
   }
 
-  function particlesForLink(link) {
-    if (state.reduced || state.phase !== "playing") return 0;
-    return link.id === state.activeEdgeId ? 5 : 0;
+  function particlesForLink() {
+    return 0;
   }
 
   function drawHalo(link, ctx) {
     var source = link.source;
     var target = link.target;
     if (!source || !target || !Number.isFinite(source.x) || !Number.isFinite(target.x)) return;
-    var active = link.id === state.activeEdgeId;
-    var evidence = state.evidenceEdges.has(link.id);
-    if (!active && !evidence) return;
+    if (state.evidenceEdges.has(link.id)) {
+      ctx.beginPath();
+      ctx.moveTo(source.x, source.y);
+      ctx.lineTo(target.x, target.y);
+      ctx.strokeStyle = "rgba(224, 122, 61, 0.22)";
+      ctx.lineWidth = 5.5;
+      ctx.stroke();
+    }
+    var active = state.frame && state.frame.active;
+    if (!active || active.edgeId !== link.id || !(active.progress >= 0)) return;
+    var x = source.x + (target.x - source.x) * active.progress;
+    var y = source.y + (target.y - source.y) * active.progress;
     ctx.beginPath();
     ctx.moveTo(source.x, source.y);
-    ctx.lineTo(target.x, target.y);
-    ctx.strokeStyle = active ? "rgba(255, 196, 140, 0.38)" : "rgba(224, 122, 61, 0.2)";
-    ctx.lineWidth = active ? 8 : 5.5;
+    ctx.lineTo(x, y);
+    ctx.strokeStyle = "rgba(255, 186, 120, 0.96)";
+    ctx.lineWidth = 2.8;
     ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(x, y, 6.5, 0, Math.PI * 2);
+    ctx.fillStyle = "#ffe1c2";
+    ctx.fill();
+    var head = graph.graph2ScreenCoords(x, y);
+    var from = graph.graph2ScreenCoords(source.x, source.y);
+    var to = graph.graph2ScreenCoords(target.x, target.y);
+    window.__knTransit = {
+      edgeId: active.edgeId,
+      progress: active.progress,
+      litCount: state.lit.size,
+      phase: state.phase,
+      head: { x: head.x, y: head.y },
+      source: { x: from.x, y: from.y },
+      target: { x: to.x, y: to.y }
+    };
   }
 
   function radiusFor(node) {
@@ -381,8 +403,18 @@
     begin(replay.buildPlayback(sample, matched.preset), matched.preset);
   }
 
+  var player = null;
+  var rafId = null;
+
+  function stopLoop() {
+    if (rafId != null) {
+      window.cancelAnimationFrame(rafId);
+      rafId = null;
+    }
+  }
+
   function begin(playback, preset) {
-    stopTimer();
+    stopLoop();
     state.playback = playback;
     state.preset = preset;
     state.stepIndex = 0;
@@ -390,7 +422,17 @@
     state.roles = new Map();
     state.evidenceEdges = new Set();
     state.activeEdgeId = null;
+    state.progress = null;
+    state.frame = null;
     state.selectedId = playback.seeds[0] || null;
+    window.__knTransit = null;
+    player = replay.createPlayer(playback, function () { return Date.now(); });
+    graph.graphData().nodes.forEach(function (node) {
+      if (Number.isFinite(node.x) && Number.isFinite(node.y)) {
+        node.fx = node.x;
+        node.fy = node.y;
+      }
+    });
     buildResults();
     renderDetail();
     blurbEl.textContent = preset.blurb || "";
@@ -398,96 +440,88 @@
       showFinal();
       return;
     }
+    player.play();
     state.phase = "playing";
     state.message = replay.MESSAGES.playing;
     updateChrome();
-    schedule();
-    redraw();
+    loop();
   }
 
-  function schedule() {
-    stopTimer();
-    var delay = state.stepIndex === 0 ? 380 : 860;
-    state.timer = window.setTimeout(advance, delay);
+  function loop() {
+    rafId = null;
+    if (!player || state.phase !== "playing") return;
+    applyFrame(player.frame());
+    if (state.phase === "playing") rafId = window.requestAnimationFrame(loop);
   }
 
-  function advance() {
-    state.timer = null;
+  function applyFrame(frame) {
     var playback = state.playback;
-    if (!playback || state.phase !== "playing") return;
-    if (state.stepIndex >= playback.steps.length) {
-      finish(false);
-      return;
-    }
-    var step = playback.steps[state.stepIndex];
-    state.stepIndex += 1;
-    if (step.kind === "seed") {
-      state.lit.add(step.nodeId);
-      state.roles.set(step.nodeId, "seed");
+    if (!playback || !frame) return;
+    state.frame = frame;
+    state.lit = new Set(frame.lit);
+    state.roles = new Map();
+    var seeds = new Set(playback.seeds);
+    frame.lit.forEach(function (id) {
+      state.roles.set(id, seeds.has(id) ? "seed" : "arrived");
+    });
+    state.evidenceEdges = new Set(frame.retainedEdgeIds);
+    state.activeEdgeId = frame.active ? frame.active.edgeId : null;
+    state.progress = frame.active ? frame.active.progress : null;
+    if (frame.done && state.phase === "playing") {
+      state.phase = "done";
+      state.message = replay.MESSAGES.done;
       state.activeEdgeId = null;
-    } else {
-      state.evidenceEdges.add(step.edgeId);
-      state.activeEdgeId = step.edgeId;
-      state.lit.add(step.target);
-      if (!state.roles.has(step.target)) state.roles.set(step.target, "arrived");
+      state.progress = null;
+      stopLoop();
     }
-    syncBadges();
-    redraw();
-    if (state.stepIndex >= playback.steps.length) finish(false);
-    else if (state.phase === "playing") schedule();
-  }
-
-  function finish(reduced) {
-    stopTimer();
-    state.phase = "done";
-    state.activeEdgeId = null;
-    state.message = reduced ? replay.MESSAGES.reduced : replay.MESSAGES.done;
+    if (!state.activeEdgeId) window.__knTransit = null;
     syncBadges();
     updateChrome();
     redraw();
   }
 
   function showFinal() {
+    stopLoop();
     var playback = state.playback;
-    stopTimer();
-    state.lit = new Set(playback.evidenceNodeIds);
-    state.roles = new Map();
-    playback.seeds.forEach(function (id) { state.roles.set(id, "seed"); });
-    playback.evidenceNodeIds.forEach(function (id) {
-      if (!state.roles.has(id)) state.roles.set(id, "arrived");
-    });
-    state.evidenceEdges = new Set(playback.evidenceEdgeIds);
+    var done = replay.frameAt(playback, replay.scheduleOf(playback).duration);
+    state.phase = "done";
+    applyFrame(done);
+    state.phase = "done";
+    state.message = replay.MESSAGES.reduced;
     state.activeEdgeId = null;
-    state.stepIndex = playback.steps.length;
-    finish(true);
+    state.progress = null;
+    state.frame = done;
+    window.__knTransit = null;
+    updateChrome();
+    redraw();
   }
 
   function play() {
-    if (!state.playback) return;
+    if (!state.playback || !player) return;
     if (state.reduced) {
       showFinal();
       return;
     }
-    if (state.phase === "done") return;
+    if (state.phase === "done" || player.frame().done) return;
+    player.play();
     state.phase = "playing";
     state.message = replay.MESSAGES.playing;
     updateChrome();
-    if (state.stepIndex >= state.playback.steps.length) finish(false);
-    else schedule();
-    redraw();
+    if (rafId == null) loop();
   }
 
   function pause() {
-    if (state.phase !== "playing") return;
-    stopTimer();
+    if (!player || state.phase !== "playing") return;
+    player.pause();
     state.phase = "paused";
     state.message = replay.MESSAGES.paused;
-    updateChrome();
-    redraw();
+    stopLoop();
+    applyFrame(player.frame());
   }
 
   function clearPlayback() {
-    stopTimer();
+    stopLoop();
+    player = null;
     state.playback = null;
     state.preset = null;
     state.phase = "idle";
@@ -496,7 +530,10 @@
     state.roles.clear();
     state.evidenceEdges.clear();
     state.activeEdgeId = null;
+    state.progress = null;
+    state.frame = null;
     state.selectedId = null;
+    window.__knTransit = null;
     markChips("");
     showIdle();
     redraw();
@@ -519,13 +556,6 @@
       showFinal();
     } else {
       redraw();
-    }
-  }
-
-  function stopTimer() {
-    if (state.timer) {
-      window.clearTimeout(state.timer);
-      state.timer = null;
     }
   }
 
