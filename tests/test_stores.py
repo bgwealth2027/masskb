@@ -12,6 +12,8 @@ from masskb.config import Settings
 from masskb.entities import EntityMention, entity_id
 from masskb.graph_store import (
     GRAPH_HOP_CANDIDATES,
+    READ_CONNECTION_ACQUISITION_TIMEOUT,
+    READ_MAX_TRANSACTION_RETRY_TIME,
     GraphStore,
     GraphStoreError,
     rank_related_rows,
@@ -597,10 +599,12 @@ class _GraphDriver:
     def __init__(self, rows: list[dict] | None = None) -> None:
         self.session_obj = _GraphSession(rows)
         self.sessions = 0
+        self.session_kwargs: list[dict] = []
         self.closed = False
 
-    def session(self):
+    def session(self, **kwargs):
         self.sessions += 1
+        self.session_kwargs.append(dict(kwargs))
         return self.session_obj
 
     def close(self) -> None:
@@ -761,6 +765,58 @@ def test_neighbor_chunk_ids_rejects_duplicate_rows(monkeypatch: pytest.MonkeyPat
 
     with pytest.raises(GraphStoreError, match="不唯一"):
         store.neighbor_chunk_ids(["c"])
+
+
+def test_read_sessions_bound_retry_and_writes_keep_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    driver = _GraphDriver()
+    store = _bind_graph(monkeypatch, driver)
+    chunk = _skeleton_chunk("c1")
+    mention = EntityMention(
+        chunk_id="c1",
+        kind="person",
+        name="甲",
+        entity_id=entity_id("person", "甲"),
+    )
+
+    store.ensure_schema()
+    store.ensure_entity_schema()
+    store.upsert_document(_skeleton_doc(chunk))
+    store.replace_mentions(chunk.doc_id, ["c1"], [mention])
+    store.replace_aliases(chunk.doc_id, ())
+    store.delete_document(chunk.doc_id)
+    assert driver.session_kwargs
+    assert driver.session_kwargs == [{}] * len(driver.session_kwargs)
+
+    driver.session_obj.rows = [
+        {
+            "chunk_id": "c1",
+            "prev_chunk_id": None,
+            "next_chunk_id": "c2",
+            "via": "next_chunk",
+            "shared": 0,
+        }
+    ]
+    store.neighbor_chunk_ids(["c1"])
+    store.related_chunks(["c1"], doc_id=chunk.doc_id)
+    store.related_chunks(["c1"], doc_id=chunk.doc_id, aliases=True)
+    assert READ_CONNECTION_ACQUISITION_TIMEOUT == 2.0
+    assert READ_MAX_TRANSACTION_RETRY_TIME == 0.0
+    assert driver.session_kwargs[-3:] == [
+        {
+            "connection_acquisition_timeout": 2.0,
+            "max_transaction_retry_time": 0.0,
+        },
+        {
+            "connection_acquisition_timeout": 2.0,
+            "max_transaction_retry_time": 0.0,
+        },
+        {
+            "connection_acquisition_timeout": 2.0,
+            "max_transaction_retry_time": 0.0,
+        },
+    ]
 
 
 def test_neighbor_chunk_ids_empty_does_not_open_driver(monkeypatch: pytest.MonkeyPatch) -> None:
