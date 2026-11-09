@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 from types import ModuleType
 
+import pytest
 from openai.types import CreateEmbeddingResponse
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -120,3 +121,128 @@ def test_health_is_not_ready_until_dimensions_exist() -> None:
     status, body = module.health_response(ready=True, model=MODEL, dimensions=512)
     assert status == 200
     assert body == {"ok": True, "model": MODEL, "dimensions": 512}
+
+
+def test_listen_address_defaults_match_container_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _server()
+    for name in ("HOST", "PORT", "EMBED_HOST", "EMBED_PORT"):
+        monkeypatch.setenv(name, "127.0.0.1" if name.endswith("HOST") else "8081")
+    assert module.listen_address([]) == ("0.0.0.0", 8080)
+
+
+def test_listen_address_accepts_loopback_8081() -> None:
+    module = _server()
+    assert module.listen_address(["--host", "127.0.0.1", "--port", "8081"]) == (
+        "127.0.0.1",
+        8081,
+    )
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--port", "0"],
+        ["--port", "65536"],
+        ["--port", "no"],
+        ["--host", ""],
+        ["--host", "   "],
+    ],
+)
+def test_listen_address_rejects_bad_values(argv: list[str]) -> None:
+    module = _server()
+    with pytest.raises(SystemExit) as caught:
+        module.listen_address(argv)
+    assert caught.value.code == 2
+
+
+def test_container_entrypoint_keeps_default_listen() -> None:
+    dockerfile = (ROOT / "embed" / "Dockerfile").read_text(encoding="utf-8")
+    assert 'CMD ["python", "server.py"]' in dockerfile
+    assert "--host" not in dockerfile
+    assert "--port" not in dockerfile
+    compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    assert "127.0.0.1:8081:8080" in compose
+
+
+def _patch_server(monkeypatch: pytest.MonkeyPatch, module: ModuleType, seen: dict[str, object]) -> None:
+    class FakeServer:
+        def __init__(self, address: tuple[str, int], state: object) -> None:
+            seen["address"] = address
+            seen["state"] = state
+
+        def serve_forever(self) -> None:
+            return None
+
+        def shutdown(self) -> None:
+            seen["shutdown"] = True
+
+    monkeypatch.setattr(module, "EmbedHTTPServer", FakeServer)
+
+
+def test_main_uses_loopback_without_loading_fastembed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _server()
+    monkeypatch.delenv("EMBEDDING_MODEL", raising=False)
+    seen: dict[str, object] = {}
+    _patch_server(monkeypatch, module, seen)
+
+    def fake_load(model_name: str) -> tuple[object, int]:
+        assert model_name == MODEL
+
+        def embed(texts: list[str]) -> list[list[float]]:
+            return [[1.0] for _ in texts]
+
+        return embed, 512
+
+    monkeypatch.setattr(module, "load_embedder", fake_load)
+    module.main(["--host", "127.0.0.1", "--port", "8081"])
+    assert seen["address"] == ("127.0.0.1", 8081)
+    state = seen["state"]
+    assert isinstance(state, module.ServerState)
+    assert state.ready is True
+    assert state.dimensions == 512
+    assert state.model == MODEL
+    assert seen.get("shutdown") is not True
+    assert "fastembed" not in sys.modules
+
+
+def test_main_default_address_stays_all_interfaces(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _server()
+    monkeypatch.delenv("EMBEDDING_MODEL", raising=False)
+    seen: dict[str, object] = {}
+    _patch_server(monkeypatch, module, seen)
+    monkeypatch.setattr(module, "load_embedder", lambda _model: (lambda texts: [[0.0]], 1))
+    module.main([])
+    assert seen["address"] == ("0.0.0.0", 8080)
+    state = seen["state"]
+    assert isinstance(state, module.ServerState)
+    assert state.ready is True
+    assert "fastembed" not in sys.modules
+
+
+def test_main_shuts_down_when_loader_fails_before_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _server()
+    monkeypatch.delenv("EMBEDDING_MODEL", raising=False)
+    seen: dict[str, object] = {}
+    _patch_server(monkeypatch, module, seen)
+
+    def boom(_model_name: str) -> tuple[object, int]:
+        raise RuntimeError("探测失败")
+
+    monkeypatch.setattr(module, "load_embedder", boom)
+    with pytest.raises(SystemExit) as caught:
+        module.main(["--host", "127.0.0.1", "--port", "8081"])
+    assert caught.value.code == "探测失败"
+    assert seen["address"] == ("127.0.0.1", 8081)
+    state = seen["state"]
+    assert isinstance(state, module.ServerState)
+    assert state.ready is False
+    assert seen.get("shutdown") is True
+    assert "fastembed" not in sys.modules
