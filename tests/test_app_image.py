@@ -9,6 +9,8 @@ import sys
 import zipfile
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parent.parent
 _DEV_PASSWORD = "${NEO4J_DEV_PASSWORD:-masskb-dev-pass}"
 
@@ -72,8 +74,15 @@ def test_compose_app_service_contract() -> None:
     blocks = _service_blocks(text)
     assert set(blocks) >= {"qdrant", "neo4j", "app"}
 
-    for published in ("6333:6333", "6334:6334", "7474:7474", "7687:7687"):
+    for published in (
+        "127.0.0.1:6333:6333",
+        "127.0.0.1:6334:6334",
+        "127.0.0.1:7474:7474",
+        "127.0.0.1:7687:7687",
+    ):
         assert published in text
+    for short in ("6333:6333", "6334:6334", "7474:7474", "7687:7687"):
+        assert text.count(short) == text.count(f"127.0.0.1:{short}")
 
     app = blocks["app"]
     neo4j = blocks["neo4j"]
@@ -177,6 +186,113 @@ def test_query_page_ships_in_the_wheel_and_image_context(tmp_path: Path) -> None
     assert html == page.read_text(encoding="utf-8")
     assert 'id="query"' in html
     assert not any(name.endswith(".env") or "/.env" in name for name in names)
+
+
+def _ports_key(block: str) -> bool:
+    return any(line.startswith("    ports:") for line in block.splitlines())
+
+
+def test_public_compose_file_has_no_internal_ports() -> None:
+    """静态检查独立部署文件。没有 docker 时，这不能代替 compose config 的渲染结果。"""
+    text = _read("docker-compose.public.yml")
+    blocks = _service_blocks(text)
+    assert set(blocks) == {"qdrant", "neo4j", "embed", "app", "gate", "sample-ingest"}
+    for name in ("qdrant", "neo4j", "embed", "app", "sample-ingest"):
+        assert not _ports_key(blocks[name]), name
+    gate = blocks["gate"]
+    assert _ports_key(gate)
+    assert "127.0.0.1:8088:8080" in gate
+    assert "0.0.0.0:" not in gate
+    assert "masskb-dev-pass" not in text
+    assert ":-masskb-dev-pass" not in text
+    assert text.count("${NEO4J_DEV_PASSWORD:?必须设置 NEO4J_DEV_PASSWORD}") >= 4
+    assert "/reject-default-password.sh" in blocks["neo4j"]
+    assert "examples/public:/sample:ro" in blocks["sample-ingest"]
+    assert "masskb ingest /sample --root /sample" in _flat(blocks["sample-ingest"])
+    assert "profiles:" in blocks["sample-ingest"]
+    assert "http://embed:8080/v1" in blocks["app"]
+    assert "qdrant_public" in text
+    assert "neo4j_public" in text
+    script = _read("deploy/public/neo4j-entrypoint.sh")
+    assert 'password = "masskb-dev-pass"' not in script
+    assert '[ "$password" = "masskb-dev-pass" ]' in script
+    assert "NEO4J_DEV_PASSWORD" in script
+
+
+def test_public_password_script_rejects_default_and_accepts_other() -> None:
+    script = ROOT / "deploy" / "public" / "neo4j-entrypoint.sh"
+    for password in ("", "masskb-dev-pass"):
+        env = os.environ.copy()
+        env["NEO4J_DEV_PASSWORD"] = password
+        completed = subprocess.run(
+            ["bash", str(script), "--check"],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        assert completed.returncode == 1
+        assert "拒绝空密码或默认开发密码" in completed.stderr
+        assert "masskb-dev-pass" not in completed.stdout
+        assert "masskb-dev-pass" not in completed.stderr
+    env = os.environ.copy()
+    env["NEO4J_DEV_PASSWORD"] = "public-sample-pass"
+    completed = subprocess.run(
+        ["bash", str(script), "--check"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "public-sample-pass" not in completed.stdout
+    assert "public-sample-pass" not in completed.stderr
+
+
+def test_public_compose_config_render_when_cli_exists() -> None:
+    docker = shutil.which("docker")
+    standalone = shutil.which("docker-compose")
+    if docker is None and standalone is None:
+        pytest.skip(
+            "静态检查已覆盖部署文件。"
+            "本环境没有 docker compose，不能把渲染结果当作已验证。"
+        )
+    env = os.environ.copy()
+    env["NEO4J_DEV_PASSWORD"] = "public-sample-pass"
+    command = (
+        [docker, "compose", "-f", "docker-compose.public.yml", "config"]
+        if docker is not None
+        else [standalone, "-f", "docker-compose.public.yml", "config"]
+    )
+    assert command[0] is not None
+    rendered = subprocess.run(
+        command,
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert rendered.returncode == 0, rendered.stderr
+    text = rendered.stdout
+    assert "127.0.0.1:8088:8080" in text or 'published: "8088"' in text
+    assert "host_ip: 127.0.0.1" in text
+    for internal in ("6333", "6334", "7474", "7687", "8081"):
+        assert f'published: "{internal}"' not in text
+        assert f"published: {internal}\n" not in text
+    assert "masskb-dev-pass" not in text
+    missing = os.environ.copy()
+    missing.pop("NEO4J_DEV_PASSWORD", None)
+    refused = subprocess.run(
+        command,
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+        env=missing,
+    )
+    assert refused.returncode != 0
+    assert "NEO4J_DEV_PASSWORD" in refused.stderr
 
 
 def test_embed_dockerfile_is_separate_from_the_app() -> None:

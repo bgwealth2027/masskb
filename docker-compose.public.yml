@@ -1,0 +1,131 @@
+# 独立的样例只读部署。不是 docker-compose.yml 的 override，也不会卸掉那个文件里的端口。
+# 单独使用：
+#   NEO4J_DEV_PASSWORD='已有的非默认密码' docker compose -f docker-compose.public.yml up -d --build
+#   docker compose -f docker-compose.public.yml --profile ingest run --rm sample-ingest
+# 数据库、嵌入和应用都不发布宿主机端口。网关只发布 127.0.0.1:8088。
+# 这一步仍然是 loopback，不是可以交给别人打开的地址。
+
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.20.0
+    container_name: masskb-public-qdrant
+    volumes:
+      - qdrant_public:/qdrant/storage
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/6333'"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  neo4j:
+    image: neo4j:5.26.18
+    container_name: masskb-public-neo4j
+    entrypoint: ["/bin/bash", "/reject-default-password.sh"]
+    environment:
+      NEO4J_DEV_PASSWORD: ${NEO4J_DEV_PASSWORD:?必须设置 NEO4J_DEV_PASSWORD}
+      NEO4J_AUTH: neo4j/${NEO4J_DEV_PASSWORD:?必须设置 NEO4J_DEV_PASSWORD}
+    volumes:
+      - neo4j_public:/data
+      - neo4j_public_logs:/logs
+      - ./deploy/public/neo4j-entrypoint.sh:/reject-default-password.sh:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 40s
+
+  embed:
+    image: masskb-embed:local
+    build: ./embed
+    container_name: masskb-public-embed
+    environment:
+      EMBEDDING_MODEL: BAAI/bge-small-zh-v1.5
+      HF_HOME: /cache
+    volumes:
+      - embed_public_cache:/cache
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 120s
+
+  app:
+    image: masskb-app:local
+    build: .
+    container_name: masskb-public-app
+    command: ["masskb", "serve", "--host", "0.0.0.0", "--port", "8080"]
+    environment:
+      QDRANT_URL: http://qdrant:6333
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: ${NEO4J_DEV_PASSWORD:?必须设置 NEO4J_DEV_PASSWORD}
+      OPENAI_API_KEY: ""
+      LLM_BASE_URL: http://127.0.0.1:9/v1
+      LLM_MODEL: gpt-4o-mini
+      EMBEDDING_MODEL: BAAI/bge-small-zh-v1.5
+      EMBEDDING_BASE_URL: http://embed:8080/v1
+      EMBEDDING_DIMENSIONS: "512"
+    depends_on:
+      qdrant:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+      embed:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health')"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  gate:
+    image: masskb-app:local
+    command: ["masskb", "gate", "--host", "0.0.0.0", "--port", "8080", "--upstream", "http://app:8080"]
+    container_name: masskb-public-gate
+    ports:
+      - "127.0.0.1:8088:8080"
+    depends_on:
+      app:
+        condition: service_healthy
+    restart: unless-stopped
+
+  sample-ingest:
+    image: masskb-app:local
+    profiles:
+      - ingest
+    volumes:
+      - ./examples/public:/sample:ro
+    command: ["masskb", "ingest", "/sample", "--root", "/sample"]
+    environment:
+      QDRANT_URL: http://qdrant:6333
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: ${NEO4J_DEV_PASSWORD:?必须设置 NEO4J_DEV_PASSWORD}
+      OPENAI_API_KEY: ""
+      LLM_BASE_URL: http://127.0.0.1:9/v1
+      LLM_MODEL: gpt-4o-mini
+      EMBEDDING_MODEL: BAAI/bge-small-zh-v1.5
+      EMBEDDING_BASE_URL: http://embed:8080/v1
+      EMBEDDING_DIMENSIONS: "512"
+    depends_on:
+      qdrant:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+      embed:
+        condition: service_healthy
+    restart: "no"
+
+volumes:
+  qdrant_public:
+  neo4j_public:
+  neo4j_public_logs:
+  embed_public_cache:
