@@ -1,12 +1,17 @@
 """图读路径的超时边界。
 
-离线测试检查会话配置。拒绝连接和卡住的握手使用本机套接字。
-在线测试只在 ``127.0.0.1:17687`` 已有临时 Neo4j 时运行，端口没开就跳过。
-跳过不是在线成功。启动示例（数据目录用完即删，不要指向已有库）::
+默认 pytest 只跑离线部分：会话配置、对 ``127.0.0.1:1`` 的拒绝连接，以及本机临时套接字。
+这些测试不探测、不写入已有数据库。
 
-    bin/neo4j-admin dbms set-initial-password masskb-read-timeout-test
-    # server.bolt.listen_address=127.0.0.1:17687
-    bin/neo4j console
+真实库集成必须显式打开，例如::
+
+    python -m pytest tests/test_graph_read_timeout.py \
+        --graph-read-bolt bolt://127.0.0.1:17687 \
+        --graph-read-user neo4j \
+        --graph-read-password '<临时库密码>'
+
+请把地址指到空的临时库。该用例会确保 masskb 约束存在，写入本次唯一的文档、分块和人物，
+读完后只删除这些节点。未传入 ``--graph-read-bolt`` 时跳过，并且不打开套接字。
 """
 
 from __future__ import annotations
@@ -14,6 +19,7 @@ from __future__ import annotations
 import socket
 import threading
 import time
+import uuid
 
 import pytest
 from neo4j.exceptions import ConfigurationError, ServiceUnavailable
@@ -23,11 +29,22 @@ from masskb.entities import EntityMention, entity_id
 from masskb.graph_store import GraphStore
 from masskb.ingest import Chunk, Document
 
-_LOOPBACK_HOST = "127.0.0.1"
-_LOOPBACK_BOLT_PORT = 17687
-_LOOPBACK_BOLT = f"bolt://{_LOOPBACK_HOST}:{_LOOPBACK_BOLT_PORT}"
-_LOOPBACK_PASSWORD = "masskb-read-timeout-test"
-_FIXTURE_DOC_ID = "masskb-read-timeout-fixture"
+_DELETE_THESE_CHUNKS = """
+MATCH (c:Chunk)
+WHERE c.chunk_id IN $chunk_ids
+DETACH DELETE c
+"""
+
+_DELETE_THIS_DOCUMENT = """
+MATCH (d:Document {doc_id: $doc_id})
+DETACH DELETE d
+"""
+
+_DELETE_THIS_PERSON_IF_UNATTACHED = """
+MATCH (person:Person {person_id: $entity_id})
+WHERE NOT (()-[:MENTIONS]->(person)) AND NOT (person)-[:ALIAS_OF]-()
+DELETE person
+"""
 
 
 def _refused_settings() -> Settings:
@@ -36,15 +53,6 @@ def _refused_settings() -> Settings:
         neo4j_user="neo4j",
         neo4j_password="unused",
     )
-
-
-def _loopback_neo4j_open() -> bool:
-    probe = socket.socket()
-    probe.settimeout(0.2)
-    try:
-        return probe.connect_ex((_LOOPBACK_HOST, _LOOPBACK_BOLT_PORT)) == 0
-    finally:
-        probe.close()
 
 
 def test_read_session_overrides_leave_write_budget_on_the_same_driver() -> None:
@@ -96,7 +104,7 @@ def test_stalled_handshake_is_bounded_by_acquisition_timeout() -> None:
     """对端接受 TCP 后不完成 Bolt 握手。等待应落在获取期限附近，而不是 30 秒连接超时。"""
     listener = socket.socket()
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    listener.bind((_LOOPBACK_HOST, 0))
+    listener.bind(("127.0.0.1", 0))
     listener.listen(1)
     port = listener.getsockname()[1]
     accepted = threading.Event()
@@ -118,7 +126,7 @@ def test_stalled_handshake_is_bounded_by_acquisition_timeout() -> None:
     thread.start()
     store = GraphStore(
         Settings(
-            neo4j_uri=f"bolt://{_LOOPBACK_HOST}:{port}",
+            neo4j_uri=f"bolt://127.0.0.1:{port}",
             neo4j_user="neo4j",
             neo4j_password="unused",
         )
@@ -138,118 +146,175 @@ def test_stalled_handshake_is_bounded_by_acquisition_timeout() -> None:
     assert 1.0 <= elapsed < 4.0
 
 
-@pytest.mark.skipif(
-    not _loopback_neo4j_open(),
-    reason="127.0.0.1:17687 没有临时 Neo4j。跳过不是在线查询成功。",
-)
-def test_loopback_neo4j_neighbor_and_related_queries() -> None:
-    settings = Settings(
-        neo4j_uri=_LOOPBACK_BOLT,
-        neo4j_user="neo4j",
-        neo4j_password=_LOOPBACK_PASSWORD,
-    )
+def test_cleanup_statements_name_only_this_run() -> None:
+    assert "c.chunk_id IN $chunk_ids" in _DELETE_THESE_CHUNKS
+    assert "d:Document {doc_id: $doc_id}" in _DELETE_THIS_DOCUMENT
+    assert "person:Person {person_id: $entity_id}" in _DELETE_THIS_PERSON_IF_UNATTACHED
+    assert "MATCH (person:Person)\n" not in _DELETE_THIS_PERSON_IF_UNATTACHED
+    assert "DETACH DELETE person" not in _DELETE_THIS_PERSON_IF_UNATTACHED
+
+
+def test_opt_in_neo4j_neighbor_and_related_queries(request: pytest.FixtureRequest) -> None:
+    bolt = request.config.getoption("--graph-read-bolt").strip()
+    if bolt == "":
+        pytest.skip("未传入 --graph-read-bolt。默认不探测、不写入数据库。")
+    password = request.config.getoption("--graph-read-password")
+    if password == "":
+        pytest.fail("已指定 --graph-read-bolt，还需要 --graph-read-password。不会用空密码连接。")
+    user = request.config.getoption("--graph-read-user").strip() or "neo4j"
+    run_id = uuid.uuid4().hex
+    doc_id = f"masskb-read-timeout-{run_id}"
+    chunk_a = f"masskb-read-timeout-{run_id}-a"
+    chunk_b = f"masskb-read-timeout-{run_id}-b"
+    person_name = f"masskb-person-{run_id}"
+    person = entity_id("person", person_name)
+    control_person = entity_id("person", f"masskb-control-{run_id}")
+    settings = Settings(neo4j_uri=bolt, neo4j_user=user, neo4j_password=password)
     store = GraphStore(settings)
-    source = "read-timeout-fixture.txt"
+    source = f"read-timeout-{run_id}.txt"
     first = Chunk(
-        doc_id=_FIXTURE_DOC_ID,
-        chunk_id="read-timeout-a",
+        doc_id=doc_id,
+        chunk_id=chunk_a,
         source=source,
         index=0,
         start=0,
         end=1,
-        text="甲",
+        text=person_name,
     )
     second = Chunk(
-        doc_id=_FIXTURE_DOC_ID,
-        chunk_id="read-timeout-b",
+        doc_id=doc_id,
+        chunk_id=chunk_b,
         source=source,
         index=1,
         start=1,
         end=2,
-        text="甲",
+        text=person_name,
     )
-    person = entity_id("person", "甲")
     mentions = (
         EntityMention(
-            chunk_id=first.chunk_id,
+            chunk_id=chunk_a,
             kind="person",
-            name="甲",
+            name=person_name,
             entity_id=person,
         ),
         EntityMention(
-            chunk_id=second.chunk_id,
+            chunk_id=chunk_b,
             kind="person",
-            name="甲",
+            name=person_name,
             entity_id=person,
         ),
     )
     try:
-        _remove_fixture(store)
+        _create_control_person(store, control_person, f"masskb-control-{run_id}")
         store.ensure_schema()
-        store.upsert_document(
-            Document(source=source, doc_id=_FIXTURE_DOC_ID, chunks=(first, second))
-        )
+        store.upsert_document(Document(source=source, doc_id=doc_id, chunks=(first, second)))
         store.ensure_entity_schema()
-        store.replace_mentions(
-            _FIXTURE_DOC_ID,
-            [first.chunk_id, second.chunk_id],
-            mentions,
-        )
+        store.replace_mentions(doc_id, [chunk_a, chunk_b], mentions)
         with store.driver.session() as session:
             assert session._config.max_transaction_retry_time == 30.0
             assert session._config.connection_acquisition_timeout == 60.0
 
         started = time.perf_counter()
-        neighbors = store.neighbor_chunk_ids([first.chunk_id, second.chunk_id])
+        neighbors = store.neighbor_chunk_ids([chunk_a, chunk_b])
         neighbor_elapsed = time.perf_counter() - started
         started = time.perf_counter()
-        related = store.related_chunks([first.chunk_id], doc_id=_FIXTURE_DOC_ID)
+        related = store.related_chunks([chunk_a], doc_id=doc_id)
         related_elapsed = time.perf_counter() - started
         started = time.perf_counter()
-        related_aliases = store.related_chunks(
-            [first.chunk_id],
-            doc_id=_FIXTURE_DOC_ID,
-            aliases=True,
-        )
+        related_aliases = store.related_chunks([chunk_a], doc_id=doc_id, aliases=True)
         alias_elapsed = time.perf_counter() - started
-        assert neighbors[first.chunk_id] == (None, second.chunk_id)
-        assert neighbors[second.chunk_id] == (first.chunk_id, None)
-        matched = [item for item in related if item.chunk_id == second.chunk_id]
+
+        assert neighbors[chunk_a] == (None, chunk_b)
+        assert neighbors[chunk_b] == (chunk_a, None)
+        matched = [item for item in related if item.chunk_id == chunk_b]
         assert len(matched) == 1
         assert matched[0].via_next is True
         assert matched[0].mention_count >= 1
-        assert any(item.chunk_id == second.chunk_id for item in related_aliases)
+        assert any(item.chunk_id == chunk_b for item in related_aliases)
         assert neighbor_elapsed < 5
         assert related_elapsed < 5
         assert alias_elapsed < 5
+
+        _remove_this_run(store, doc_id=doc_id, chunk_ids=(chunk_a, chunk_b), person_id=person)
+        left = _count_this_run(
+            store,
+            doc_id=doc_id,
+            chunk_ids=(chunk_a, chunk_b),
+            person_id=person,
+        )
+        assert left == 0
+        assert _count_person(store, control_person) == 1
     finally:
-        _remove_fixture(store)
+        _remove_this_run(store, doc_id=doc_id, chunk_ids=(chunk_a, chunk_b), person_id=person)
+        _remove_this_run(store, doc_id=None, chunk_ids=(), person_id=control_person)
         store.close()
 
 
-def _remove_fixture(store: GraphStore) -> None:
-    """删掉本测试写入的节点。
-
-    ``delete_document`` 的语句在 Neo4j 5.26 上以带 RETURN 的 CALL 结尾，
-    服务端会拒绝。这里只用本次夹具的删除，不改产品里的写入语句。
-    """
-
+def _create_control_person(store: GraphStore, person_id: str, name: str) -> None:
     def work(tx):
         tx.run(
-            "MATCH (c:Chunk {doc_id: $doc_id}) DETACH DELETE c",
-            doc_id=_FIXTURE_DOC_ID,
-        ).consume()
-        tx.run(
-            "MATCH (d:Document {doc_id: $doc_id}) DETACH DELETE d",
-            doc_id=_FIXTURE_DOC_ID,
-        ).consume()
-        tx.run(
-            """
-            MATCH (person:Person)
-            WHERE NOT (()-[:MENTIONS]->(person)) AND NOT (person)-[:ALIAS_OF]-()
-            DELETE person
-            """
+            "MERGE (person:Person {person_id: $entity_id}) SET person.name = $name",
+            entity_id=person_id,
+            name=name,
         ).consume()
 
     with store.driver.session() as session:
         session.execute_write(work)
+
+
+def _remove_this_run(
+    store: GraphStore,
+    *,
+    doc_id: str | None,
+    chunk_ids: tuple[str, ...],
+    person_id: str,
+) -> None:
+    """只删除本次 id。人物仅在已经没有任何提及和别名边时删除。"""
+
+    def work(tx):
+        if chunk_ids:
+            tx.run(_DELETE_THESE_CHUNKS, chunk_ids=list(chunk_ids)).consume()
+        if doc_id is not None:
+            tx.run(_DELETE_THIS_DOCUMENT, doc_id=doc_id).consume()
+        tx.run(_DELETE_THIS_PERSON_IF_UNATTACHED, entity_id=person_id).consume()
+
+    with store.driver.session() as session:
+        session.execute_write(work)
+
+
+def _count_this_run(
+    store: GraphStore,
+    *,
+    doc_id: str,
+    chunk_ids: tuple[str, ...],
+    person_id: str,
+) -> int:
+    def work(tx):
+        record = tx.run(
+            """
+            MATCH (n)
+            WHERE n.doc_id = $doc_id
+               OR n.chunk_id IN $chunk_ids
+               OR n.person_id = $entity_id
+            RETURN count(n) AS n
+            """,
+            doc_id=doc_id,
+            chunk_ids=list(chunk_ids),
+            entity_id=person_id,
+        ).single()
+        return 0 if record is None else int(record["n"])
+
+    with store.driver.session() as session:
+        return session.execute_read(work)
+
+
+def _count_person(store: GraphStore, person_id: str) -> int:
+    def work(tx):
+        record = tx.run(
+            "MATCH (person:Person {person_id: $entity_id}) RETURN count(person) AS n",
+            entity_id=person_id,
+        ).single()
+        return 0 if record is None else int(record["n"])
+
+    with store.driver.session() as session:
+        return session.execute_read(work)

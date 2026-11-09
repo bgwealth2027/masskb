@@ -363,7 +363,16 @@ python -m pip install -e ".[dev,api]"
 python -m pytest
 ```
 
-测试不连接 Qdrant、Neo4j，也不会访问 OpenAI，也不绑定端口，不下载嵌入模型，也不需要 GPU。HTTP 测试使用 `TestClient`，不执行查询页脚本。浏览器里的点击检查要单独做，而且替身接口不等于真实检索。
+默认 `pytest` 不探测、不写入已有数据库，也不访问 OpenAI，不下载嵌入模型，也不需要 GPU。图读超时里的拒绝连接测试只访问 `127.0.0.1:1`，握手测试只占用一个临时本地端口。HTTP 测试使用 `TestClient`，不执行查询页脚本。浏览器里的点击检查要单独做，而且替身接口不等于真实检索。
+
+要对空的临时 Neo4j 做显式图读集成，才传入下面的 pytest 选项。它会在该库确保 masskb 约束存在，写入本次唯一的文档、分块和人物，读完后只删除这些节点。未传入 `--graph-read-bolt` 时该用例跳过，并且不打开套接字。
+
+```bash
+python -m pytest tests/test_graph_read_timeout.py \
+  --graph-read-bolt bolt://127.0.0.1:17687 \
+  --graph-read-user neo4j \
+  --graph-read-password '<临时库密码>'
+```
 
 ## 配置
 
@@ -470,7 +479,8 @@ masskb/
 | `tests/test_rerank.py` | 重排提示词只含命中正文和 `chunk_id`；未知 id 丢弃，缺失 id 按原顺序补上；非法 JSON 与错误形状。不创建外部客户端 |
 | `tests/test_entities.py` | 名称规范化、子串过滤、停用词、每类 8 条、稳定 `entity_id`、非法 JSON。不创建外部客户端 |
 | `tests/test_aliases.py` | 别名开关组合、只接受本次名单、不传递、人物与概念分开、8 对上限、非法 JSON。不创建外部客户端 |
-| `tests/test_stores.py` | 两个存储的健康检查成功、失败和 `close`；集合创建含 `bm25`、缺槽或 modifier 不符时不删除、分批 upsert、同一点的稠密与稀疏、按 `doc_id` 删除、近邻与稀疏查询、按 `chunk_id` 读 payload；骨架约束、MERGE、删除和前后邻。人物与概念约束单独创建；提及替换使用 MERGE。骨架更新、文档删除和提及替换都不会拆掉仍连着 `ALIAS_OF` 的表面节点。别名写入只替换该 `doc_id` 的边，并在同一事务里清掉随后已经空掉的节点。打开别名时只多走一跳，且不按边的 `doc_id` 过滤。空输入不打开驱动 |
+| `tests/test_stores.py` | 两个存储的健康检查成功、失败和 `close`；集合创建含 `bm25`、缺槽或 modifier 不符时不删除、分批 upsert、同一点的稠密与稀疏、按 `doc_id` 删除、近邻与稀疏查询、按 `chunk_id` 读 payload；骨架约束、MERGE、删除和前后邻。人物与概念约束单独创建；提及替换使用 MERGE。骨架更新、文档删除和提及替换都不会拆掉仍连着 `ALIAS_OF` 的表面节点。别名写入只替换该 `doc_id` 的边，并在同一事务里清掉随后已经空掉的节点。打开别名时只多走一跳，且不按边的 `doc_id` 过滤。空输入不打开驱动。图读会话带有界的连接获取和重试；写入会话不带 |
+| `tests/test_graph_read_timeout.py` | 默认只跑离线部分：读会话不改变同一驱动的写入预算；`127.0.0.1:1` 拒绝连接时读失败要快，健康检查仍是失败；本机套接字接受 TCP 后不完成握手时，等待落在连接获取期限附近。显式传入 `--graph-read-bolt` 才连接该地址，用本次唯一 id 写入并读取前后邻和相关分块，清理只删除这些节点。默认 `pytest` 不探测、不写入已有库 |
 | `tests/test_pipeline.py` | 离线健康检查、任一侧失败；向量写入的探测、稀疏编码、维度中止、分批、重复写入与空文件；检索的空集合、过滤、维度与缺 Key；混合融合与稀疏失败；改写在 embedding 之前，失败改用原文；图扩展在截断之后、重排之前，失败保留向量命中；重排在图扩展之后、补邻之前，失败保持原顺序；回答引用、无命中不调用模型；向量成功后再写图，图失败不回滚 Qdrant，邻接失败仍返回命中。`--entities` 在骨架之后抽取；失败不改已有提及。别名模型、解析或写入失败仍提交提及，且不改已有别名边。未加 `doc_id` 时别名扩展可以走到另一篇文档的表面名；加上之后换入的分块仍须属于该文档。`ask` 转发检索开关（含 `graph_hops` 与 `aliases`）且固定不生成检索回答，引用只来自本轮命中，步数不超过 `max_steps` |
 | `tests/test_ingest.py` | 空文件、短文件、超长段、重叠、Markdown 标题、同一路径重复切分 id 不变 |
 | `tests/test_api.py` | `GET /`、`GET /health`、`POST /search`、`POST /ask` 与 `POST /ingest` 的状态码、`asdict` 正文、校验失败、软失败和 `close()`。`GET /` 返回包内查询页且不调用管线。TestClient 不执行页面脚本。dry-run 不调用 `pipeline.ingest`。不绑定端口。`rewrite`、`graph_hops` 与 `aliases` 默认 false。别名软失败仍是 200。非法别名开关是 422 且不调用管线。`POST /search` 不接受 `agent` 字段 |
@@ -483,7 +493,7 @@ masskb/
 - 推送到 `main`
 - 任意 Pull Request
 
-作业在 `ubuntu-latest` 上使用 Python 3.12，执行 `pip install -e ".[dev,api]"` 和 `python -m pytest`。CI 不启动 Docker，也不构建应用镜像，也不运行 `ruff`。本地若要检查风格，可在安装开发依赖后执行 `ruff check`。
+作业在 `ubuntu-latest` 上使用 Python 3.12，执行 `pip install -e ".[dev,api]"` 和 `python -m pytest`。CI 不启动 Docker，也不构建应用镜像，也不运行 `ruff`，也不传入 `--graph-read-bolt`。本地若要检查风格，可在安装开发依赖后执行 `ruff check`。
 
 ## 许可证
 
