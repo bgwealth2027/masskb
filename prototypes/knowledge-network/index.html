@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>知识碎片网 · 交互原型</title>
+  <!--
+    隔离的交互原型。不替换 masskb/static/index.html，不调用检索接口。
+    资源使用相对路径，GitHub Pages 项目站挂在 /masskb/ 时仍能加载。
+    预期的 Pages 地址在启用并完成部署之前不可用。
+  -->
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #141618;
+      --raise: #1c2024;
+      --sunken: #101214;
+      --line: #2c343a;
+      --text: #e7eaed;
+      --muted: #9aa3ab;
+      --dim: #717b83;
+      --cyan: #7eb4bb;
+      --orange: #e8893a;
+      --orange-hot: #ffb067;
+      --orange-deep: #c46a28;
+      --ink: #1a120c;
+      --focus: #ffb067;
+      --font: "WenQuanYi Micro Hei", "Noto Sans SC", "Source Han Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; }
+    body {
+      margin: 0;
+      display: flex;
+      flex-direction: column;
+      background: var(--bg);
+      color: var(--text);
+      font: 15px/1.5 var(--font);
+    }
+    button, input { font: inherit; color: inherit; }
+    button { cursor: pointer; }
+    :focus-visible {
+      outline: 2px solid var(--focus);
+      outline-offset: 2px;
+    }
+    .top {
+      flex: none;
+      position: sticky;
+      top: 0;
+      z-index: 3;
+      background: rgba(20, 22, 24, 0.96);
+      border-bottom: 1px solid var(--line);
+      padding: 0.75rem 1rem 0.7rem;
+    }
+    .stamp {
+      margin: 0 0 0.55rem;
+      padding: 0.35rem 0.7rem;
+      border-left: 3px solid var(--orange);
+      background: #241c16;
+      color: var(--orange-hot);
+      font-size: 0.92rem;
+      letter-spacing: 0.01em;
+    }
+    .heading {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.4rem 1rem;
+      align-items: baseline;
+      margin-bottom: 0.55rem;
+    }
+    h1 { font-size: 1.15rem; font-weight: 650; margin: 0; }
+    .lede { margin: 0; color: var(--muted); font-size: 0.86rem; }
+    .query-row { display: flex; gap: 0.45rem; align-items: end; }
+    .query-field { flex: 1; min-width: 0; }
+    label { display: block; margin-bottom: 0.2rem; color: var(--muted); font-size: 0.78rem; }
+    input[type="search"] {
+      width: 100%;
+      min-height: 2.6rem;
+      padding: 0.4rem 0.65rem;
+      border: 1px solid #3c464d;
+      border-radius: 2px;
+      background: var(--sunken);
+    }
+    .primary, .tool, .chip {
+      min-height: 2.5rem;
+      border-radius: 2px;
+      border: 1px solid #3c464d;
+      background: #23282c;
+    }
+    .primary {
+      padding: 0 0.95rem;
+      background: var(--orange-deep);
+      border-color: var(--orange);
+      color: var(--ink);
+      font-weight: 650;
+    }
+    .tool, .chip { padding: 0.2rem 0.7rem; }
+    .tool[aria-pressed="true"], .chip[aria-pressed="true"] {
+      border-color: var(--orange);
+      color: var(--orange-hot);
+      background: #2a2118;
+    }
+    button:disabled { opacity: 0.45; cursor: not-allowed; }
+    .chips { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-top: 0.55rem; }
+    .hint { margin: 0.45rem 0 0; color: var(--dim); font-size: 0.78rem; }
+    .workspace {
+      flex: 1;
+      min-height: 0;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(18rem, 24rem);
+    }
+    .graph-pane {
+      min-width: 0;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+      border-right: 1px solid var(--line);
+    }
+    .toolbar, .legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.4rem;
+      align-items: center;
+      padding: 0.45rem 0.7rem;
+    }
+    .toolbar { border-bottom: 1px solid var(--line); }
+    .replay-note {
+      margin: 0;
+      color: var(--cyan);
+      font-size: 0.8rem;
+    }
+    #graph { flex: 1; min-height: 16rem; position: relative; background: var(--bg); }
+    .legend {
+      margin: 0;
+      padding-top: 0;
+      padding-bottom: 0.55rem;
+      list-style: none;
+      color: var(--muted);
+      font-size: 0.75rem;
+    }
+    .legend li { display: flex; align-items: center; gap: 0.3rem; }
+    .swatch { width: 0.85rem; height: 0.85rem; display: inline-block; background: #2c3136; border: 1px solid #60777c; }
+    .swatch.doc { border-radius: 2px; }
+    .swatch.chunk { border-radius: 50%; }
+    .swatch.person { transform: rotate(45deg); width: 0.7rem; height: 0.7rem; }
+    .swatch.concept { border-radius: 3px; }
+    .swatch.edge-dim { width: 1.1rem; height: 0; border: 0; border-top: 2px solid rgba(126, 180, 187, 0.7); background: transparent; }
+    .swatch.edge-hot { width: 1.1rem; height: 0; border: 0; border-top: 2px solid var(--orange-hot); background: transparent; }
+    .side {
+      min-width: 0;
+      min-height: 0;
+      overflow: auto;
+      background: var(--raise);
+      padding: 0.75rem 0.85rem 1.2rem;
+    }
+    .side h2 { margin: 0; font-size: 0.95rem; }
+    .panel-head { display: flex; justify-content: space-between; gap: 0.5rem; align-items: center; }
+    #status { min-height: 1.4em; margin: 0.55rem 0; }
+    #blurb { margin: 0 0 0.6rem; color: var(--muted); font-size: 0.84rem; }
+    #results { list-style: none; margin: 0.4rem 0 0.8rem; padding: 0; display: grid; gap: 0.35rem; }
+    .side.is-collapsed #results { display: none; }
+    .hit, .path-step {
+      width: 100%;
+      text-align: left;
+      border: 1px solid var(--line);
+      background: var(--sunken);
+      border-radius: 2px;
+      padding: 0.4rem 0.55rem;
+    }
+    .hit[aria-current="true"], .path-step[aria-current="true"] {
+      border-color: var(--orange);
+    }
+    .hit-label { display: block; font-weight: 650; }
+    .hit-meta, .hit-excerpt { display: block; color: var(--muted); font-size: 0.78rem; }
+    .hit[data-state="seed"] .hit-meta { color: var(--orange-hot); }
+    .hit[data-state="arrived"] .hit-meta { color: #f0c39a; }
+    .detail h3 { margin: 0.85rem 0 0.25rem; font-size: 0.82rem; color: var(--muted); font-weight: 600; }
+    .detail p, .detail li { margin: 0.15rem 0; }
+    .detail ul, .path { margin: 0; padding-left: 0; list-style: none; display: grid; gap: 0.3rem; }
+    .path { margin-top: 0.3rem; }
+    .path-line { display: flex; flex-wrap: wrap; gap: 0.3rem; align-items: center; }
+    .rel {
+      color: var(--cyan);
+      font-size: 0.75rem;
+    }
+    .future { margin-top: 1rem; color: var(--muted); font-size: 0.8rem; }
+    .future summary { cursor: pointer; color: var(--text); }
+    .missing { color: #f0c39a; }
+    .skip {
+      position: absolute;
+      left: 0.5rem;
+      top: -3rem;
+      background: var(--orange-deep);
+      color: var(--ink);
+      padding: 0.4rem 0.6rem;
+    }
+    .skip:focus { top: 0.5rem; z-index: 5; }
+    @media (max-width: 860px) {
+      body { height: auto; min-height: 100%; }
+      .workspace {
+        flex: none;
+        grid-template-columns: 1fr;
+        grid-template-rows: minmax(22rem, 62vh) auto;
+      }
+      .graph-pane { border-right: 0; border-bottom: 1px solid var(--line); min-height: 22rem; }
+      #graph { height: 100%; min-height: 18rem; }
+      .side { overflow: visible; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      * { scroll-behavior: auto !important; transition: none !important; }
+    }
+  </style>
+</head>
+<body>
+  <a class="skip" href="#results">跳到结果列表</a>
+  <header class="top">
+    <p class="stamp" role="note" id="banner">示例数据/交互原型，未接真实知识库</p>
+    <div class="heading">
+      <h1>知识碎片网</h1>
+      <p class="lede">文档、分块、人物和概念按结构边连成几团。拖拽节点，滚轮或捏合缩放。</p>
+    </div>
+    <form id="query-form">
+      <div class="query-row">
+        <div class="query-field">
+          <label for="query">预置问题</label>
+          <input id="query" name="query" type="search" autocomplete="off" spellcheck="false" placeholder="输入完整的预置问题">
+        </div>
+        <button class="primary" id="submit" type="submit">回放</button>
+      </div>
+    </form>
+    <div class="chips" id="presets"></div>
+    <p class="hint" id="match-hint"></p>
+  </header>
+  <div class="workspace">
+    <section class="graph-pane" aria-label="知识碎片网">
+      <div class="toolbar">
+        <button class="tool" id="play" type="button">播放</button>
+        <button class="tool" id="pause" type="button">暂停</button>
+        <button class="tool" id="replay" type="button">重播</button>
+        <button class="tool" id="clear" type="button">清除</button>
+        <button class="tool" id="fit" type="button">适应画面</button>
+        <button class="tool" id="reduce" type="button" aria-pressed="false">减少动画：关</button>
+        <p class="replay-note" id="replay-note">示例关联回放，非后端实时推理</p>
+      </div>
+      <div id="graph" role="img" aria-label="示例知识碎片网。键盘请使用结果列表和路径。"></div>
+      <ul class="legend">
+        <li><i class="swatch doc"></i>文档</li>
+        <li><i class="swatch chunk"></i>分块</li>
+        <li><i class="swatch person"></i>人物</li>
+        <li><i class="swatch concept"></i>概念</li>
+        <li><i class="swatch edge-dim"></i>背景结构边</li>
+        <li><i class="swatch edge-hot"></i>命中与电流</li>
+      </ul>
+    </section>
+    <aside class="side" id="side">
+      <div class="panel-head">
+        <h2 id="results-title">证据子图</h2>
+        <button class="tool" id="toggle-results" type="button" aria-expanded="true" aria-controls="results">折叠结果</button>
+      </div>
+      <p id="status" role="status" aria-live="polite"></p>
+      <p id="blurb"></p>
+      <ul id="results" aria-labelledby="results-title"></ul>
+      <div class="detail" id="detail"></div>
+      <details class="future">
+        <summary>以后接入真实子图时需要的数据</summary>
+        <div id="future"></div>
+      </details>
+    </aside>
+  </div>
+  <noscript><p>这个原型需要 JavaScript 才能回放。它仍然没有连接真实知识库。</p></noscript>
+  <script src="vendor/force-graph/force-graph.min.js"></script>
+  <script src="sample/graph.js"></script>
+  <script src="src/replay.js"></script>
+  <script src="src/app.js"></script>
+</body>
+</html>
