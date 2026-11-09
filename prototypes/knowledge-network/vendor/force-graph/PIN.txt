@@ -1,0 +1,11 @@
+name: force-graph
+version: 1.52.0
+license: MIT
+description: 2D force-directed graph rendered on HTML5 canvas
+author: Vasco Asturiano
+homepage: https://github.com/vasturiano/force-graph
+registry: https://registry.npmjs.org/force-graph/-/force-graph-1.52.0.tgz
+tarball_sha256: faf67b6b6c153a447d0c759bd78b4442cebf3894e63d5a94aa75d6d37c9ceebe
+browser_bundle: dist/force-graph.min.js
+bundle_sha256: f59db59ba92ff5a76ed93d7a4d77a703b176260e5d9cd29f4f8eb4f6c369a629
+note: 页面只使用这一份已锁版的 UMD 浏览器构建。构建内含其自身依赖。未引入 Sigma.js 或 React。许可证原文见同目录 LICENSE。

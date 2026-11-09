@@ -1,0 +1,69 @@
+name: deploy-pages
+
+# 只准备知识网原型的手动发布。
+# 合并到 main 之后，这个工作流才会出现在 Actions 里。
+# 它不会在 push、pull request 或定时任务时运行。
+# 启用 GitHub Pages，以及在 Actions 里点击运行，都要等审阅后另行授权。
+# 产物只有 prototypes/knowledge-network 的纯静态文件，根上是原型 index.html。
+# 不上传仓库其余部分，不部署应用容器。
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: publish prototype
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Stage prototype
+        run: |
+          set -euo pipefail
+          src="prototypes/knowledge-network"
+          stage="${GITHUB_WORKSPACE}/_pages"
+          rm -rf "$stage"
+          mkdir -p "$stage/vendor/force-graph" "$stage/sample" "$stage/src"
+          cp "$src/index.html" "$stage/index.html"
+          cp "$src/standalone.html" "$stage/standalone.html"
+          cp "$src/vendor/force-graph/force-graph.min.js" "$stage/vendor/force-graph/force-graph.min.js"
+          cp "$src/vendor/force-graph/LICENSE" "$stage/vendor/force-graph/LICENSE"
+          cp "$src/sample/graph.js" "$stage/sample/graph.js"
+          cp "$src/src/replay.js" "$stage/src/replay.js"
+          cp "$src/src/app.js" "$stage/src/app.js"
+          test -s "$stage/index.html"
+          test -s "$stage/vendor/force-graph/force-graph.min.js"
+          if grep -Eq '(src|href)="/' "$stage/index.html"; then
+            echo "index.html uses a domain-root path and would break under /masskb/" >&2
+            exit 1
+          fi
+          if find "$stage" -type f \( -name '*.py' -o -name 'docker-compose.yml' -o -name '.env' -o -name 'pyproject.toml' \) | grep -q .; then
+            echo "staged tree contains non-prototype files" >&2
+            exit 1
+          fi
+          find "$stage" -type f | sort
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload prototype
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _pages
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
