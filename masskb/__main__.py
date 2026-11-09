@@ -224,6 +224,38 @@ def _listen_port(value: str) -> int:
     return port
 
 
+def cmd_gate(args: argparse.Namespace) -> int:
+    """只读网关。不改 ``serve`` 的路由，也不读取新的产品环境变量。"""
+    from masskb.gate import (
+        DEFAULT_ALLOWED_HOSTS,
+        GateConfig,
+        GateError,
+        normalize_allowed_host,
+        serve_gate,
+    )
+
+    hosts = set(DEFAULT_ALLOWED_HOSTS)
+    for item in args.allow_host:
+        try:
+            hosts.add(normalize_allowed_host(item))
+        except GateError as exc:
+            print(f"[FAIL] {exc}", file=sys.stderr)
+            return 1
+    try:
+        config = GateConfig(upstream=args.upstream, allowed_hosts=frozenset(hosts))
+    except GateError as exc:
+        print(f"[FAIL] {exc}", file=sys.stderr)
+        return 1
+    try:
+        serve_gate(config, args.host, args.port)
+    except KeyboardInterrupt:
+        return 0
+    except OSError as exc:
+        print(f"[FAIL] {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def cmd_serve(args: argparse.Namespace) -> int:
     """启动 HTTP。FastAPI 与 uvicorn 在这里才导入。"""
     try:
@@ -472,6 +504,35 @@ def build_parser() -> argparse.ArgumentParser:
         help="监听端口（默认 8080）",
     )
     serve.set_defaults(func=cmd_serve)
+
+    gate = sub.add_parser(
+        "gate",
+        help="启动只读网关，只转发查询页需要的健康检查和检索",
+        description=(
+            "独立只读入口。默认只监听 127.0.0.1:8088，上游默认是本机 serve。"
+            "不改变 serve、CLI 检索或 Python 客户端的默认契约，也不读取新的环境变量。"
+            "额外域名用重复的 --allow-host 加入。默认只允许 localhost、127.0.0.1 和 ::1。"
+        ),
+    )
+    gate.add_argument("--host", default="127.0.0.1", help="监听地址（默认 127.0.0.1）")
+    gate.add_argument(
+        "--port",
+        type=_listen_port,
+        default=8088,
+        help="监听端口（默认 8088）",
+    )
+    gate.add_argument(
+        "--upstream",
+        default="http://127.0.0.1:8080",
+        help="本机 serve 的地址（默认 http://127.0.0.1:8080）",
+    )
+    gate.add_argument(
+        "--allow-host",
+        action="append",
+        default=[],
+        help="额外允许的 Host 主机名，可重复。默认仍保留 loopback 主机名",
+    )
+    gate.set_defaults(func=cmd_gate)
 
     return parser
 
