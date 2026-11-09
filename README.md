@@ -318,7 +318,7 @@ curl -sS -X POST http://127.0.0.1:8080/ingest \
 
 检索的 20 秒只是网关对浏览器的等候。到点返回「检索超时」，这次上游读取继续，名额要等它结束才释放。健康检查若在这段等候里没有结果，只返回 `ok: false`，不附上游正文。客户端提前断开也一样，不会把已经交给 `serve` 的调用取消。名额默认 2，限制的是网关尚未结束的上游调用，不是 `serve` 里那把锁，也不是它的线程池。上游读取本身还有 120 秒上限；到点网关会放下自己这边的连接并释放名额，`serve` 仍可能把那次调用做完。
 
-公开样例库用独立文件 `docker-compose.public.yml`。它用 `!override` 清掉合并时可能留下的端口和卷，单独渲染时也不发布 Qdrant、Neo4j、嵌入或应用的宿主机端口，网关只发布 `127.0.0.1:8088`。`docker compose config` 只检查这份渲染，不代表容器已经启动。它沿用已有的 `NEO4J_DEV_PASSWORD`：没设置时渲染会失败；值若是 `masskb-dev-pass`，Neo4j、应用、网关和样例入库在执行自己的命令前都会退出。默认 Compose 仍保留这个开发密码，只是端口改到 loopback。样例入库：
+公开样例库用独立文件 `docker-compose.public.yml`。它用 `!override` 清掉合并时可能留下的端口和卷，单独渲染时也不发布 Qdrant、Neo4j、嵌入或应用的宿主机端口，网关只发布 `127.0.0.1:8088`。`docker compose config` 只检查这份渲染，不代表容器已经启动。它沿用已有的 `NEO4J_DEV_PASSWORD`：没设置时渲染会失败。入口脚本读的是容器里的这个变量，所以 Neo4j、应用、网关和样例入库都会把它写进各自的 `environment`；应用和入库连接数据库仍用 `NEO4J_PASSWORD`。值若是 `masskb-dev-pass`，这四个服务在执行自己的命令前都会退出。默认 Compose 仍保留这个开发密码，只是端口改到 loopback。样例入库：
 
 ```bash
 NEO4J_DEV_PASSWORD='已有的非默认密码' docker compose -f docker-compose.public.yml up -d --build

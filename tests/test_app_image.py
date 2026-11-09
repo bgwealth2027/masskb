@@ -205,7 +205,9 @@ def test_public_compose_file_has_no_internal_ports() -> None:
     assert "0.0.0.0:" not in gate
     assert "masskb-dev-pass" not in text
     assert ":-masskb-dev-pass" not in text
-    assert text.count("${NEO4J_DEV_PASSWORD:?必须设置 NEO4J_DEV_PASSWORD}") >= 4
+    assert text.count("${NEO4J_DEV_PASSWORD:?必须设置 NEO4J_DEV_PASSWORD}") == 7
+    for name in ("neo4j", "app", "gate", "sample-ingest"):
+        assert "NEO4J_DEV_PASSWORD: ${NEO4J_DEV_PASSWORD:?必须设置 NEO4J_DEV_PASSWORD}" in blocks[name]
     assert "/reject-default-password.sh" in blocks["neo4j"]
     for name in ("neo4j", "app", "gate", "sample-ingest"):
         assert "/bin/sh" in blocks[name]
@@ -328,7 +330,122 @@ def test_public_compose_config_render_when_cli_exists() -> None:
     assert "embed_cache:" not in merged_text
     for internal in ("6333", "6334", "7474", "7687", "8081"):
         assert f'published: "{internal}"' not in merged_text
-    # config 只渲染文件。这里不调用 up，渲染成功也不表示容器已经启动。
+    # config 只渲染文件。这里不调用 up 或 pull，渲染成功也不表示容器已经启动。
+    _assert_rendered_password_reaches_entrypoint(command, env["NEO4J_DEV_PASSWORD"])
+
+
+def _compose_config(command: list[str | None], password: str, *, profile: str | None) -> str:
+    prefix = command[:2] if command[1] == "compose" else command[:1]
+    args = [item for item in prefix if item is not None]
+    args.extend(["-f", "docker-compose.public.yml"])
+    if profile is not None:
+        args.extend(["--profile", profile])
+    args.append("config")
+    env = os.environ.copy()
+    env["NEO4J_DEV_PASSWORD"] = password
+    rendered = subprocess.run(
+        args,
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert rendered.returncode == 0, rendered.stderr
+    assert " up " not in " ".join(args)
+    assert "pull" not in args
+    return rendered.stdout
+
+
+def _rendered_service_environment(rendered: str) -> dict[str, dict[str, str]]:
+    """只取 config 写进各服务的 environment，不沿用宿主进程里的同名变量。"""
+    services: dict[str, dict[str, str]] = {}
+    current: str | None = None
+    in_services = False
+    in_env = False
+    for line in rendered.splitlines():
+        if line.startswith("services:"):
+            in_services = True
+            current = None
+            in_env = False
+            continue
+        if in_services and line and not line.startswith(" "):
+            in_services = False
+            in_env = False
+            current = None
+        if not in_services:
+            continue
+        if line.startswith("  ") and not line.startswith("    ") and line.rstrip().endswith(":"):
+            current = line.strip()[:-1]
+            services.setdefault(current, {})
+            in_env = False
+            continue
+        if current is None:
+            continue
+        if line.startswith("    environment:"):
+            in_env = True
+            continue
+        if not in_env:
+            continue
+        if not line.startswith("      ") or line.startswith("        "):
+            in_env = False
+            continue
+        item = line.strip()
+        if item.startswith("- "):
+            key, _, value = item[2:].partition("=")
+        else:
+            key, _, value = item.partition(":")
+        key = key.strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+            value = value[1:-1]
+        services[current][key] = value
+    return services
+
+
+def _check_entrypoint(service_env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    """只用渲染出的容器环境。宿主上的 NEO4J_DEV_PASSWORD 不会被带进去。"""
+    script = ROOT / "deploy" / "public" / "neo4j-entrypoint.sh"
+    env = {"PATH": os.environ.get("PATH", "")}
+    env.update(service_env)
+    return subprocess.run(
+        ["sh", str(script), "--check"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+
+def _assert_rendered_password_reaches_entrypoint(command: list[str | None], password: str) -> None:
+    rendered = _compose_config(command, password, profile="ingest")
+    environments = _rendered_service_environment(rendered)
+    guarded = ("neo4j", "app", "gate", "sample-ingest")
+    assert set(guarded) <= set(environments)
+    for name in guarded:
+        service_env = environments[name]
+        assert service_env.get("NEO4J_DEV_PASSWORD") == password, name
+        passed = _check_entrypoint(service_env)
+        assert passed.returncode == 0, name
+        assert password not in passed.stdout
+        assert password not in passed.stderr
+        assert "masskb-dev-pass" not in passed.stdout
+        assert "masskb-dev-pass" not in passed.stderr
+        for bad in ("", "masskb-dev-pass"):
+            rejected_env = dict(service_env)
+            rejected_env["NEO4J_DEV_PASSWORD"] = bad
+            rejected = _check_entrypoint(rejected_env)
+            assert rejected.returncode == 1, name
+            assert "拒绝空密码或默认开发密码" in rejected.stderr
+            assert password not in rejected.stdout
+            assert password not in rejected.stderr
+    app_without_dev = {
+        key: value
+        for key, value in environments["app"].items()
+        if key != "NEO4J_DEV_PASSWORD"
+    }
+    missed = _check_entrypoint(app_without_dev)
+    assert missed.returncode == 1
 
 
 def test_embed_dockerfile_is_separate_from_the_app() -> None:
