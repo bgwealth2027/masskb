@@ -714,6 +714,32 @@ def test_upsert_document_accepts_a_single_chunk(monkeypatch: pytest.MonkeyPatch)
     assert driver.session_obj.write_calls == 1
 
 
+def test_delete_call_is_unit_subquery_and_upsert_returns_before_linking(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """删除语句不能再以带 RETURN 的 CALL 收尾；更新语句仍要靠这个 RETURN 保住后继行。"""
+    driver = _GraphDriver()
+    store = _bind_graph(monkeypatch, driver)
+    chunk = _skeleton_chunk("only")
+
+    store.upsert_document(_skeleton_doc(chunk))
+    store.delete_document(chunk.doc_id)
+
+    upsert_query = driver.session_obj.queries[0][0]
+    delete_query = driver.session_obj.queries[1][0]
+    returned = "RETURN count(*) AS removed_orphans"
+    assert returned in upsert_query
+    after_return = upsert_query.split(returned, 1)[1]
+    assert "MERGE (prev)-[:NEXT_CHUNK]->(nxt)" in after_return
+    assert _keeps_alias_endpoints(upsert_query)
+    call_at = delete_query.rfind("CALL {")
+    assert call_at != -1
+    assert "RETURN" not in delete_query[call_at:]
+    assert _keeps_alias_endpoints(delete_query)
+    assert "DETACH DELETE person" not in delete_query
+    assert "DETACH DELETE concept" not in delete_query
+
+
 def test_delete_document_detaches_chunks_and_document(monkeypatch: pytest.MonkeyPatch) -> None:
     driver = _GraphDriver()
     store = _bind_graph(monkeypatch, driver)

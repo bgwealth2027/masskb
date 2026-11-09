@@ -89,6 +89,8 @@ WITH chunks[i] AS prev, chunks[i + 1] AS nxt
 MERGE (prev)-[:NEXT_CHUNK]->(nxt)
 """
 
+# 末尾必须是单元子查询。Neo4j 5.26 拒绝以带 RETURN 的 CALL 结束的查询。
+# 这里的 count 没有调用方；去掉之后仍是同一条写事务，孤儿条件也不变。
 _DELETE_DOCUMENT = """
 OPTIONAL MATCH (c:Chunk {doc_id: $doc_id})
 OPTIONAL MATCH (c)-[mention:MENTIONS]->()
@@ -109,7 +111,6 @@ CALL {
   OPTIONAL MATCH (concept:Concept {concept_id: eid})
   WHERE NOT (()-[:MENTIONS]->(concept)) AND NOT (concept)-[:ALIAS_OF]-()
   DELETE concept
-  RETURN count(*) AS removed_orphans
 }
 """
 
