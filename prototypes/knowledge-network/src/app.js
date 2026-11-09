@@ -121,7 +121,7 @@
   });
 
   var charge = graph.d3Force("charge");
-  if (charge) charge.strength(-42);
+  if (charge) charge.strength(-28);
   var center = graph.d3Force("center");
   if (center) center.strength(0.03);
   var linkForce = graph.d3Force("link");
@@ -215,8 +215,37 @@
   function fitGraph(animated, force) {
     if (state.userAdjusted && !force) return;
     state.fitting = true;
-    graph.zoomToFit(animated && !state.reduced ? 350 : 0, 72);
-    window.setTimeout(function () { state.fitting = false; }, animated ? 420 : 50);
+    var nodes = graph.graphData().nodes.filter(function (node) {
+      return Number.isFinite(node.x) && Number.isFinite(node.y);
+    });
+    var rect = mount.getBoundingClientRect();
+    if (nodes.length && rect.width > 40 && rect.height > 40) {
+      var minX = Infinity;
+      var maxX = -Infinity;
+      var minY = Infinity;
+      var maxY = -Infinity;
+      nodes.forEach(function (node) {
+        if (node.x < minX) minX = node.x;
+        if (node.x > maxX) maxX = node.x;
+        if (node.y < minY) minY = node.y;
+        if (node.y > maxY) maxY = node.y;
+      });
+      minX -= 42;
+      maxX += 42;
+      minY -= 28;
+      maxY += 46;
+      var pad = 24;
+      var k = Math.min(
+        (rect.width - pad * 2) / Math.max(120, maxX - minX),
+        (rect.height - pad * 2) / Math.max(120, maxY - minY)
+      );
+      k = Math.max(0.6, Math.min(2.6, k));
+      graph.centerAt((minX + maxX) / 2, (minY + maxY) / 2, 0);
+      graph.zoom(k, 0);
+    } else {
+      graph.zoomToFit(0, 36);
+    }
+    window.setTimeout(function () { state.fitting = false; }, animated ? 80 : 40);
   }
 
   function clusterForce() {
@@ -224,8 +253,8 @@
     function force(alpha) {
       nodes.forEach(function (node) {
         if (!Number.isFinite(node.homeX) || node.fx != null) return;
-        node.vx += (node.homeX - node.x) * 0.42 * alpha;
-        node.vy += (node.homeY - node.y) * 0.42 * alpha;
+        node.vx += (node.homeX - node.x) * 0.9 * alpha;
+        node.vy += (node.homeY - node.y) * 0.9 * alpha;
       });
     }
     force.initialize = function (next) { nodes = next || []; };
@@ -235,13 +264,13 @@
   function colorForLink(link) {
     if (link.id === state.activeEdgeId) return "rgba(255, 176, 102, 0.98)";
     if (state.evidenceEdges.has(link.id)) return "rgba(226, 132, 68, 0.92)";
-    return "rgba(118, 176, 184, 0.32)";
+    return "rgba(158, 214, 222, 0.72)";
   }
 
   function widthForLink(link) {
     if (link.id === state.activeEdgeId) return 2.6;
     if (state.evidenceEdges.has(link.id)) return 1.7;
-    return 0.75;
+    return 1.25;
   }
 
   function particlesForLink(link) {
@@ -283,14 +312,14 @@
     traceShape(ctx, node, radius);
     ctx.fillStyle = role === "seed" ? "#e8893a" : role === "arrived" ? "#c46a28" : "#2a2f34";
     ctx.fill();
-    ctx.lineWidth = selected ? 2.4 : 1.1;
-    ctx.strokeStyle = selected ? "#ffd7b0" : role ? "#ffb067" : "#5d757b";
+    ctx.lineWidth = selected ? 2.4 : 1.35;
+    ctx.strokeStyle = selected ? "#ffd7b0" : role ? "#ffb067" : "#9ec5cb";
     ctx.stroke();
-    var fontSize = Math.max(11 / globalScale, 3);
+    var fontSize = Math.max(14 / globalScale, 4);
     ctx.font = fontSize + 'px "WenQuanYi Micro Hei", "Noto Sans SC", sans-serif';
     ctx.textAlign = "center";
     ctx.textBaseline = "top";
-    ctx.fillStyle = role ? "#ffe7d0" : "rgba(196, 204, 208, 0.84)";
+    ctx.fillStyle = role ? "#ffe7d0" : "rgba(226, 232, 234, 0.94)";
     ctx.fillText(node.label, node.x, node.y + radius + 3);
   }
 
