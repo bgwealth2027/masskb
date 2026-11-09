@@ -17,6 +17,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from masskb.agent import MAX_AGENT_STEPS
+from masskb.aliases import alias_flag_error
 from masskb.ingest import DEFAULT_CHUNK_OVERLAP, DEFAULT_CHUNK_SIZE, ingest_path
 from masskb.pipeline import RetrievalPipeline
 
@@ -41,6 +42,7 @@ class SearchRequest(BaseModel):
     rerank: bool = False
     rewrite: bool = False
     graph_hops: bool = False
+    aliases: bool = False
 
     @field_validator("query")
     @classmethod
@@ -69,6 +71,7 @@ class AskRequest(BaseModel):
     rewrite: bool = False
     rerank: bool = False
     graph_hops: bool = False
+    aliases: bool = False
     max_steps: int = Field(default=MAX_AGENT_STEPS, ge=1, le=MAX_AGENT_STEPS, strict=True)
 
     @field_validator("query")
@@ -107,6 +110,11 @@ class IngestRequest(BaseModel):
     )
     dry_run: bool = Field(default=False, description="只做本地切分，不调用 pipeline.ingest")
     entities: bool = Field(default=False, description="抽取人物与概念；dry_run 时不抽取")
+    aliases: bool = Field(default=False, description="合并已抽取的人物/概念别名；必须和 entities 一起使用")
+    drop_aliases: bool = Field(
+        default=False,
+        description="删除本文档写下的别名边；必须和 entities 一起使用，且不能与 aliases 同开",
+    )
 
     @field_validator("path")
     @classmethod
@@ -168,6 +176,7 @@ def create_app(pipeline: RetrievalPipeline | None = None) -> FastAPI:
                     rerank=body.rerank,
                     rewrite=body.rewrite,
                     graph_hops=body.graph_hops,
+                    aliases=body.aliases,
                 )
         except ValueError as exc:
             return UTF8JSONResponse({"detail": str(exc)}, status_code=422)
@@ -188,6 +197,7 @@ def create_app(pipeline: RetrievalPipeline | None = None) -> FastAPI:
                     rewrite=body.rewrite,
                     rerank=body.rerank,
                     graph_hops=body.graph_hops,
+                    aliases=body.aliases,
                     max_steps=body.max_steps,
                 )
         except ValueError as exc:
@@ -201,6 +211,13 @@ def create_app(pipeline: RetrievalPipeline | None = None) -> FastAPI:
         pipe = request.app.state.pipeline
         path = Path(body.path).expanduser()
         root = Path(body.root).expanduser() if body.root is not None else None
+        rejected = alias_flag_error(
+            entities=body.entities,
+            aliases=body.aliases,
+            drop_aliases=body.drop_aliases,
+        )
+        if rejected is not None:
+            return UTF8JSONResponse({"detail": rejected}, status_code=422)
         try:
             with lock:
                 if body.dry_run:
@@ -213,6 +230,8 @@ def create_app(pipeline: RetrievalPipeline | None = None) -> FastAPI:
                     payload: object = {
                         "dry_run": True,
                         "entities": body.entities,
+                        "aliases": body.aliases,
+                        "drop_aliases": body.drop_aliases,
                         "report": asdict(report),
                     }
                 else:
@@ -222,6 +241,8 @@ def create_app(pipeline: RetrievalPipeline | None = None) -> FastAPI:
                         chunk_size=body.chunk_size,
                         overlap=body.overlap,
                         entities=body.entities,
+                        aliases=body.aliases,
+                        drop_aliases=body.drop_aliases,
                     )
                     payload = asdict(result)
         except ValueError as exc:

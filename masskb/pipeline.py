@@ -17,6 +17,13 @@ from masskb.agent import (
     format_search_observation,
     parse_agent_action,
 )
+from masskb.aliases import (
+    AliasLink,
+    AliasParseError,
+    alias_flag_error,
+    build_alias_messages,
+    parse_alias_response,
+)
 from masskb.answer import (
     AnswerStatus,
     ChatClient,
@@ -128,6 +135,7 @@ class GraphHopStatus:
 
     `found` 是排序后的候选数，最多 8。`expanded` 是进入命中列表的条数，为 0 或 1。
     跳过、没有种子或失败时，这两个计数是 None。
+    `aliases` 在这次成功的扩展允许走别名边时为真。跳过、没开或失败时为假。
     """
 
     ok: bool
@@ -135,6 +143,7 @@ class GraphHopStatus:
     error: str | None = None
     found: int | None = None
     expanded: int | None = None
+    aliases: bool = False
 
 
 @dataclass(frozen=True)
@@ -213,6 +222,7 @@ class AskResult:
     rewrite: bool
     rerank: bool
     graph_hops: bool = False
+    aliases: bool = False
 
 
 @dataclass(frozen=True)
@@ -231,6 +241,11 @@ class IngestWriteResult:
     graph_concepts: int = 0
     graph_mentions: int = 0
     entities_dropped: int = 0
+    aliases_skipped: bool = True
+    aliases_ok: bool = True
+    aliases_error: str | None = None
+    graph_aliases: int = 0
+    aliases_dropped: int = 0
 
 
 def _validate_search(query: str, top_k: int, doc_id: str | None) -> None:
@@ -262,6 +277,7 @@ def _ask_result(
     rewrite: bool,
     rerank: bool,
     graph_hops: bool,
+    aliases: bool = False,
 ) -> AskResult:
     return AskResult(
         query=query,
@@ -276,6 +292,7 @@ def _ask_result(
         rewrite=rewrite,
         rerank=rerank,
         graph_hops=graph_hops,
+        aliases=aliases,
     )
 
 
@@ -546,6 +563,10 @@ def _graph_failure(doc_id: str, exc: Exception) -> GraphSyncError:
     )
 
 
+def _alias_soft_error(doc_id: str, exc: Exception) -> str:
+    return f"文档 {doc_id} 的别名未写入：{type(exc).__name__}: {exc}"
+
+
 def _entity_failure(doc_id: str, exc: Exception, *, index: int | None = None) -> EntitySyncError:
     where = f"文档 {doc_id}"
     if index is not None:
@@ -566,6 +587,15 @@ def _payload(chunk: Chunk) -> dict[str, Any]:
         "end": chunk.end,
         "text": chunk.text,
     }
+
+
+@dataclass(frozen=True)
+class _PendingAliases:
+    """一篇文档要不要改别名边。`ready` 为空表示这次不碰已有别名。"""
+
+    ready: tuple[AliasLink, ...] | None = None
+    dropped: int = 0
+    failed: str | None = None
 
 
 class RetrievalPipeline:
@@ -599,6 +629,8 @@ class RetrievalPipeline:
         chunk_size: int = DEFAULT_CHUNK_SIZE,
         overlap: int = DEFAULT_CHUNK_OVERLAP,
         entities: bool = False,
+        aliases: bool = False,
+        drop_aliases: bool = False,
     ) -> IngestWriteResult:
         """切分并写入 Qdrant，再同步这篇文档的 Neo4j 骨架。不做检索。
 
@@ -607,10 +639,25 @@ class RetrievalPipeline:
         每个文档的向量 upsert 和过期点删除都成功后，才写该文档的图。
         `entities` 为真时，骨架成功后才按分块抽取人物和概念，并替换这些分块上的提及。
         抽取或提及写入失败时不回滚已经写入的向量和骨架。
+        `aliases` 与 `drop_aliases` 默认关闭，并且必须和 `entities` 一起使用。
+        别名模型、解析或写入失败不改变提及，也不删除已有别名边，调用方仍得到写入结果。
         """
+        rejected = alias_flag_error(
+            entities=entities,
+            aliases=aliases,
+            drop_aliases=drop_aliases,
+        )
+        if rejected is not None:
+            raise ValueError(rejected)
+        alias_requested = aliases or drop_aliases
         report = ingest_path(path, root=root, chunk_size=chunk_size, overlap=overlap)
         if not any(doc.chunks for doc in report.files):
-            return self._clear_docs_if_collection_exists(report, entities=entities)
+            return self._clear_docs_if_collection_exists(
+                report,
+                entities=entities,
+                aliases=aliases,
+                drop_aliases=drop_aliases,
+            )
 
         probe = self.embeddings.embed_one(_PROBE_TEXT)
         if len(probe) != self.settings.embedding_dimensions:
@@ -624,11 +671,21 @@ class RetrievalPipeline:
         concept_ids: set[str] = set()
         graph_mentions = 0
         entities_dropped = 0
+        graph_aliases = 0
+        aliases_dropped = 0
+        aliases_ok = True
+        aliases_error: str | None = None
         for doc in report.files:
             if not doc.chunks:
                 self.vector_store.delete_by_doc_id(doc.doc_id)
                 self._delete_graph_document(doc.doc_id)
                 graph_documents += 1
+                if alias_requested:
+                    wrote, failed = self._replace_aliases_soft(doc.doc_id, ())
+                    graph_aliases += wrote
+                    if failed is not None and aliases_ok:
+                        aliases_ok = False
+                        aliases_error = failed
                 continue
             vectors = self._embed_document(doc.chunks)
             ids = [point_id_for_chunk(chunk.chunk_id) for chunk in doc.chunks]
@@ -642,10 +699,27 @@ class RetrievalPipeline:
             if entities:
                 found, dropped = self._extract_mentions(doc)
                 entities_dropped += dropped
+                pending = self._pending_aliases(
+                    doc,
+                    found,
+                    aliases=aliases,
+                    drop_aliases=drop_aliases,
+                )
+                if pending.failed is not None and aliases_ok:
+                    aliases_ok = False
+                    aliases_error = pending.failed
                 self._replace_mentions(doc, found)
                 person_ids.update(item.entity_id for item in found if item.kind == "person")
                 concept_ids.update(item.entity_id for item in found if item.kind == "concept")
                 graph_mentions += len(found)
+                if pending.ready is not None:
+                    wrote, failed = self._replace_aliases_soft(doc.doc_id, pending.ready)
+                    if failed is None:
+                        graph_aliases += wrote
+                        aliases_dropped += pending.dropped
+                    elif aliases_ok:
+                        aliases_ok = False
+                        aliases_error = failed
         return self._result(
             report,
             upserted,
@@ -657,6 +731,11 @@ class RetrievalPipeline:
             graph_concepts=len(concept_ids),
             graph_mentions=graph_mentions,
             entities_dropped=entities_dropped,
+            aliases_skipped=not alias_requested,
+            aliases_ok=aliases_ok,
+            aliases_error=aliases_error,
+            graph_aliases=graph_aliases,
+            aliases_dropped=aliases_dropped,
         )
 
     def search(
@@ -670,6 +749,7 @@ class RetrievalPipeline:
         rerank: bool = False,
         rewrite: bool = False,
         graph_hops: bool = False,
+        aliases: bool = False,
     ) -> SearchResult:
         """用与入库相同的模型做近邻检索，再按 chunk_id 补前后邻。
 
@@ -681,6 +761,7 @@ class RetrievalPipeline:
         `SearchResult.query` 始终是用户原文。
         `hybrid` 为真时，在补邻之前用进程内 RRF 融合 bm25。
         `graph_hops` 为真时，在截成 `top_k` 之后、重排之前沿已有边最多替换 1 条命中。
+        `aliases` 只在 `graph_hops` 同时为真时让这次扩展多走一跳别名。单独打开不读图。
         图扩展失败时仍返回向量命中。
         `rerank` 为真时，在图扩展之后、补邻之前做 listwise 重排。
         `answer` 为真时，补邻之后才请求聊天，且只引用本次命中的 chunk_id。
@@ -710,7 +791,7 @@ class RetrievalPipeline:
             )
             return self._maybe_answer(
                 self._maybe_rerank(
-                    self._maybe_graph_hops(result, enabled=graph_hops),
+                    self._maybe_graph_hops(result, enabled=graph_hops, aliases=aliases),
                     enabled=rerank,
                 ),
                 enabled=answer,
@@ -751,7 +832,7 @@ class RetrievalPipeline:
         return self._maybe_answer(
             self._attach_neighbors(
                 self._maybe_rerank(
-                    self._maybe_graph_hops(result, enabled=graph_hops),
+                    self._maybe_graph_hops(result, enabled=graph_hops, aliases=aliases),
                     enabled=rerank,
                 )
             ),
@@ -768,13 +849,14 @@ class RetrievalPipeline:
         rewrite: bool = False,
         rerank: bool = False,
         graph_hops: bool = False,
+        aliases: bool = False,
         max_steps: int = MAX_AGENT_STEPS,
     ) -> AskResult:
         """用有界工具循环回答问题。默认不由 `search` 进入。
 
         每一步只接受一个 JSON 动作：`search`、`healthcheck` 或 `finish`。
         `search` 转发调用方的 `top_k`、`doc_id`、`hybrid`、`rewrite`、`rerank`、
-        `graph_hops`，并固定 `answer=False`。引用只能来自本轮带正文的命中。
+        `graph_hops` 和 `aliases`，并固定 `answer=False`。引用只能来自本轮带正文的命中。
         空白问题、非法 `top_k`、`doc_id` 或 `max_steps` 在第一次聊天前抛出 `ValueError`。
         缺 Key、聊天失败，以及 `search` 的硬错误会继续抛出。
         走满步数仍未 `finish` 时返回 `stopped="max_steps"`，不抛错。
@@ -795,6 +877,7 @@ class RetrievalPipeline:
                 rewrite=rewrite,
                 rerank=rerank,
                 graph_hops=graph_hops,
+                aliases=aliases,
             )
             raw = self._complete_agent(system, user)
             action = parse_agent_action(raw)
@@ -826,6 +909,7 @@ class RetrievalPipeline:
                     rewrite=rewrite,
                     rerank=rerank,
                     graph_hops=graph_hops,
+                    aliases=aliases,
                 )
             if action.kind == "healthcheck":
                 payload = self.healthcheck()
@@ -848,6 +932,7 @@ class RetrievalPipeline:
                 rerank=rerank,
                 rewrite=rewrite,
                 graph_hops=graph_hops,
+                aliases=aliases,
             )
             for hit in result.hits:
                 if hit.chunk_id and hit.text:
@@ -882,6 +967,7 @@ class RetrievalPipeline:
             rewrite=rewrite,
             rerank=rerank,
             graph_hops=graph_hops,
+            aliases=aliases,
         )
 
     def _complete_agent(self, system: str, user: str) -> str:
@@ -896,8 +982,11 @@ class RetrievalPipeline:
         report: IngestReport,
         *,
         entities: bool = False,
+        aliases: bool = False,
+        drop_aliases: bool = False,
     ) -> IngestWriteResult:
         """没有可写入的分块时不探测、不建集合。集合已在则先删点，再删骨架。"""
+        alias_requested = aliases or drop_aliases
         if not self.vector_store.has_collection() or not report.files:
             return self._result(
                 report,
@@ -906,10 +995,20 @@ class RetrievalPipeline:
                 graph_chunks=0,
                 graph_skipped=True,
                 entities_skipped=not entities,
+                aliases_skipped=not alias_requested,
             )
+        graph_aliases = 0
+        aliases_ok = True
+        aliases_error: str | None = None
         for doc in report.files:
             self.vector_store.delete_by_doc_id(doc.doc_id)
             self._delete_graph_document(doc.doc_id)
+            if alias_requested:
+                wrote, failed = self._replace_aliases_soft(doc.doc_id, ())
+                graph_aliases += wrote
+                if failed is not None and aliases_ok:
+                    aliases_ok = False
+                    aliases_error = failed
         return self._result(
             report,
             0,
@@ -917,6 +1016,10 @@ class RetrievalPipeline:
             graph_chunks=0,
             graph_skipped=False,
             entities_skipped=not entities,
+            aliases_skipped=not alias_requested,
+            aliases_ok=aliases_ok,
+            aliases_error=aliases_error,
+            graph_aliases=graph_aliases,
         )
 
     def _sync_graph_document(self, doc: Document) -> int:
@@ -968,6 +1071,65 @@ class RetrievalPipeline:
     def _complete_entities(self, system: str, user: str) -> str:
         return ChatClient(self.settings).complete(system, user, max_tokens=256)
 
+    def _pending_aliases(
+        self,
+        doc: Document,
+        mentions: Sequence[EntityMention],
+        *,
+        aliases: bool,
+        drop_aliases: bool,
+    ) -> _PendingAliases:
+        """决定这篇文档的别名边。模型或解析失败时不准备写入，已有边保持不动。"""
+        if drop_aliases:
+            return _PendingAliases(ready=())
+        if not aliases:
+            return _PendingAliases()
+        try:
+            links, dropped = self._propose_aliases(doc, mentions)
+        except AliasParseError as exc:
+            return _PendingAliases(failed=_alias_soft_error(doc.doc_id, exc))
+        except Exception as exc:  # noqa: BLE001 — 别名失败不阻断提及
+            return _PendingAliases(failed=_alias_soft_error(doc.doc_id, exc))
+        return _PendingAliases(ready=links, dropped=dropped)
+
+    def _propose_aliases(
+        self,
+        doc: Document,
+        mentions: Sequence[EntityMention],
+    ) -> tuple[tuple[AliasLink, ...], int]:
+        """只把这篇文档已经接受的表面名送给模型。每类不足 2 个时不请求模型。"""
+        persons: list[str] = []
+        concepts: list[str] = []
+        seen_persons: set[str] = set()
+        seen_concepts: set[str] = set()
+        for mention in mentions:
+            if mention.kind == "person" and mention.name not in seen_persons:
+                seen_persons.add(mention.name)
+                persons.append(mention.name)
+            elif mention.kind == "concept" and mention.name not in seen_concepts:
+                seen_concepts.add(mention.name)
+                concepts.append(mention.name)
+        if len(persons) < 2 and len(concepts) < 2:
+            return (), 0
+        system, user = build_alias_messages(persons, concepts)
+        raw = self._complete_aliases(system, user)
+        return parse_alias_response(raw, persons=persons, concepts=concepts)
+
+    def _complete_aliases(self, system: str, user: str) -> str:
+        return ChatClient(self.settings).complete(system, user, max_tokens=256)
+
+    def _replace_aliases_soft(
+        self,
+        doc_id: str,
+        links: Sequence[AliasLink],
+    ) -> tuple[int, str | None]:
+        """写入别名。失败时返回错误文本，调用方不把它当成入库失败。"""
+        try:
+            written = self.graph_store.replace_aliases(doc_id, links)
+        except Exception as exc:  # noqa: BLE001 — 别名写入失败保留已有边
+            return 0, _alias_soft_error(doc_id, exc)
+        return written, None
+
     def _delete_graph_document(self, doc_id: str) -> None:
         try:
             self.graph_store.delete_document(doc_id)
@@ -976,7 +1138,13 @@ class RetrievalPipeline:
         except Exception as exc:  # 点已删，骨架失败时可重试
             raise _graph_failure(doc_id, exc) from exc
 
-    def _maybe_graph_hops(self, result: SearchResult, *, enabled: bool) -> SearchResult:
+    def _maybe_graph_hops(
+        self,
+        result: SearchResult,
+        *,
+        enabled: bool,
+        aliases: bool = False,
+    ) -> SearchResult:
         """在重排之前沿已有边最多换入 1 条分块。关闭或失败时不改向量命中。"""
         if not enabled:
             return _copy_result(result, graph_hops=_skipped_graph_hops())
@@ -989,10 +1157,19 @@ class RetrievalPipeline:
         if not seeds:
             return _copy_result(
                 result,
-                graph_hops=GraphHopStatus(ok=True, skipped=False, error="no_hits"),
+                graph_hops=GraphHopStatus(
+                    ok=True,
+                    skipped=False,
+                    error="no_hits",
+                    aliases=aliases,
+                ),
             )
         try:
-            related = self.graph_store.related_chunks(seeds, doc_id=result.doc_id)
+            related = self.graph_store.related_chunks(
+                seeds,
+                doc_id=result.doc_id,
+                aliases=aliases,
+            )
         except Exception as exc:  # noqa: BLE001 — 图扩展失败仍返回向量命中
             return _copy_result(result, graph_hops=_graph_hop_error(exc))
         found = len(related)
@@ -1005,6 +1182,7 @@ class RetrievalPipeline:
                     error=None,
                     found=found,
                     expanded=0,
+                    aliases=aliases,
                 ),
             )
         try:
@@ -1021,6 +1199,7 @@ class RetrievalPipeline:
                     error=None,
                     found=found,
                     expanded=0,
+                    aliases=aliases,
                 ),
             )
         item, payload = chosen
@@ -1037,6 +1216,7 @@ class RetrievalPipeline:
                 error=None,
                 found=found,
                 expanded=expanded,
+                aliases=aliases,
             ),
         )
 
@@ -1345,6 +1525,11 @@ class RetrievalPipeline:
         graph_concepts: int = 0,
         graph_mentions: int = 0,
         entities_dropped: int = 0,
+        aliases_skipped: bool = True,
+        aliases_ok: bool = True,
+        aliases_error: str | None = None,
+        graph_aliases: int = 0,
+        aliases_dropped: int = 0,
     ) -> IngestWriteResult:
         return IngestWriteResult(
             report=report,
@@ -1359,4 +1544,9 @@ class RetrievalPipeline:
             graph_concepts=graph_concepts,
             graph_mentions=graph_mentions,
             entities_dropped=entities_dropped,
+            aliases_skipped=aliases_skipped,
+            aliases_ok=aliases_ok,
+            aliases_error=aliases_error,
+            graph_aliases=graph_aliases,
+            aliases_dropped=aliases_dropped,
         )

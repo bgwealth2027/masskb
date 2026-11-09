@@ -206,6 +206,7 @@ def test_happy_path_requests_and_parsed_results() -> None:
         "rerank": False,
         "rewrite": False,
         "graph_hops": False,
+        "aliases": False,
     }
     assert "质量".encode() in seen[1][2]
     assert b"\\u8d28" not in seen[1][2]
@@ -225,6 +226,7 @@ def test_happy_path_requests_and_parsed_results() -> None:
         "rewrite": False,
         "rerank": False,
         "graph_hops": False,
+        "aliases": False,
         "max_steps": 3,
     }
     assert "answer" not in ask_body
@@ -275,6 +277,7 @@ def test_search_and_ask_keep_query_and_flags() -> None:
         "rerank": True,
         "rewrite": True,
         "graph_hops": True,
+        "aliases": False,
     }
     assert found.query == " 质量 "
     assert "answer" not in seen[1]
@@ -286,6 +289,7 @@ def test_search_and_ask_keep_query_and_flags() -> None:
         "rewrite": True,
         "rerank": True,
         "graph_hops": True,
+        "aliases": False,
         "max_steps": 2,
     }
     assert answered.query == " 质量 "
@@ -601,7 +605,16 @@ def test_ingest_request_and_parsed_results() -> None:
         preview = kb.ingest("笔记.md", root="data", dry_run=True, entities=True)
         written = kb.ingest("a.md")
 
-    keys = {"path", "root", "chunk_size", "overlap", "dry_run", "entities"}
+    keys = {
+        "path",
+        "root",
+        "chunk_size",
+        "overlap",
+        "dry_run",
+        "entities",
+        "aliases",
+        "drop_aliases",
+    }
     assert set(seen[0]) == keys
     assert seen[0] == {
         "path": "笔记.md",
@@ -610,6 +623,8 @@ def test_ingest_request_and_parsed_results() -> None:
         "overlap": DEFAULT_CHUNK_OVERLAP,
         "dry_run": True,
         "entities": True,
+        "aliases": False,
+        "drop_aliases": False,
     }
     assert DEFAULT_CHUNK_SIZE == 800
     assert DEFAULT_CHUNK_OVERLAP == 100
@@ -871,6 +886,7 @@ def test_asgi_round_trip_matches_server_json(tmp_path: Path) -> None:
         "rerank": False,
         "rewrite": False,
         "graph_hops": False,
+        "aliases": False,
     }
     assert pipeline.seen_ask == {
         "query": "质量",
@@ -880,6 +896,7 @@ def test_asgi_round_trip_matches_server_json(tmp_path: Path) -> None:
         "rewrite": True,
         "rerank": True,
         "graph_hops": False,
+        "aliases": False,
         "max_steps": 2,
     }
     assert "answer" not in pipeline.seen_ask
@@ -891,6 +908,8 @@ def test_asgi_round_trip_matches_server_json(tmp_path: Path) -> None:
         "chunk_size": 40,
         "overlap": 5,
         "entities": True,
+        "aliases": False,
+        "drop_aliases": False,
     }
     preview_report = ingest_path(note, root=tmp_path)
     assert isinstance(preview, IngestPreview)
@@ -925,3 +944,86 @@ if loaded:
         text=True,
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_missing_alias_fields_use_closed_defaults() -> None:
+    """旧服务没有这些字段时，按关闭态读取，不当成解析错误。"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/search":
+            body = _search_body()
+            assert "aliases" not in body["graph_hops"]
+            return httpx.Response(200, json=body)
+        if request.url.path == "/ask":
+            body = _ask_body()
+            assert "aliases" not in body
+            return httpx.Response(200, json=body)
+        payload = json.loads(request.content.decode())
+        if payload["dry_run"] is True:
+            preview = _ingest_preview_body()
+            assert "aliases" not in preview
+            return httpx.Response(200, json=preview)
+        written = _ingest_write_body()
+        assert "aliases_skipped" not in written
+        assert "graph_aliases" not in written
+        return httpx.Response(200, json=written)
+
+    with _mock(handler) as kb:
+        found = kb.search("质量")
+        answered = kb.ask("质量")
+        preview = kb.ingest("a.md", dry_run=True)
+        written = kb.ingest("a.md")
+
+    assert found.graph_hops.aliases is False
+    assert answered.aliases is False
+    assert answered.steps[0].search is not None
+    assert answered.steps[0].search.graph_hops.aliases is False
+    assert isinstance(preview, IngestPreview)
+    assert preview.aliases is False
+    assert preview.drop_aliases is False
+    assert isinstance(written, IngestWrite)
+    assert written.aliases_skipped is True
+    assert written.aliases_ok is True
+    assert written.aliases_error is None
+    assert written.graph_aliases == 0
+    assert written.aliases_dropped == 0
+
+
+def test_present_alias_fields_override_the_closed_defaults() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/search":
+            body = _search_body()
+            hops = body["graph_hops"]
+            assert isinstance(hops, dict)
+            hops["aliases"] = True
+            return httpx.Response(200, json=body)
+        written = _ingest_write_body()
+        written["aliases_skipped"] = False
+        written["aliases_ok"] = False
+        written["aliases_error"] = "down"
+        written["graph_aliases"] = 0
+        written["aliases_dropped"] = 2
+        return httpx.Response(200, json=written)
+
+    with _mock(handler) as kb:
+        found = kb.search("质量")
+        written = kb.ingest("a.md")
+
+    assert found.graph_hops.aliases is True
+    assert isinstance(written, IngestWrite)
+    assert written.aliases_skipped is False
+    assert written.aliases_ok is False
+    assert written.aliases_error == "down"
+    assert written.aliases_dropped == 2
+
+
+def test_bad_alias_field_type_is_a_parse_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        written = _ingest_write_body()
+        written["aliases_ok"] = "no"
+        return httpx.Response(200, json=written)
+
+    with _mock(handler) as kb, pytest.raises(MassKBParseError) as exc:
+        kb.ingest("a.md")
+
+    assert exc.value.path == "aliases_ok"

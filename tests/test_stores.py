@@ -7,8 +7,9 @@ from types import SimpleNamespace
 import pytest
 from qdrant_client.models import Distance, Modifier, PayloadSchemaType, SparseVector
 
+from masskb.aliases import AliasLink
 from masskb.config import Settings
-from masskb.entities import EntityMention
+from masskb.entities import EntityMention, entity_id
 from masskb.graph_store import (
     GRAPH_HOP_CANDIDATES,
     GraphStore,
@@ -814,6 +815,9 @@ def test_replace_mentions_merges_and_retires_old_targets(monkeypatch: pytest.Mon
     assert "CREATE (" not in merge_query
     assert "apoc" not in merge_query.lower()
     assert "孔子" not in merge_query
+    assert "ALIAS_OF" not in merge_query
+    assert "ALIAS_OF" not in clear_query
+    assert "ALIAS_OF" not in orphan_query
     assert merge_params["mentions"] == [
         {"chunk_id": "c1", "kind": "person", "entity_id": "pid", "name": "孔子"}
     ]
@@ -907,6 +911,7 @@ def test_related_chunks_reads_existing_edges(monkeypatch: pytest.MonkeyPatch) ->
     assert "LIMIT 2" in query
     assert "LIMIT 8" in query
     assert "apoc" not in query.lower()
+    assert "ALIAS_OF" not in query
     assert params == {"chunk_ids": ['seed"1'], "doc_id": 'doc"1'}
     assert 'doc"1' not in query
     assert 'seed"1' not in query
@@ -973,3 +978,122 @@ def test_get_by_chunk_ids_empty_does_not_open_client() -> None:
 
     assert store.get_by_chunk_ids([]) == {}
     assert store._client is None
+
+
+def _alias_link(kind: str = "person") -> AliasLink:
+    return AliasLink(
+        kind=kind,
+        alias_name="孔子",
+        canonical_name="孔丘",
+        alias_id=entity_id(kind, "孔子"),
+        canonical_id=entity_id(kind, "孔丘"),
+    )
+
+
+def test_replace_aliases_touches_only_this_document(monkeypatch: pytest.MonkeyPatch) -> None:
+    driver = _GraphDriver()
+    store = _bind_graph(monkeypatch, driver)
+    link = _alias_link()
+    concept = AliasLink(
+        kind="concept",
+        alias_name="仁义",
+        canonical_name="仁",
+        alias_id=entity_id("concept", "仁义"),
+        canonical_id=entity_id("concept", "仁"),
+    )
+
+    assert store.replace_aliases("doc-a", [link, concept]) == 2
+
+    delete_query, delete_params = driver.session_obj.queries[0]
+    person_query, person_params = driver.session_obj.queries[1]
+    concept_query, concept_params = driver.session_obj.queries[2]
+    assert "ALIAS_OF {doc_id: $doc_id}" in delete_query
+    assert "MENTIONS" not in delete_query
+    assert "DETACH DELETE" not in delete_query
+    assert delete_params == {"doc_id": "doc-a"}
+    assert "MERGE (alias)-[:ALIAS_OF {doc_id: $doc_id}]->(canonical)" in person_query
+    assert ":Person" in person_query
+    assert person_params["doc_id"] == "doc-a"
+    assert person_params["links"] == [
+        {"alias_id": link.alias_id, "canonical_id": link.canonical_id}
+    ]
+    assert ":Concept" in concept_query
+    assert concept_params["doc_id"] == "doc-a"
+    assert "apoc" not in person_query.lower()
+
+    assert store.replace_aliases("doc-b", []) == 0
+
+    clear_query, clear_params = driver.session_obj.queries[-1]
+    assert clear_params == {"doc_id": "doc-b"}
+    assert "doc-a" not in clear_query
+    assert "MENTIONS" not in clear_query
+    assert len(driver.session_obj.queries) == 4
+
+
+def test_replace_aliases_rejects_bad_links_before_write(monkeypatch: pytest.MonkeyPatch) -> None:
+    driver = _GraphDriver()
+    store = _bind_graph(monkeypatch, driver)
+    bad = AliasLink(
+        kind="place",
+        alias_name="孔子",
+        canonical_name="孔丘",
+        alias_id="a",
+        canonical_id="b",
+    )
+
+    with pytest.raises(ValueError, match="未知别名种类"):
+        store.replace_aliases("doc-a", [bad])
+
+    assert store._driver is None
+    assert driver.sessions == 0
+
+
+def test_related_chunks_alias_hop_is_one_edge_and_global(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """别名边不按写入它的 doc_id 过滤。分块过滤仍在，所以带 doc_id 时跨文档分块进不来。"""
+    driver = _GraphDriver(rows=[{"chunk_id": "chunk-a", "via": "person", "shared": 1}])
+    store = _bind_graph(monkeypatch, driver)
+
+    found = store.related_chunks(["chunk-b"], doc_id=None, aliases=True)
+
+    query, params = driver.session_obj.queries[0]
+    assert query.count("[:ALIAS_OF]-") == 2
+    assert "ALIAS_OF*" not in query
+    assert "*1" not in query
+    assert "ALIAS_OF {doc_id" not in query
+    assert "rel.doc_id" not in query
+    assert "other.doc_id = $doc_id" in query
+    assert "LIMIT 4" in query
+    assert "LIMIT 8" in query
+    assert "LIMIT 2" in query
+    assert "apoc" not in query.lower()
+    assert params == {"chunk_ids": ["chunk-b"], "doc_id": None}
+    assert found[0].chunk_id == "chunk-a"
+    assert driver.session_obj.write_calls == 0
+
+
+def test_related_chunks_alias_flag_off_keeps_the_old_query(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    driver = _GraphDriver(rows=[])
+    store = _bind_graph(monkeypatch, driver)
+
+    assert store.related_chunks(["seed"], doc_id="doc-b", aliases=False) == ()
+
+    query, params = driver.session_obj.queries[0]
+    assert "ALIAS_OF" not in query
+    assert params == {"chunk_ids": ["seed"], "doc_id": "doc-b"}
+
+
+def test_related_chunks_aliases_empty_does_not_open_driver(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def boom(*_args, **_kwargs):
+        raise AssertionError("不应连接 Neo4j")
+
+    monkeypatch.setattr("masskb.graph_store.GraphDatabase.driver", boom)
+    store = GraphStore(Settings())
+
+    assert store.related_chunks([], doc_id=None, aliases=True) == ()
+    assert store._driver is None

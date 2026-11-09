@@ -9,6 +9,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from masskb.agent import MAX_AGENT_STEPS
+from masskb.aliases import alias_flag_error
 from masskb.ingest import (
     DEFAULT_CHUNK_OVERLAP,
     DEFAULT_CHUNK_SIZE,
@@ -76,6 +77,8 @@ def _format_report(
     preview_limit: int,
     written: IngestWriteResult | None = None,
     entities: bool = False,
+    aliases: bool = False,
+    drop_aliases: bool = False,
 ) -> str:
     header = "=== MassKB Ingest (dry-run) ===" if dry_run else "=== MassKB Ingest ==="
     lines = [
@@ -102,6 +105,10 @@ def _format_report(
         lines.append("[INFO] dry-run：未连接 Qdrant、Neo4j 或 OpenAI。")
         if entities:
             lines.append("[INFO] --entities 在 dry-run 中不抽取。")
+        if aliases:
+            lines.append("[INFO] --aliases 在 dry-run 中不合并。")
+        if drop_aliases:
+            lines.append("[INFO] --drop-aliases 在 dry-run 中不删除。")
     elif written is not None:
         if report.files:
             lines.append("---")
@@ -117,6 +124,12 @@ def _format_report(
             lines.append(f"graph_concepts: {written.graph_concepts}")
             lines.append(f"graph_mentions: {written.graph_mentions}")
             lines.append(f"entities_dropped: {written.entities_dropped}")
+        if not written.aliases_skipped:
+            lines.append("aliases: drop" if drop_aliases else "aliases: on")
+            lines.append(f"graph_aliases: {written.graph_aliases}")
+            lines.append(f"aliases_dropped: {written.aliases_dropped}")
+            if not written.aliases_ok:
+                lines.append(f"[INFO] 别名未写入：{written.aliases_error}")
         if written.graph_skipped:
             lines.append("[INFO] 没有可写入的分块，且集合不存在。未连接 Neo4j，未执行检索。")
         elif written.entities_skipped:
@@ -134,6 +147,14 @@ def _format_report(
 
 def cmd_ingest(args: argparse.Namespace) -> int:
     """切分本地文本。--dry-run 只预览；否则写入 Qdrant 并同步文档骨架。"""
+    rejected = alias_flag_error(
+        entities=args.entities,
+        aliases=args.aliases,
+        drop_aliases=args.drop_aliases,
+    )
+    if rejected is not None:
+        print(f"[FAIL] {rejected}", file=sys.stderr)
+        return 1
     if args.preview < 0:
         print("[FAIL] preview 不能为负", file=sys.stderr)
         return 1
@@ -156,6 +177,8 @@ def cmd_ingest(args: argparse.Namespace) -> int:
                 dry_run=True,
                 preview_limit=args.preview,
                 entities=args.entities,
+                aliases=args.aliases,
+                drop_aliases=args.drop_aliases,
             )
         )
         return 0
@@ -169,6 +192,8 @@ def cmd_ingest(args: argparse.Namespace) -> int:
                 chunk_size=args.chunk_size,
                 overlap=args.overlap,
                 entities=args.entities,
+                aliases=args.aliases,
+                drop_aliases=args.drop_aliases,
             )
         except Exception as exc:  # noqa: BLE001 — CLI 把写入失败转成退出码
             print(f"[FAIL] {exc}", file=sys.stderr)
@@ -180,6 +205,8 @@ def cmd_ingest(args: argparse.Namespace) -> int:
                 preview_limit=args.preview,
                 written=result,
                 entities=args.entities,
+                aliases=args.aliases,
+                drop_aliases=args.drop_aliases,
             )
         )
         return 0
@@ -231,6 +258,7 @@ def cmd_search(args: argparse.Namespace) -> int:
                 rerank=args.rerank,
                 rewrite=args.rewrite,
                 graph_hops=args.graph_hops,
+                aliases=args.aliases,
             )
         except Exception as exc:  # noqa: BLE001 — CLI 把检索失败转成退出码
             print(f"[FAIL] {exc}", file=sys.stderr)
@@ -254,6 +282,7 @@ def cmd_ask(args: argparse.Namespace) -> int:
                 rewrite=args.rewrite,
                 rerank=args.rerank,
                 graph_hops=args.graph_hops,
+                aliases=args.aliases,
                 max_steps=args.max_steps,
             )
         except Exception as exc:  # noqa: BLE001 — CLI 把失败转成退出码
@@ -312,6 +341,16 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="用 LLM_MODEL 抽取人物与概念并写入 Neo4j；默认关闭",
     )
+    ingest.add_argument(
+        "--aliases",
+        action="store_true",
+        help="把本篇已抽取的人物/概念表面名合并为别名；默认关闭，必须和 --entities 一起使用",
+    )
+    ingest.add_argument(
+        "--drop-aliases",
+        action="store_true",
+        help="删除本篇文档写下的别名边；默认关闭，必须和 --entities 一起使用",
+    )
     ingest.set_defaults(func=cmd_ingest)
 
     search = sub.add_parser(
@@ -356,6 +395,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="沿已有前后边和人物/概念提及最多替换 1 条命中；默认关闭",
     )
+    search.add_argument(
+        "--aliases",
+        action="store_true",
+        help="图扩展时再走一跳人物/概念别名；默认关闭，且只在 --graph-hops 打开时生效",
+    )
     search.set_defaults(func=cmd_search)
 
     ask = sub.add_parser(
@@ -397,6 +441,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--graph-hops",
         action="store_true",
         help="每次 search 沿已有前后边和人物/概念提及最多替换 1 条命中；默认关闭",
+    )
+    ask.add_argument(
+        "--aliases",
+        action="store_true",
+        help="每次 search 在图扩展时再走一跳别名；默认关闭，且只在 --graph-hops 打开时生效",
     )
     ask.add_argument(
         "--max-steps",

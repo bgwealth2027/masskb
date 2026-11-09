@@ -8,6 +8,7 @@ from typing import Any
 
 from neo4j import Driver, GraphDatabase
 
+from masskb.aliases import AliasLink
 from masskb.config import Settings, get_settings
 from masskb.entities import EntityMention
 from masskb.ingest import Document
@@ -201,6 +202,84 @@ CALL {
 RETURN chunk_id, via, shared
 """
 
+# 别名支路各自 LIMIT 4，仍是常量。只走一条 ALIAS_OF，不沿第二跳串到同组的其他表面名。
+# 边的 doc_id 不参与过滤：表面节点是全局的，文档 A 写下的别名在未按 doc_id 过滤时
+# 也能从文档 B 的同名分块走出去。分块本身仍服从 $doc_id。
+_RELATED_CHUNKS_ALIASES = """
+UNWIND $chunk_ids AS cid
+MATCH (seed:Chunk {chunk_id: cid})
+CALL {
+  WITH seed
+  MATCH (seed)-[:NEXT_CHUNK]-(near:Chunk)
+  WHERE ($doc_id IS NULL OR near.doc_id = $doc_id)
+    AND NOT near.chunk_id IN $chunk_ids
+  WITH near
+  ORDER BY near.chunk_id ASC
+  LIMIT 2
+  RETURN near.chunk_id AS chunk_id, 'next_chunk' AS via, 0 AS shared
+  UNION ALL
+  WITH seed
+  MATCH (seed)-[:MENTIONS]->(entity:Person)<-[:MENTIONS]-(other:Chunk)
+  WHERE other.chunk_id <> seed.chunk_id
+    AND NOT other.chunk_id IN $chunk_ids
+    AND ($doc_id IS NULL OR other.doc_id = $doc_id)
+  WITH other
+  ORDER BY other.chunk_id ASC
+  LIMIT 8
+  RETURN other.chunk_id AS chunk_id, 'person' AS via, 1 AS shared
+  UNION ALL
+  WITH seed
+  MATCH (seed)-[:MENTIONS]->(entity:Concept)<-[:MENTIONS]-(other:Chunk)
+  WHERE other.chunk_id <> seed.chunk_id
+    AND NOT other.chunk_id IN $chunk_ids
+    AND ($doc_id IS NULL OR other.doc_id = $doc_id)
+  WITH other
+  ORDER BY other.chunk_id ASC
+  LIMIT 8
+  RETURN other.chunk_id AS chunk_id, 'concept' AS via, 1 AS shared
+  UNION ALL
+  WITH seed
+  MATCH (seed)-[:MENTIONS]->(:Person)-[:ALIAS_OF]-(:Person)<-[:MENTIONS]-(other:Chunk)
+  WHERE other.chunk_id <> seed.chunk_id
+    AND NOT other.chunk_id IN $chunk_ids
+    AND ($doc_id IS NULL OR other.doc_id = $doc_id)
+  WITH other
+  ORDER BY other.chunk_id ASC
+  LIMIT 4
+  RETURN other.chunk_id AS chunk_id, 'person' AS via, 1 AS shared
+  UNION ALL
+  WITH seed
+  MATCH (seed)-[:MENTIONS]->(:Concept)-[:ALIAS_OF]-(:Concept)<-[:MENTIONS]-(other:Chunk)
+  WHERE other.chunk_id <> seed.chunk_id
+    AND NOT other.chunk_id IN $chunk_ids
+    AND ($doc_id IS NULL OR other.doc_id = $doc_id)
+  WITH other
+  ORDER BY other.chunk_id ASC
+  LIMIT 4
+  RETURN other.chunk_id AS chunk_id, 'concept' AS via, 1 AS shared
+}
+RETURN chunk_id, via, shared
+"""
+
+_DELETE_DOC_ALIASES = """
+MATCH ()-[rel:ALIAS_OF {doc_id: $doc_id}]->()
+DELETE rel
+"""
+
+_MERGE_PERSON_ALIASES = """
+UNWIND $links AS row
+MATCH (alias:Person {person_id: row.alias_id})
+MATCH (canonical:Person {person_id: row.canonical_id})
+MERGE (alias)-[:ALIAS_OF {doc_id: $doc_id}]->(canonical)
+"""
+
+_MERGE_CONCEPT_ALIASES = """
+UNWIND $links AS row
+MATCH (alias:Concept {concept_id: row.alias_id})
+MATCH (canonical:Concept {concept_id: row.canonical_id})
+MERGE (alias)-[:ALIAS_OF {doc_id: $doc_id}]->(canonical)
+"""
+
 
 class GraphStoreError(RuntimeError):
     """骨架读回的前后邻不唯一。"""
@@ -255,7 +334,7 @@ def rank_related_rows(
 
 
 class GraphStore:
-    """Neo4j 薄封装：连通性检查、文档骨架、可选提及，以及只读的相关分块。"""
+    """Neo4j 薄封装：连通性检查、文档骨架、可选提及和别名，以及只读的相关分块。"""
 
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()
@@ -451,15 +530,53 @@ class GraphStore:
             session.execute_write(work)
         return len(persons), len(concepts), len(rows)
 
+    def replace_aliases(self, doc_id: str, links: Sequence[AliasLink]) -> int:
+        """替换该文档写下的 ALIAS_OF。返回准备写入的边数。
+
+        空列表也会打开驱动，只删除 `doc_id` 等于本文档的别名边。
+        不改 MENTIONS，不删除节点，也不删除其他文档的别名边。
+        端点必须已经是 Person / Concept。本方法不创建表面节点，也不回读确认。
+        """
+        persons: list[dict[str, str]] = []
+        concepts: list[dict[str, str]] = []
+        seen: set[tuple[str, str, str]] = set()
+        for link in links:
+            if link.kind not in {"person", "concept"}:
+                raise ValueError(f"文档 {doc_id} 含有未知别名种类 {link.kind}")
+            if link.alias_id == "" or link.canonical_id == "" or link.alias_id == link.canonical_id:
+                raise ValueError(f"文档 {doc_id} 含有空的或自指向的别名")
+            key = (link.kind, link.alias_id, link.canonical_id)
+            if key in seen:
+                raise ValueError(f"文档 {doc_id} 含有重复别名")
+            seen.add(key)
+            row = {"alias_id": link.alias_id, "canonical_id": link.canonical_id}
+            if link.kind == "person":
+                persons.append(row)
+            else:
+                concepts.append(row)
+
+        def work(tx: Any) -> None:
+            tx.run(_DELETE_DOC_ALIASES, doc_id=doc_id).consume()
+            if persons:
+                tx.run(_MERGE_PERSON_ALIASES, links=persons, doc_id=doc_id).consume()
+            if concepts:
+                tx.run(_MERGE_CONCEPT_ALIASES, links=concepts, doc_id=doc_id).consume()
+
+        with self.driver.session() as session:
+            session.execute_write(work)
+        return len(persons) + len(concepts)
+
     def related_chunks(
         self,
         chunk_ids: Sequence[str],
         *,
         doc_id: str | None,
+        aliases: bool = False,
     ) -> tuple[RelatedChunk, ...]:
         """只读前后块和同人物、同概念的其他分块。空输入不打开驱动。
 
-        不建约束，也不写节点。排序和 8 条上限在进程内完成。
+        `aliases` 为假时使用不含 ALIAS_OF 的语句。为真时额外走一跳别名，
+        每支路最多 4 条。不建约束，也不写节点。排序和 8 条上限在进程内完成。
         """
         unique: list[str] = []
         seen: set[str] = set()
@@ -469,9 +586,10 @@ class GraphStore:
                 unique.append(chunk_id)
         if not unique:
             return ()
+        statement = _RELATED_CHUNKS_ALIASES if aliases else _RELATED_CHUNKS
 
         def work(tx: Any) -> list[dict[str, Any]]:
-            result = tx.run(_RELATED_CHUNKS, chunk_ids=unique, doc_id=doc_id)
+            result = tx.run(statement, chunk_ids=unique, doc_id=doc_id)
             return [
                 {
                     "chunk_id": record["chunk_id"],
