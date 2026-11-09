@@ -256,7 +256,7 @@ python -m masskb search "质量" --graph-hops --aliases
 - `--graph-hops` 发生在截成 `top_k` 之后、`--rerank` 之前。它只读已有的 `NEXT_CHUNK` 和 `MENTIONS`，不建约束，也不调用 APOC。每个种子的前后块最多 2 条，人物和概念各最多 8 条，进程内再留 8 个候选。`top_k` 大于等于 2 且候选有正文时，最多用 1 条替换排名最后的种子；列表还没满时则接在种子后面，不超过 `top_k`。`top_k` 为 1 时不替换。扩展命中的 `graph_via` 是 `mention`、`next_chunk` 或 `mention+next_chunk`。重排关闭时它的 `score` 为 `0`，`score_kind` 不变。没跑过 `--entities` 时提及支路为空，只可能扩出前后块。图查询或按 id 取正文失败时，命中保持向量原列表，`graph_hops.ok` 为 `false`，`graph_hops.aliases` 为 `false`，进程退出码为 0。没有种子 `chunk_id` 时不连接 Neo4j，`graph_hops.error` 为 `no_hits`。关闭时 `graph_hops.skipped` 为 `true`，`found` 和 `expanded` 为 `null`。
 - `--aliases` 只在 `--graph-hops` 也打开、并且这次扩展成功时，把 `graph_hops.aliases` 设为 `true`。查询在原有三支之外，为人物和概念各加一支一跳 `ALIAS_OF`，每支最多 4 条。不沿第二跳，也不按别名边上的 `doc_id` 收窄。因此未加 `--doc-id` 时，别的文档里只通过别名相连的分块可以进入候选；这就是全局表面节点带来的跨文档误合并。加了 `--doc-id` 时，候选分块仍须属于该文档。默认语句不含 `ALIAS_OF`。
 - `--rerank` 作用在图扩展之后的命中上，发生在补邻和 `--answer` 之前。提示词只含用户原文和这些命中的 `chunk_id` 与正文。成功时 `mode` 不变，`score_kind` 为 `rerank`，`score` 改为 `1/名次`（第 1 条是 `1.0`，第 2 条是 `0.5`），`dense_score`、`sparse_score`、`dense_rank`、`sparse_rank` 保留重排前的值。纯稠密路径这四项仍是 `null`，原来的余弦不再留在 `score` 里。未知 `chunk_id` 会丢掉，没被点到的 id 按原顺序接在后面。没有可排序的命中时不调用模型，`rerank.error` 为 `no_hits`。JSON 非法或聊天失败时保持原顺序和原分数，`rerank.ok` 为 `false`，进程退出码为 0。关闭该开关时 `rerank.skipped` 为 `true`，不会创建聊天客户端。
-- 结果里有 `graph`，包含 `ok`、`skipped` 和 `error`。没有命中时不连接 Neo4j，也不发稀疏查询，`graph.skipped` 为 `true`。Neo4j 补邻接失败时，`hits` 仍在，邻接字段为 `null`，`graph.ok` 为 `false`，进程退出码为 0。
+- 结果里有 `graph`，包含 `ok`、`skipped` 和 `error`。没有命中时不连接 Neo4j，也不发稀疏查询，`graph.skipped` 为 `true`。Neo4j 补邻接失败时，`hits` 仍在，邻接字段为 `null`，`graph.ok` 为 `false`，进程退出码为 0。补邻和 `--graph-hops` 的读会话把连接获取时间设为 2 秒、托管事务重试时间设为 0。2 秒只限制这一次读在建立 Bolt 连接和握手上的等待，不限制连上之后服务端执行查询的时间。默认检索只有补邻这一次；打开 `--graph-hops` 时，相关分块再单独计算一次。写入事务仍使用驱动默认的重试和连接获取预算。
 - `--answer` 成功时，`answer.text` 是回答，`answer.citations` 是本次命中 `chunk_id` 的子集，`answer.model` 是 `LLM_MODEL`。没有命中、模型输出不是合法 JSON，或引用都被丢掉时，`answer.text` 为 `null`，命中列表仍然保留，进程退出码为 0。关闭该开关时 `answer.skipped` 为 `true`，不会创建聊天客户端。
 - 查询使用当前的 `EMBEDDING_MODEL`，需要和入库时是同一个模型，并且维度等于 `EMBEDDING_DIMENSIONS`（默认 1536）。
 - 集合不存在、集合里没有点，或过滤后没有命中时，`hits` 为空数组，进程退出码为 0。Qdrant 连不上、API Key 缺失或只是占位符、向量维度或集合配置与约定不符时，错误打到标准错误，退出码为 1。
@@ -363,7 +363,16 @@ python -m pip install -e ".[dev,api]"
 python -m pytest
 ```
 
-测试不连接 Qdrant、Neo4j，也不会访问 OpenAI，也不绑定端口，不下载嵌入模型，也不需要 GPU。HTTP 测试使用 `TestClient`，不执行查询页脚本。浏览器里的点击检查要单独做，而且替身接口不等于真实检索。
+默认 `pytest` 不探测、不写入已有数据库，也不访问 OpenAI，不下载嵌入模型，也不需要 GPU。图读超时里的拒绝连接测试只访问 `127.0.0.1:1`，握手测试只占用一个临时本地端口。HTTP 测试使用 `TestClient`，不执行查询页脚本。浏览器里的点击检查要单独做，而且替身接口不等于真实检索。
+
+要对空的临时 Neo4j 做显式图读集成，才传入下面的 pytest 选项。它会在该库确保 masskb 约束存在，写入本次唯一的文档、分块和人物，读完后只删除这些节点。未传入 `--graph-read-bolt` 时该用例跳过，并且不打开套接字。
+
+```bash
+python -m pytest tests/test_graph_read_timeout.py \
+  --graph-read-bolt bolt://127.0.0.1:17687 \
+  --graph-read-user neo4j \
+  --graph-read-password '<临时库密码>'
+```
 
 ## 配置
 
@@ -470,7 +479,8 @@ masskb/
 | `tests/test_rerank.py` | 重排提示词只含命中正文和 `chunk_id`；未知 id 丢弃，缺失 id 按原顺序补上；非法 JSON 与错误形状。不创建外部客户端 |
 | `tests/test_entities.py` | 名称规范化、子串过滤、停用词、每类 8 条、稳定 `entity_id`、非法 JSON。不创建外部客户端 |
 | `tests/test_aliases.py` | 别名开关组合、只接受本次名单、不传递、人物与概念分开、8 对上限、非法 JSON。不创建外部客户端 |
-| `tests/test_stores.py` | 两个存储的健康检查成功、失败和 `close`；集合创建含 `bm25`、缺槽或 modifier 不符时不删除、分批 upsert、同一点的稠密与稀疏、按 `doc_id` 删除、近邻与稀疏查询、按 `chunk_id` 读 payload；骨架约束、MERGE、删除和前后邻。人物与概念约束单独创建；提及替换使用 MERGE。骨架更新、文档删除和提及替换都不会拆掉仍连着 `ALIAS_OF` 的表面节点。别名写入只替换该 `doc_id` 的边，并在同一事务里清掉随后已经空掉的节点。打开别名时只多走一跳，且不按边的 `doc_id` 过滤。空输入不打开驱动 |
+| `tests/test_stores.py` | 两个存储的健康检查成功、失败和 `close`；集合创建含 `bm25`、缺槽或 modifier 不符时不删除、分批 upsert、同一点的稠密与稀疏、按 `doc_id` 删除、近邻与稀疏查询、按 `chunk_id` 读 payload；骨架约束、MERGE、删除和前后邻。人物与概念约束单独创建；提及替换使用 MERGE。骨架更新、文档删除和提及替换都不会拆掉仍连着 `ALIAS_OF` 的表面节点。别名写入只替换该 `doc_id` 的边，并在同一事务里清掉随后已经空掉的节点。打开别名时只多走一跳，且不按边的 `doc_id` 过滤。空输入不打开驱动。图读会话带有界的连接获取和重试；写入会话不带 |
+| `tests/test_graph_read_timeout.py` | 默认只跑离线部分：读会话不改变同一驱动的写入预算；`127.0.0.1:1` 拒绝连接时读失败要快，健康检查仍是失败；本机套接字接受 TCP 后不完成握手时，等待落在连接获取期限附近。显式传入 `--graph-read-bolt` 才连接该地址，用本次唯一 id 写入并读取前后邻和相关分块，清理只删除这些节点。默认 `pytest` 不探测、不写入已有库 |
 | `tests/test_pipeline.py` | 离线健康检查、任一侧失败；向量写入的探测、稀疏编码、维度中止、分批、重复写入与空文件；检索的空集合、过滤、维度与缺 Key；混合融合与稀疏失败；改写在 embedding 之前，失败改用原文；图扩展在截断之后、重排之前，失败保留向量命中；重排在图扩展之后、补邻之前，失败保持原顺序；回答引用、无命中不调用模型；向量成功后再写图，图失败不回滚 Qdrant，邻接失败仍返回命中。`--entities` 在骨架之后抽取；失败不改已有提及。别名模型、解析或写入失败仍提交提及，且不改已有别名边。未加 `doc_id` 时别名扩展可以走到另一篇文档的表面名；加上之后换入的分块仍须属于该文档。`ask` 转发检索开关（含 `graph_hops` 与 `aliases`）且固定不生成检索回答，引用只来自本轮命中，步数不超过 `max_steps` |
 | `tests/test_ingest.py` | 空文件、短文件、超长段、重叠、Markdown 标题、同一路径重复切分 id 不变 |
 | `tests/test_api.py` | `GET /`、`GET /health`、`POST /search`、`POST /ask` 与 `POST /ingest` 的状态码、`asdict` 正文、校验失败、软失败和 `close()`。`GET /` 返回包内查询页且不调用管线。TestClient 不执行页面脚本。dry-run 不调用 `pipeline.ingest`。不绑定端口。`rewrite`、`graph_hops` 与 `aliases` 默认 false。别名软失败仍是 200。非法别名开关是 422 且不调用管线。`POST /search` 不接受 `agent` 字段 |
@@ -483,7 +493,7 @@ masskb/
 - 推送到 `main`
 - 任意 Pull Request
 
-作业在 `ubuntu-latest` 上使用 Python 3.12，执行 `pip install -e ".[dev,api]"` 和 `python -m pytest`。CI 不启动 Docker，也不构建应用镜像，也不运行 `ruff`。本地若要检查风格，可在安装开发依赖后执行 `ruff check`。
+作业在 `ubuntu-latest` 上使用 Python 3.12，执行 `pip install -e ".[dev,api]"` 和 `python -m pytest`。CI 不启动 Docker，也不构建应用镜像，也不运行 `ruff`，也不传入 `--graph-read-bolt`。本地若要检查风格，可在安装开发依赖后执行 `ruff check`。
 
 ## 许可证
 

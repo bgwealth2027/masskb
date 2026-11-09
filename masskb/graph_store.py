@@ -346,6 +346,19 @@ def rank_related_rows(
     return tuple(ranked[:limit])
 
 
+# 只传给补邻和相关分块的 session()。Neo4j 驱动 5.14 与 6.4 里，这两个键在
+# WorkspaceConfig 上，SessionConfig 继承它们，session() 接受，并且只覆盖这一次会话。
+# connection_timeout 在 PoolConfig 上，传给 session() 会 ConfigurationError，所以不传。
+# 驱动把这次 TCP 连接和 Bolt 握手的等待收成获取期限与池连接超时的较小值。
+# 连接建立之后，Cypher 在服务端跑多久不受这个数限制，也没有单独的服务端事务超时。
+# 重试时间为 0，读事务不会进入默认的指数退避。那套默认预算是 30 秒，而且下一次睡眠
+# 不按剩余时间截断，对立刻拒绝的端口实测大约要 62 秒。
+# 两次读各自开会话：默认检索只有 neighbor_chunk_ids；graph_hops 再调用 related_chunks。
+# 写入、约束和健康检查仍用没有这些参数的 session()，驱动默认仍是 30 秒重试、60 秒获取。
+READ_CONNECTION_ACQUISITION_TIMEOUT = 2.0
+READ_MAX_TRANSACTION_RETRY_TIME = 0.0
+
+
 class GraphStore:
     """Neo4j 薄封装：连通性检查、文档骨架、可选提及和别名，以及只读的相关分块。"""
 
@@ -363,6 +376,13 @@ class GraphStore:
                 auth=(self.settings.neo4j_user, self.settings.neo4j_password),
             )
         return self._driver
+
+    def _read_session(self):
+        """补邻和相关分块使用的读会话。同一个驱动上的写入会话不走这里。"""
+        return self.driver.session(
+            connection_acquisition_timeout=READ_CONNECTION_ACQUISITION_TIMEOUT,
+            max_transaction_retry_time=READ_MAX_TRANSACTION_RETRY_TIME,
+        )
 
     def healthcheck(self) -> dict[str, Any]:
         """检查 Neo4j Bolt 是否可用。成功返回 {"ok": True, ...}。"""
@@ -471,7 +491,7 @@ class GraphStore:
                 for record in result
             ]
 
-        with self.driver.session() as session:
+        with self._read_session() as session:
             rows = session.execute_read(work)
 
         found: dict[str, tuple[str | None, str | None]] = {}
@@ -615,7 +635,7 @@ class GraphStore:
                 for record in result
             ]
 
-        with self.driver.session() as session:
+        with self._read_session() as session:
             rows = session.execute_read(work)
         return rank_related_rows(rows, seeds=unique)
 
