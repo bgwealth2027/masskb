@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import argparse
 import sys
 from pathlib import Path
 
@@ -17,8 +18,7 @@ _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from masskb.__main__ import cmd_healthcheck  # noqa: E402
-import argparse  # noqa: E402
+from masskb.__main__ import cmd_healthcheck
 
 
 def main() -> int:

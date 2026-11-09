@@ -459,8 +459,8 @@ def build_parser() -> argparse.ArgumentParser:
         "serve",
         help='启动 HTTP（需要 pip install -e ".[api]"）',
         description=(
-            "启动 HTTP：GET /health、POST /search、POST /ask 与 POST /ingest。"
-            "CLI 入库仍可使用 ingest 子命令。"
+            "启动 HTTP：GET / 为本机查询页，另有 GET /health、POST /search、POST /ask 与 POST /ingest。"
+            "查询页不改变这些接口的默认参数。CLI 入库仍可使用 ingest 子命令。"
             '需要 pip install -e ".[api]"。'
         ),
     )

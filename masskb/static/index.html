@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MassKB 查询</title>
+  <style>
+    body {
+      margin: 2rem auto;
+      max-width: 40rem;
+      padding: 0 1rem 3rem;
+      font-family: sans-serif;
+      line-height: 1.5;
+    }
+    input[type="search"] {
+      width: 100%;
+      box-sizing: border-box;
+      font: inherit;
+      padding: 0.4rem 0.5rem;
+    }
+    button { font: inherit; margin-top: 0.75rem; }
+    #status[data-state="error"] { font-weight: 700; }
+    .hit-text, #answer-text, #status, #service-status {
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>MassKB 查询</h1>
+    <p>本机页面，默认只检索。</p>
+    <p id="service-status" role="status">正在检查服务</p>
+    <form id="query-form" action="/" method="get">
+      <label for="query">查询</label>
+      <input id="query" name="query" type="search" autocomplete="off" spellcheck="false">
+      <p id="answer-unavailable" hidden>未配置回答，这次只检索。</p>
+      <div id="answer-control" hidden>
+        <label for="answer">
+          <input id="answer" type="checkbox">
+          生成回答
+        </label>
+        <p id="answer-note">已配置回答；默认不生成。配置存在不表示回答会成功。</p>
+      </div>
+      <button id="submit" type="submit">检索</button>
+    </form>
+    <p id="status" role="status" aria-live="polite"></p>
+    <section id="answer-section" hidden>
+      <h2>回答</h2>
+      <p id="answer-text"></p>
+      <div id="citation-block" hidden>
+        <h3>引用</h3>
+        <ul id="citations"></ul>
+      </div>
+    </section>
+    <section id="hits-section" hidden>
+      <h2>命中</h2>
+      <p id="empty" hidden>没有命中</p>
+      <ol id="hits"></ol>
+    </section>
+  </main>
+  <noscript><p>这个页面需要 JavaScript 才能查询。</p></noscript>
+  <script>
+    "use strict";
+    var form = document.getElementById("query-form");
+    var queryInput = document.getElementById("query");
+    var answerBox = document.getElementById("answer");
+    var answerControl = document.getElementById("answer-control");
+    var answerUnavailable = document.getElementById("answer-unavailable");
+    var submitButton = document.getElementById("submit");
+    var serviceStatus = document.getElementById("service-status");
+    var statusEl = document.getElementById("status");
+    var answerSection = document.getElementById("answer-section");
+    var answerText = document.getElementById("answer-text");
+    var citationBlock = document.getElementById("citation-block");
+    var citations = document.getElementById("citations");
+    var hitsSection = document.getElementById("hits-section");
+    var emptyEl = document.getElementById("empty");
+    var hitsEl = document.getElementById("hits");
+    var inflight = false;
+    var answerAvailable = false;
+
+    function asText(value) {
+      return typeof value === "string" ? value : "";
+    }
+
+    function setStatus(text, state) {
+      statusEl.textContent = text;
+      if (state) {
+        statusEl.dataset.state = state;
+      } else {
+        delete statusEl.dataset.state;
+      }
+    }
+
+    function setBusy(busy) {
+      inflight = busy;
+      submitButton.disabled = busy;
+      queryInput.disabled = busy;
+      answerBox.disabled = busy || !answerAvailable;
+      submitButton.setAttribute("aria-busy", busy ? "true" : "false");
+    }
+
+    function applyAnswerAvailability(configured) {
+      answerAvailable = configured;
+      answerControl.hidden = !configured;
+      answerUnavailable.hidden = configured;
+      if (!configured) {
+        answerBox.checked = false;
+      }
+      answerBox.disabled = inflight || !configured;
+    }
+
+    function clearResults() {
+      answerSection.hidden = true;
+      answerText.textContent = "";
+      citations.replaceChildren();
+      citationBlock.hidden = true;
+      hitsSection.hidden = true;
+      emptyEl.hidden = true;
+      hitsEl.replaceChildren();
+    }
+
+    function renderHits(hits) {
+      var ids = new Set();
+      hitsEl.replaceChildren();
+      hitsSection.hidden = false;
+      if (hits.length === 0) {
+        emptyEl.hidden = false;
+        return ids;
+      }
+      emptyEl.hidden = true;
+      hits.forEach(function (hit) {
+        var item = hit && typeof hit === "object" ? hit : {};
+        var chunkId = asText(item.chunk_id);
+        var li = document.createElement("li");
+        var source = document.createElement("p");
+        var chunk = document.createElement("p");
+        var body = document.createElement("p");
+        source.textContent = "来源：" + asText(item.source);
+        chunk.textContent = "分块：" + chunkId;
+        body.className = "hit-text";
+        body.textContent = asText(item.text);
+        li.appendChild(source);
+        li.appendChild(chunk);
+        li.appendChild(body);
+        hitsEl.appendChild(li);
+        if (chunkId !== "") {
+          ids.add(chunkId);
+        }
+      });
+      return ids;
+    }
+
+    function renderAnswer(answer, hitIds, requested) {
+      answerSection.hidden = true;
+      answerText.textContent = "";
+      citations.replaceChildren();
+      citationBlock.hidden = true;
+      if (!requested) {
+        return true;
+      }
+      answerSection.hidden = false;
+      var failed = !answer
+        || answer.ok !== true
+        || answer.skipped === true
+        || typeof answer.text !== "string"
+        || answer.text === "";
+      if (failed) {
+        var reason = answer && typeof answer.error === "string" && answer.error !== ""
+          ? answer.error
+          : "未返回回答";
+        answerText.textContent = "回答失败：" + reason;
+        return false;
+      }
+      answerText.textContent = answer.text;
+      var cited = Array.isArray(answer.citations) ? answer.citations : [];
+      var shown = 0;
+      cited.forEach(function (id) {
+        if (typeof id !== "string" || id === "" || !hitIds.has(id)) {
+          return;
+        }
+        var li = document.createElement("li");
+        li.textContent = id;
+        citations.appendChild(li);
+        shown += 1;
+      });
+      if (shown === 0) {
+        var none = document.createElement("li");
+        none.textContent = "没有引用";
+        citations.appendChild(none);
+      }
+      citationBlock.hidden = false;
+      return true;
+    }
+
+    function describeHealth(response, payload) {
+      var configured = Boolean(payload && payload.openai_key_configured === true);
+      applyAnswerAvailability(configured);
+      if (payload && payload.ok === false) {
+        serviceStatus.textContent = "数据库未就绪，仍可尝试检索。";
+        return;
+      }
+      if (!response.ok) {
+        serviceStatus.textContent = payload && typeof payload.detail === "string" && payload.detail !== ""
+          ? payload.detail
+          : "服务检查失败，仍可尝试检索。";
+        return;
+      }
+      serviceStatus.textContent = configured
+        ? "服务可用。已配置回答；默认不生成。配置存在不表示回答会成功。"
+        : "服务可用。未配置回答，这次只检索。";
+    }
+
+    async function loadHealth() {
+      serviceStatus.textContent = "正在检查服务";
+      try {
+        var response = await fetch("/health", { headers: { accept: "application/json" } });
+        var payload = null;
+        try {
+          payload = await response.json();
+        } catch (error) {
+          payload = null;
+        }
+        describeHealth(response, payload);
+      } catch (error) {
+        applyAnswerAvailability(false);
+        serviceStatus.textContent = "无法连接服务。";
+      }
+    }
+
+    form.addEventListener("submit", async function (event) {
+      event.preventDefault();
+      if (inflight) {
+        return;
+      }
+      var query = queryInput.value;
+      if (query.trim() === "") {
+        setStatus("查询不能为空", "error");
+        return;
+      }
+      var wantAnswer = answerAvailable && answerBox.checked;
+      setBusy(true);
+      clearResults();
+      setStatus("正在检索", "loading");
+      try {
+        var response = await fetch("/search", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            accept: "application/json"
+          },
+          body: JSON.stringify({
+            query: query,
+            top_k: 5,
+            doc_id: null,
+            hybrid: false,
+            answer: wantAnswer,
+            rerank: false,
+            rewrite: false,
+            graph_hops: false,
+            aliases: false
+          })
+        });
+        var payload = null;
+        try {
+          payload = await response.json();
+        } catch (error) {
+          payload = null;
+        }
+        if (!response.ok) {
+          var detail = payload && typeof payload.detail === "string" && payload.detail !== ""
+            ? payload.detail
+            : "检索失败（HTTP " + response.status + "）";
+          setStatus(detail, "error");
+          return;
+        }
+        if (!payload || typeof payload !== "object" || !Array.isArray(payload.hits)) {
+          setStatus("检索失败", "error");
+          return;
+        }
+        var hitIds = renderHits(payload.hits);
+        var answerOk = renderAnswer(payload.answer, hitIds, wantAnswer);
+        setStatus(answerOk ? "检索完成" : "检索完成，回答失败", answerOk ? "ok" : "error");
+      } catch (error) {
+        setStatus("无法连接服务", "error");
+      } finally {
+        setBusy(false);
+      }
+    });
+
+    loadHealth();
+  </script>
+</body>
+</html>
