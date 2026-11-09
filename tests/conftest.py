@@ -24,6 +24,41 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         default="",
         help="与 --graph-read-bolt 一起使用的密码。不是产品配置。",
     )
+    parser.addoption(
+        "--live-qdrant",
+        default="",
+        help="显式全链路使用的 Qdrant HTTP 地址。默认空，不探测、不写入。",
+    )
+    parser.addoption(
+        "--live-bolt",
+        default="",
+        help="显式全链路使用的 Neo4j Bolt 地址。默认空，不探测、不写入。",
+    )
+    parser.addoption(
+        "--live-neo4j-user",
+        default="neo4j",
+        help="与 --live-bolt 一起写入隔离 Settings 的用户名。",
+    )
+    parser.addoption(
+        "--live-neo4j-password",
+        default="",
+        help="与 --live-bolt 一起写入隔离 Settings 的密码。",
+    )
+    parser.addoption(
+        "--live-embed",
+        default="",
+        help="显式全链路使用的嵌入 API 根，含 /v1。默认空，不探测。",
+    )
+    parser.addoption(
+        "--live-embedding-model",
+        default="BAAI/bge-small-zh-v1.5",
+        help="与 --live-embed 一起写入隔离 Settings 的模型名。",
+    )
+    parser.addoption(
+        "--live-embedding-dimensions",
+        default="",
+        help="与 --live-embed 一起写入隔离 Settings 的向量维度。",
+    )
 
 
 @pytest.fixture(autouse=True)
