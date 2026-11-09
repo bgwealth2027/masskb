@@ -9,7 +9,8 @@ services:
   qdrant:
     image: qdrant/qdrant:v1.20.0
     container_name: masskb-public-qdrant
-    volumes:
+    ports: !override []
+    volumes: !override
       - qdrant_public:/qdrant/storage
     restart: unless-stopped
     healthcheck:
@@ -22,11 +23,13 @@ services:
   neo4j:
     image: neo4j:5.26.18
     container_name: masskb-public-neo4j
-    entrypoint: ["/bin/bash", "/reject-default-password.sh"]
+    entrypoint: ["/bin/sh", "/reject-default-password.sh"]
+    command: ["--neo4j"]
     environment:
       NEO4J_DEV_PASSWORD: ${NEO4J_DEV_PASSWORD:?必须设置 NEO4J_DEV_PASSWORD}
       NEO4J_AUTH: neo4j/${NEO4J_DEV_PASSWORD:?必须设置 NEO4J_DEV_PASSWORD}
-    volumes:
+    ports: !override []
+    volumes: !override
       - neo4j_public:/data
       - neo4j_public_logs:/logs
       - ./deploy/public/neo4j-entrypoint.sh:/reject-default-password.sh:ro
@@ -42,10 +45,12 @@ services:
     image: masskb-embed:local
     build: ./embed
     container_name: masskb-public-embed
+    profiles: !override []
     environment:
       EMBEDDING_MODEL: BAAI/bge-small-zh-v1.5
       HF_HOME: /cache
-    volumes:
+    ports: !override []
+    volumes: !override
       - embed_public_cache:/cache
     restart: unless-stopped
     healthcheck:
@@ -59,7 +64,11 @@ services:
     image: masskb-app:local
     build: .
     container_name: masskb-public-app
+    entrypoint: ["/bin/sh", "/reject-default-password.sh"]
     command: ["masskb", "serve", "--host", "0.0.0.0", "--port", "8080"]
+    ports: !override []
+    volumes: !override
+      - ./deploy/public/neo4j-entrypoint.sh:/reject-default-password.sh:ro
     environment:
       QDRANT_URL: http://qdrant:6333
       NEO4J_URI: bolt://neo4j:7687
@@ -88,10 +97,13 @@ services:
 
   gate:
     image: masskb-app:local
+    entrypoint: ["/bin/sh", "/reject-default-password.sh"]
     command: ["masskb", "gate", "--host", "0.0.0.0", "--port", "8080", "--upstream", "http://app:8080"]
     container_name: masskb-public-gate
-    ports:
+    ports: !override
       - "127.0.0.1:8088:8080"
+    volumes: !override
+      - ./deploy/public/neo4j-entrypoint.sh:/reject-default-password.sh:ro
     depends_on:
       app:
         condition: service_healthy
@@ -101,8 +113,11 @@ services:
     image: masskb-app:local
     profiles:
       - ingest
-    volumes:
-      - ./examples/public:/sample:ro
+    entrypoint: ["/bin/sh", "/reject-default-password.sh"]
+    ports: !override []
+    volumes: !override
+      - ./masskb/samples:/sample:ro
+      - ./deploy/public/neo4j-entrypoint.sh:/reject-default-password.sh:ro
     command: ["masskb", "ingest", "/sample", "--root", "/sample"]
     environment:
       QDRANT_URL: http://qdrant:6333

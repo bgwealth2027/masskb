@@ -198,16 +198,19 @@ def test_public_compose_file_has_no_internal_ports() -> None:
     blocks = _service_blocks(text)
     assert set(blocks) == {"qdrant", "neo4j", "embed", "app", "gate", "sample-ingest"}
     for name in ("qdrant", "neo4j", "embed", "app", "sample-ingest"):
-        assert not _ports_key(blocks[name]), name
+        assert "ports: !override []" in blocks[name]
+        assert "8088" not in blocks[name]
     gate = blocks["gate"]
-    assert _ports_key(gate)
     assert "127.0.0.1:8088:8080" in gate
     assert "0.0.0.0:" not in gate
     assert "masskb-dev-pass" not in text
     assert ":-masskb-dev-pass" not in text
     assert text.count("${NEO4J_DEV_PASSWORD:?必须设置 NEO4J_DEV_PASSWORD}") >= 4
     assert "/reject-default-password.sh" in blocks["neo4j"]
-    assert "examples/public:/sample:ro" in blocks["sample-ingest"]
+    for name in ("neo4j", "app", "gate", "sample-ingest"):
+        assert "/bin/sh" in blocks[name]
+        assert "reject-default-password.sh" in blocks[name]
+    assert "masskb/samples:/sample:ro" in blocks["sample-ingest"]
     assert "masskb ingest /sample --root /sample" in _flat(blocks["sample-ingest"])
     assert "profiles:" in blocks["sample-ingest"]
     assert "http://embed:8080/v1" in blocks["app"]
@@ -247,6 +250,23 @@ def test_public_password_script_rejects_default_and_accepts_other() -> None:
     assert completed.returncode == 0, completed.stderr
     assert "public-sample-pass" not in completed.stdout
     assert "public-sample-pass" not in completed.stderr
+    blocked = subprocess.run(
+        ["sh", str(script), "python3", "-c", "raise SystemExit(0)"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "NEO4J_DEV_PASSWORD": "masskb-dev-pass"},
+    )
+    assert blocked.returncode == 1
+    assert "拒绝空密码或默认开发密码" in blocked.stderr
+    allowed = subprocess.run(
+        ["sh", str(script), "python3", "-c", "raise SystemExit(0)"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "NEO4J_DEV_PASSWORD": "public-sample-pass"},
+    )
+    assert allowed.returncode == 0, allowed.stderr
 
 
 def test_public_compose_config_render_when_cli_exists() -> None:
@@ -293,6 +313,33 @@ def test_public_compose_config_render_when_cli_exists() -> None:
     )
     assert refused.returncode != 0
     assert "NEO4J_DEV_PASSWORD" in refused.stderr
+    merged_command = [command[0], "compose", "-f", "docker-compose.yml", "-f", "docker-compose.public.yml", "config"] if docker is not None else [standalone, "-f", "docker-compose.yml", "-f", "docker-compose.public.yml", "config"]
+    merged = subprocess.run(
+        merged_command,
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert merged.returncode == 0, merged.stderr
+    merged_text = merged.stdout
+    assert "qdrant_data:" not in merged_text
+    assert "embed_cache:" not in merged_text
+    for internal in ("6333", "6334", "7474", "7687", "8081"):
+        assert f'published: "{internal}"' not in merged_text
+    up_command = [command[0], "compose", "-f", "docker-compose.public.yml", "up", "-d"] if docker is not None else [standalone, "-f", "docker-compose.public.yml", "up", "-d"]
+    started = subprocess.run(
+        up_command,
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=20,
+    )
+    assert started.returncode != 0
+    assert "masskb-public-qdrant" not in started.stdout
 
 
 def test_embed_dockerfile_is_separate_from_the_app() -> None:

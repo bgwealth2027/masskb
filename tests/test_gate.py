@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import socket
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -19,8 +20,9 @@ from masskb.gate import (
     GateConfig,
     GateError,
     bind_gate,
+    load_sample_catalog,
     normalize_upstream,
-    public_search_hits,
+    project_sample_hits,
 )
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -37,6 +39,7 @@ class _Upstream:
         self.hold.set()
         self.health_status = 200
         self.search_status = 200
+        self.catalog = load_sample_catalog()
         self.health_body: dict[str, Any] = {
             "ok": True,
             "qdrant": {
@@ -105,6 +108,59 @@ class _Upstream:
             },
         }
 
+    def search_payload(self, body: bytes) -> dict[str, Any]:
+        try:
+            requested = json.loads(body.decode("utf-8"))
+        except json.JSONDecodeError:
+            return {"hits": []}
+        doc_id = requested.get("doc_id") if isinstance(requested, dict) else None
+        if not isinstance(doc_id, str):
+            return {
+                "query": "被改写的查询",
+                "hits": [
+                    {
+                        "score": 0.99,
+                        "text": _PRIVATE,
+                        "source": "/tmp/secret/notes.md",
+                        "chunk_id": _CHUNK,
+                        "doc_id": "private-doc",
+                    }
+                ],
+                "graph": {"ok": False, "error": _GRAPH_ERROR},
+            }
+        hits: list[dict[str, Any]] = [
+            {
+                "score": 0.99,
+                "text": _PRIVATE,
+                "source": "qingpingguo.md",
+                "chunk_id": _CHUNK,
+                "doc_id": doc_id,
+            }
+        ]
+        for item in self.catalog:
+            if item.doc_id != doc_id:
+                continue
+            hits.append(
+                {
+                    "score": 0.2,
+                    "text": _PRIVATE,
+                    "source": item.source,
+                    "chunk_id": item.chunk_id,
+                    "doc_id": item.doc_id,
+                }
+            )
+            hits.append(
+                {
+                    "score": 0.1,
+                    "text": item.text,
+                    "source": item.source,
+                    "chunk_id": item.chunk_id,
+                    "doc_id": item.doc_id,
+                    "graph": {"error": _GRAPH_ERROR},
+                }
+            )
+        return {"query": "被改写的查询", "hits": hits, "graph": {"error": _GRAPH_ERROR}}
+
     def record(self, method: str, path: str, headers: dict[str, str], body: bytes) -> None:
         with self.lock:
             self.requests.append(
@@ -133,14 +189,14 @@ def _handler(state: _Upstream) -> type[BaseHTTPRequestHandler]:
         def _take(self, method: str, body: bytes) -> None:
             headers = {key.lower(): value for key, value in self.headers.items()}
             state.record(method, self.path, headers, body)
-            if not state.hold.wait(5):
+            if not state.hold.wait(30):
                 self._send(504, {"detail": "held"})
                 return
             if method == "GET" and self.path == "/health":
                 self._send(state.health_status, state.health_body)
                 return
             if method == "POST" and self.path == "/search":
-                self._send(state.search_status, state.search_body)
+                self._send(state.search_status, state.search_payload(body))
                 return
             self._send(404, {"error": f"unexpected {method} {self.path}"})
 
@@ -261,7 +317,7 @@ def stack():
 
 
 def test_sample_files_are_the_allowlist_and_have_no_secrets() -> None:
-    directory = ROOT / "examples" / "public"
+    directory = ROOT / "masskb" / "samples"
     names = {path.name for path in directory.iterdir() if path.is_file()}
     assert names == set(PUBLIC_SAMPLE_SOURCES)
     for path in directory.iterdir():
@@ -330,14 +386,14 @@ def test_health_and_search_are_whitelisted(stack) -> None:
     )
     assert status == 200
     assert set(found) == {"query", "hits"}
+    assert "answer" not in found
+    assert "graph" not in found
     assert found["query"] == "青苹果"
+    catalog = load_sample_catalog()
     assert found["hits"] == [
-        {
-            "source": "qingpingguo.md",
-            "chunk_id": _CHUNK,
-            "text": "青苹果长在虚构果园的东边。",
-        }
+        {"source": item.source, "chunk_id": item.chunk_id, "text": item.text} for item in catalog
     ]
+    assert len(found["hits"]) == 4
     encoded = json.dumps(found, ensure_ascii=False)
     for secret in (
         _PRIVATE,
@@ -349,16 +405,21 @@ def test_health_and_search_are_whitelisted(stack) -> None:
         "super-secret-token",
     ):
         assert secret not in encoded
-    assert state.count("/search") == 1
-    recorded = state.requests[-1]
-    assert recorded["path"] == "/search"
-    forwarded = json.loads(recorded["body"].decode())
-    assert forwarded["answer"] is False
-    assert forwarded["query"] == "青苹果"
-    headers = recorded["headers"]
-    assert headers["host"].startswith("127.0.0.1:")
-    for banned in ("authorization", "cookie", "x-forwarded-for", "x-api-key"):
-        assert banned not in headers
+    searches = [item for item in state.requests if item["path"] == "/search"]
+    assert len(searches) == len({item.doc_id for item in catalog})
+    forwarded_ids = []
+    for recorded in searches:
+        forwarded = json.loads(recorded["body"].decode())
+        assert forwarded["answer"] is False
+        assert forwarded["query"] == "青苹果"
+        assert forwarded["doc_id"] in {item.doc_id for item in catalog}
+        forwarded_ids.append(forwarded["doc_id"])
+        headers = recorded["headers"]
+        assert headers["host"].startswith("127.0.0.1:")
+        for banned in ("authorization", "cookie", "x-forwarded-for", "x-api-key", "x-original-url"):
+            assert banned not in headers
+    assert forwarded_ids == list(dict.fromkeys(item.doc_id for item in catalog))
+    assert None not in forwarded_ids
 
 
 def test_sdk_cannot_treat_gate_health_as_serve_health(stack) -> None:
@@ -372,14 +433,27 @@ def test_sdk_cannot_treat_gate_health_as_serve_health(stack) -> None:
 
 
 def test_private_hit_with_bad_chunk_id_is_dropped() -> None:
-    hits = public_search_hits(
+    catalog = load_sample_catalog()
+    pinned = catalog[0]
+    hits = project_sample_hits(
         {
             "hits": [
-                {"source": "qingpingguo.md", "chunk_id": "not-a-hash", "text": "青苹果"},
-                {"source": "other.md", "chunk_id": _CHUNK, "text": _PRIVATE},
+                {
+                    "source": pinned.source,
+                    "chunk_id": "not-a-hash",
+                    "doc_id": pinned.doc_id,
+                    "text": pinned.text,
+                },
+                {
+                    "source": pinned.source,
+                    "chunk_id": pinned.chunk_id,
+                    "doc_id": pinned.doc_id,
+                    "text": _PRIVATE,
+                },
+                {"source": "other.md", "chunk_id": _CHUNK, "doc_id": "private", "text": _PRIVATE},
             ]
         },
-        PUBLIC_SAMPLE_SOURCES,
+        catalog,
     )
     assert hits == []
 
@@ -484,18 +558,109 @@ def test_timeout_does_not_free_the_slot_or_start_another_upstream() -> None:
         state.hold.set()
         gate.finish()
         gate = None
-        assert state.count("/search") == 1
+        # 同一次检索会按样例文档各查一次，超时后不另起一次，也不把同一个文档再查一遍。
+        assert state.count("/search") == len({item.doc_id for item in load_sample_catalog()})
         again_upstream, again_gate, again_port = _open_stack(state)
         try:
             status, found = _status_and_json(
                 _request_bytes(again_port, "POST", "/search", json.dumps(_page_body()).encode())
             )
             assert status == 200
-            assert found["hits"][0]["source"] == "qingpingguo.md"
+            assert found["hits"][0]["source"] == load_sample_catalog()[0].source
         finally:
             again_gate.finish()
             again_upstream.shutdown()
             again_upstream.server_close()
+    finally:
+        state.hold.set()
+        if gate is not None:
+            gate.finish()
+        upstream.shutdown()
+        upstream.server_close()
+
+
+def test_duplicate_keys_wrong_types_chunked_and_proxy_headers_do_not_bypass(stack) -> None:
+    state, port = stack
+    catalog = load_sample_catalog()
+    base = _page_body()
+    duplicate = (
+        '{"query":"青苹果","query":"私密","top_k":5,"doc_id":null,"hybrid":false,'
+        '"answer":false,"rerank":false,"rewrite":false,"graph_hops":false,"aliases":false}'
+    ).encode()
+    status, payload = _status_and_json(_request_bytes(port, "POST", "/search", duplicate))
+    assert status == 422
+    assert payload == {"detail": "请求无效"}
+    for bad_flag in (0, None, "false", "False"):
+        body = json.dumps(_page_body(answer=bad_flag)).encode()
+        status, payload = _status_and_json(_request_bytes(port, "POST", "/search", body))
+        assert status == 422, bad_flag
+    status, payload = _status_and_json(
+        _request_bytes(port, "POST", "/search", json.dumps(_page_body(top_k=5.0)).encode())
+    )
+    assert status == 422
+    chunked = (
+        f"POST /search HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+        "Transfer-Encoding: chunked\r\nContent-Length: 2\r\n"
+        "Content-Type: application/json\r\nConnection: close\r\n\r\n"
+        "2\r\n{}\r\n0\r\n\r\n"
+    ).encode()
+    status, payload = _status_and_json(_raw(port, chunked))
+    assert status == 422
+    for target in ("/search/../ingest", "/%2e%2e/ingest", "/search%2f..%2fingest", "/Search"):
+        raw = _request_bytes(port, "POST", target, json.dumps(base).encode())
+        assert int(raw.split()[1]) in {403, 404, 405}
+    proxied = _request_bytes(
+        port,
+        "POST",
+        "/search",
+        json.dumps(base).encode(),
+        extra="X-Original-URL: /ingest\r\nX-Forwarded-Host: evil.example\r\nForwarded: host=evil.example",
+    )
+    status, found = _status_and_json(proxied)
+    assert status == 200
+    assert found["hits"][0]["chunk_id"] in {item.chunk_id for item in catalog}
+    assert _PRIVATE not in json.dumps(found, ensure_ascii=False)
+    assert state.count("/ingest") == 0
+
+
+def test_failed_upstream_is_not_retried() -> None:
+    state = _Upstream()
+    state.search_status = 503
+    upstream, gate, port = _open_stack(state, upstream_timeout_seconds=2)
+    try:
+        status, payload = _status_and_json(
+            _request_bytes(port, "POST", "/search", json.dumps(_page_body()).encode())
+        )
+        assert status == 503
+        assert payload == {"detail": "检索失败"}
+        assert state.count("/search") == 1
+        assert gate.admission.inflight == 0
+    finally:
+        gate.finish()
+        upstream.shutdown()
+        upstream.server_close()
+
+
+def test_finish_does_not_wait_for_the_upstream_deadline() -> None:
+    state = _Upstream()
+    state.hold.clear()
+    upstream, gate, port = _open_stack(
+        state,
+        admission_limit=1,
+        client_wait_seconds=0.2,
+        upstream_timeout_seconds=30,
+    )
+    try:
+        status, payload = _status_and_json(
+            _request_bytes(port, "POST", "/search", json.dumps(_page_body()).encode())
+        )
+        assert status == 504
+        assert payload == {"detail": "检索超时"}
+        assert gate.admission.inflight == 1
+        started = time.monotonic()
+        gate.finish()
+        gate = None
+        assert time.monotonic() - started < 3
     finally:
         state.hold.set()
         if gate is not None:

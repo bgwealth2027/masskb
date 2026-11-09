@@ -97,9 +97,11 @@ def test_gate_live_loopback_roundtrip(request: pytest.FixtureRequest, tmp_path: 
     gate: subprocess.Popen[str] | None = None
     doc_ids: list[str] = []
     try:
-        sample_root = repo_root() / "examples" / "public"
+        sample_root = repo_root() / "masskb" / "samples"
         documents = ingest_path(sample_root, root=sample_root).files
         assert {item.source for item in documents} == {"lanheliu.md", "qingpingguo.md"}
+        sample_chunks = [chunk for doc in documents for chunk in doc.chunks]
+        assert len(sample_chunks) == 4
         secret_path = tmp_path / "secret-live.md"
         secret_path.write_text(_PRIVATE + "\n", encoding="utf-8")
         secret = ingest_path(secret_path).files[0]
@@ -196,6 +198,20 @@ def test_gate_live_loopback_roundtrip(request: pytest.FixtureRequest, tmp_path: 
         assert isinstance(hits, list) and hits
         assert all(set(hit) == {"source", "chunk_id", "text"} for hit in hits)
         assert any(hit["source"] == "qingpingguo.md" and "虚构果园" in hit["text"] for hit in hits)
+        repeated: list[str] = []
+        for chunk in sample_chunks:
+            first_status, first = _request("POST", f"{gate_base}/search", _search_body(chunk.text))
+            second_status, second = _request("POST", f"{gate_base}/search", _search_body(chunk.text))
+            assert first_status == 200 and second_status == 200, (first, second)
+            assert isinstance(first, dict) and isinstance(second, dict)
+            assert [item["chunk_id"] for item in first["hits"]] == [
+                item["chunk_id"] for item in second["hits"]
+            ]
+            matched = [item for item in first["hits"] if item["chunk_id"] == chunk.chunk_id]
+            assert matched and matched[0]["text"] == chunk.text
+            assert matched[0]["source"] == chunk.source
+            repeated.append(chunk.chunk_id)
+        assert len(set(repeated)) == 4
         encoded = json.dumps(found, ensure_ascii=False)
         assert _PRIVATE not in encoded
         assert secret.source not in encoded

@@ -3,14 +3,19 @@
 独立于 ``masskb serve``。不修改检索、健康检查、入库、ask 或 Python 客户端的默认契约。
 页面仍是包内的查询页。上游只访问写死的 ``GET /health`` 和 ``POST /search``。
 
+公开检索假定专用样例库，不把混有私密文档的集合当成安全边界。
+每次只按包内样例预先算好的 ``doc_id`` 请求上游，让过滤发生在检索之前。
+返回的命中必须同时对上该分块的 ``doc_id``、``chunk_id`` 和正文；对不上的 payload 整条丢掉。
+因此同名 ``source`` 或伪造正文都不会被显示。样例点被别的入库覆盖后，这里也不会把旧正文补回去。
+
 对外健康检查只有 ``ok`` 和固定为 false 的 ``openai_key_configured``。
-对外检索只保留样例文件名、分块 id 和正文。上游的 ``graph.error``、绝对路径、
-集合名、模型名和其它字段都不会原样返回。
+成功的检索 JSON 只有 ``query`` 和 ``hits`` 里的 ``source``、``chunk_id``、``text``。
 
 ``client_wait_seconds`` 只决定何时给浏览器回「检索超时」。
 到点不取消上游读取，名额也要等这次读取结束才释放。
 因此名额是网关尚未结束的上游调用数，不是 ``serve`` 进程锁或线程池的并发上限。
-客户端断开，或网关已经返回超时，都不会把这次调用从 ``serve`` 的队列里拿掉。
+每个样例 ``doc_id`` 只请求一次，失败不重试。
+进程关闭会关掉自己的连接并不再无限等待；``serve`` 里已经开始的调用仍可能做完。
 """
 
 from __future__ import annotations
@@ -18,6 +23,7 @@ from __future__ import annotations
 import json
 import re
 import threading
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -27,6 +33,8 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from masskb.ingest import chunk_text
+
 PUBLIC_SAMPLE_SOURCES = frozenset({"lanheliu.md", "qingpingguo.md"})
 DEFAULT_ALLOWED_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 DEFAULT_UPSTREAM = "http://127.0.0.1:8080"
@@ -35,10 +43,9 @@ UPSTREAM_TIMEOUT_SECONDS = 120.0
 ADMISSION_LIMIT = 2
 MAX_BODY_BYTES = 4096
 MAX_QUERY_CHARS = 200
-MAX_HIT_TEXT = 8000
 MAX_UPSTREAM_BYTES = 256 * 1024
+SHUTDOWN_JOIN_SECONDS = 2.0
 
-_CHUNK_ID = re.compile(r"^[0-9a-f]{64}$")
 _SEARCH_KEYS = frozenset(
     {
         "query",
@@ -85,12 +92,21 @@ class GateError(ValueError):
 
 
 @dataclass(frozen=True)
+class SampleChunk:
+    """包内样例的一条分块。``doc_id`` 与 ``chunk_id`` 用和入库相同的算法。"""
+
+    source: str
+    doc_id: str
+    chunk_id: str
+    text: str
+
+
+@dataclass(frozen=True)
 class GateConfig:
     """一次网关进程的边界。超时和名额有默认值，测试可以收短。"""
 
     upstream: str = DEFAULT_UPSTREAM
     allowed_hosts: frozenset[str] = DEFAULT_ALLOWED_HOSTS
-    sample_sources: frozenset[str] = PUBLIC_SAMPLE_SOURCES
     admission_limit: int = ADMISSION_LIMIT
     client_wait_seconds: float = CLIENT_WAIT_SECONDS
     upstream_timeout_seconds: float = UPSTREAM_TIMEOUT_SECONDS
@@ -101,10 +117,6 @@ class GateConfig:
         if not hosts:
             raise GateError("至少要允许一个 Host")
         object.__setattr__(self, "allowed_hosts", hosts)
-        sources = frozenset(self.sample_sources)
-        if not sources or any("/" in source or source.startswith(".") for source in sources):
-            raise GateError("样例来源必须是文件名")
-        object.__setattr__(self, "sample_sources", sources)
         if self.admission_limit < 1:
             raise GateError("名额至少为 1")
         if self.client_wait_seconds <= 0 or self.upstream_timeout_seconds <= 0:
@@ -215,13 +227,23 @@ def classify_request(method: str, target: str) -> str | None:
     return "method"
 
 
+def _json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """拒绝重复键。标准库 ``json.loads`` 会默默留下后一个值。"""
+    payload: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in payload:
+            raise ValueError("duplicate key")
+        payload[key] = value
+    return payload
+
+
 def parse_search_body(raw: bytes) -> tuple[dict[str, Any] | None, str | None]:
     """只接受查询页现在发出的那一组字段，并拒绝打开任何开关。"""
     if len(raw) > MAX_BODY_BYTES:
         return None, "size"
     try:
-        payload = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
+        payload = json.loads(raw.decode("utf-8"), object_pairs_hook=_json_object)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
         return None, "invalid"
     if not isinstance(payload, dict) or set(payload) != _SEARCH_KEYS:
         return None, "invalid"
@@ -250,32 +272,72 @@ def parse_search_body(raw: bytes) -> tuple[dict[str, Any] | None, str | None]:
     }, None
 
 
-def public_health_ok(status: int, body: object) -> bool:
-    return status == 200 and isinstance(body, dict) and body.get("ok") is True
+def load_sample_catalog() -> tuple[SampleChunk, ...]:
+    """用和 ``ingest --root`` 相同的切分，钉死包内样例的 id 和正文。"""
+    chunks: list[SampleChunk] = []
+    for name in sorted(PUBLIC_SAMPLE_SOURCES):
+        raw = files("masskb").joinpath("samples", name).read_text(encoding="utf-8")
+        document = chunk_text(raw, source=name)
+        for chunk in document.chunks:
+            chunks.append(
+                SampleChunk(
+                    source=name,
+                    doc_id=document.doc_id,
+                    chunk_id=chunk.chunk_id,
+                    text=chunk.text,
+                )
+            )
+    if len(chunks) != 4:
+        raise GateError("公开样例必须是 4 条分块")
+    if len({item.chunk_id for item in chunks}) != 4:
+        raise GateError("公开样例分块 id 不能重复")
+    return tuple(chunks)
 
 
-def public_search_hits(body: object, sources: frozenset[str]) -> list[dict[str, str]] | None:
-    """从上游检索结果里只挑样例命中。来源不在样例名单里的整条丢掉。"""
+def sample_doc_ids(catalog: tuple[SampleChunk, ...]) -> tuple[str, ...]:
+    """按样例文件名排序后的文档 id，每个只出现一次。"""
+    ordered: list[str] = []
+    for item in catalog:
+        if item.doc_id not in ordered:
+            ordered.append(item.doc_id)
+    return tuple(ordered)
+
+
+def project_sample_hits(
+    body: object,
+    catalog: tuple[SampleChunk, ...],
+) -> list[dict[str, str]] | None:
+    """只收下和目录逐字一致的命中。正文用目录里的那份，不抄上游的其它字段。"""
     if not isinstance(body, dict):
         return None
     hits = body.get("hits")
     if not isinstance(hits, list):
         return None
-    safe: list[dict[str, str]] = []
+    by_id = {item.chunk_id: item for item in catalog}
+    accepted: list[str] = []
     for hit in hits:
         if not isinstance(hit, dict):
             continue
-        source = hit.get("source")
         chunk_id = hit.get("chunk_id")
-        text = hit.get("text")
-        if source not in sources:
+        pinned = by_id.get(chunk_id) if isinstance(chunk_id, str) else None
+        if pinned is None:
             continue
-        if not isinstance(chunk_id, str) or _CHUNK_ID.fullmatch(chunk_id) is None:
+        if hit.get("doc_id") != pinned.doc_id or hit.get("source") != pinned.source:
             continue
-        if not isinstance(text, str) or text == "" or len(text) > MAX_HIT_TEXT or "\x00" in text:
+        if hit.get("text") != pinned.text:
             continue
-        safe.append({"source": source, "chunk_id": chunk_id, "text": text})
-    return safe
+        if pinned.chunk_id not in accepted:
+            accepted.append(pinned.chunk_id)
+    chosen = set(accepted)
+    return [
+        {"source": item.source, "chunk_id": item.chunk_id, "text": item.text}
+        for item in catalog
+        if item.chunk_id in chosen
+    ]
+
+
+def public_health_ok(status: int, body: object) -> bool:
+    return status == 200 and isinstance(body, dict) and body.get("ok") is True
 
 
 def query_page_bytes() -> bytes:
@@ -304,7 +366,7 @@ def run_limited(
         finally:
             admission.release()
 
-    thread = threading.Thread(target=worker, name="masskb-gate-upstream")
+    thread = threading.Thread(target=worker, name="masskb-gate-upstream", daemon=True)
     if workers is not None and workers_lock is not None:
         with workers_lock:
             alive = [item for item in workers if item.is_alive()]
@@ -328,6 +390,7 @@ class GateServer(ThreadingHTTPServer):
         self.admission = Admission(config.admission_limit)
         self.workers: list[threading.Thread] = []
         self.workers_lock = threading.Lock()
+        self.catalog = load_sample_catalog()
         self.http = httpx.Client(
             trust_env=False,
             follow_redirects=False,
@@ -351,13 +414,20 @@ class GateServer(ThreadingHTTPServer):
         return _fetch_reply(response)
 
     def finish(self) -> None:
+        """停止接受连接并关掉客户端。不等待上游的 120 秒上限。"""
         self.shutdown()
         self.server_close()
+        self.http.close()
+        self._join_workers(SHUTDOWN_JOIN_SECONDS)
+
+    def _join_workers(self, limit: float) -> None:
+        deadline = time.monotonic() + limit
         with self.workers_lock:
             workers = list(self.workers)
         for thread in workers:
-            thread.join(self.config.upstream_timeout_seconds)
-        self.http.close()
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                thread.join(remaining)
 
 
 class GateHandler(BaseHTTPRequestHandler):
@@ -408,7 +478,11 @@ class GateHandler(BaseHTTPRequestHandler):
         if kind == "method":
             self._send_json(405, {"detail": _DETAIL_FORBIDDEN})
             return
-        host = hostname_from_host_header(self.headers.get("Host"))
+        host_values = self.headers.get_all("Host") or []
+        if len(host_values) != 1:
+            self._send_json(403, {"detail": _DETAIL_FORBIDDEN})
+            return
+        host = hostname_from_host_header(host_values[0])
         if host is None or host not in self.server.config.allowed_hosts:
             self._send_json(403, {"detail": _DETAIL_FORBIDDEN})
             return
@@ -462,11 +536,10 @@ class GateHandler(BaseHTTPRequestHandler):
         if problem is not None or parsed is None:
             self._send_json(422, {"detail": _DETAIL_INVALID})
             return
-        payload = json.dumps(parsed, ensure_ascii=False).encode("utf-8")
         outcome = run_limited(
             self.server.admission,
             self.server.config.client_wait_seconds,
-            lambda: self.server.fetch("POST", "/search", payload),
+            lambda: search_pinned(self.server, parsed["query"]),
             workers=self.server.workers,
             workers_lock=self.server.workers_lock,
         )
@@ -476,32 +549,34 @@ class GateHandler(BaseHTTPRequestHandler):
         if outcome.kind == "timeout":
             self._send_json(504, {"detail": _DETAIL_TIMEOUT})
             return
-        if outcome.kind != "ok" or outcome.reply is None:
+        if outcome.kind != "ok" or not isinstance(outcome.reply, list):
             self._send_json(503, {"detail": _DETAIL_SEARCH_FAILED})
             return
-        status, body = outcome.reply
-        hits = public_search_hits(body, self.server.config.sample_sources) if status == 200 else None
-        if hits is None:
-            self._send_json(503, {"detail": _DETAIL_SEARCH_FAILED})
-            return
-        self._send_json(200, {"query": parsed["query"], "hits": hits})
+        self._send_json(200, {"query": parsed["query"], "hits": outcome.reply})
 
     def _read_body(self) -> tuple[bytes | None, str | None]:
-        raw_length = self.headers.get("Content-Length")
-        if raw_length is None:
+        if self.headers.get_all("Transfer-Encoding"):
+            return None, "invalid"
+        lengths = self.headers.get_all("Content-Length") or []
+        if len(lengths) != 1:
             return None, "invalid"
         try:
-            length = int(raw_length)
+            declared = int(lengths[0].strip())
         except ValueError:
             return None, "invalid"
-        if length < 0:
+        if declared < 0:
             return None, "invalid"
-        if length > MAX_BODY_BYTES:
+        if declared > MAX_BODY_BYTES:
             return None, "size"
-        data = self.rfile.read(length)
-        if len(data) != length:
-            return None, "invalid"
-        return data, None
+        got = bytearray()
+        while len(got) < declared:
+            piece = self.rfile.read(min(1024, declared - len(got)))
+            if not piece:
+                return None, "invalid"
+            got.extend(piece)
+            if len(got) > MAX_BODY_BYTES:
+                return None, "size"
+        return bytes(got), None
 
     def _send_json(self, status: int, payload: Mapping[str, Any]) -> None:
         raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -530,6 +605,39 @@ class GateHandler(BaseHTTPRequestHandler):
             return
 
 
+def search_pinned(server: GateServer, query: str) -> list[dict[str, str]]:
+    """每个预置 ``doc_id`` 只查一次。失败即停止，不重试，也不再查下一个。"""
+    catalog = server.catalog
+    accepted: set[str] = set()
+    for doc_id in sample_doc_ids(catalog):
+        payload = json.dumps(
+            {
+                "query": query,
+                "top_k": 5,
+                "doc_id": doc_id,
+                "hybrid": False,
+                "answer": False,
+                "rerank": False,
+                "rewrite": False,
+                "graph_hops": False,
+                "aliases": False,
+            },
+            ensure_ascii=False,
+        ).encode("utf-8")
+        status, body = server.fetch("POST", "/search", payload)
+        if status != 200:
+            raise GateError("upstream search failed")
+        projected = project_sample_hits(body, catalog)
+        if projected is None:
+            raise GateError("upstream search shape")
+        accepted.update(item["chunk_id"] for item in projected)
+    return [
+        {"source": item.source, "chunk_id": item.chunk_id, "text": item.text}
+        for item in catalog
+        if item.chunk_id in accepted
+    ]
+
+
 def _fetch_reply(response: httpx.Response) -> tuple[int, Any]:
     content = response.content
     if len(content) > MAX_UPSTREAM_BYTES:
@@ -548,14 +656,11 @@ def bind_gate(config: GateConfig, host: str, port: int) -> GateServer:
 
 
 def serve_gate(config: GateConfig, host: str, port: int) -> None:
-    """前台运行，直到进程收到中断。结束时等已经发出的上游读取走完超时上限。"""
+    """前台运行，直到进程收到中断。关闭时不再等待上游的 120 秒上限。"""
     server = GateServer((host, port), config)
     try:
         server.serve_forever()
     finally:
         server.server_close()
-        with server.workers_lock:
-            workers = list(server.workers)
-        for thread in workers:
-            thread.join(config.upstream_timeout_seconds)
         server.http.close()
+        server._join_workers(SHUTDOWN_JOIN_SECONDS)

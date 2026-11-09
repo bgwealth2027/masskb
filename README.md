@@ -114,7 +114,7 @@ flowchart LR
 | 重排 | 已实现 | `search --rerank` 默认关闭。在图扩展之后、补邻和回答之前，用 `LLM_MODEL` 做 listwise 重排。成功时 `score_kind` 为 `rerank`，`score` 为 `1/名次`。不新增依赖，也不重排融合前的候选。提示词使用用户原文 |
 | 查询改写 | 已实现 | `search --rewrite` 与 `POST /search` 的 `rewrite` 默认关闭。检索前用 `LLM_MODEL` 把查询改写成一条文本，供 embedding 和 bm25 使用。失败则用原文检索，退出码仍为 0。JSON 里的 `query` 始终是用户原文。重排和回答的提示词也使用原文 |
 | 本机 HTTP | 已实现 | 可选 extra `[api]`。`masskb serve` 提供 `GET /`、`GET /health`、`POST /search`、`POST /ask` 与 `POST /ingest`。`GET /` 是本机查询页。健康检查和检索的响应与 CLI 的健康检查字典和 `search` JSON 一致。写入成功的正文是 `asdict(IngestWriteResult)`；`dry_run` 只切分，不连接 Qdrant、Neo4j 或 OpenAI。默认只绑 `127.0.0.1`，无鉴权。没有上传接口。没有公网入口 |
-| 只读网关 | 已实现（默认关闭） | `masskb gate` 单独监听，默认 `127.0.0.1:8088`。只服务 `examples/public/` 的样例命中和安全健康检查。不改 `serve` 与 `MassKB` 的默认契约。独立部署文件不发布数据库、嵌入和应用端口。loopback 地址不是交付地址 |
+| 只读网关 | 已实现（默认关闭） | `masskb gate` 单独监听，默认 `127.0.0.1:8088`。只检索包内 4 条样例分块，并在请求上游前按这些 `doc_id` 过滤。正文必须与样例逐字一致。不改 `serve` 与 `MassKB` 的默认契约。它不是混合私密库的安全边界。loopback 地址不是交付地址 |
 | 应用容器 | 已实现 | `Dockerfile` 与 Compose 服务 `app`。容器内执行 `masskb serve --host 0.0.0.0 --port 8080`，宿主机只发布 `127.0.0.1:8080`。不含嵌入运行时。可选嵌入是旁边的 profile `embed`，不在这个镜像里。不挂载语料卷，容器内入库只能看到该用户可见的路径 |
 | 本机嵌入推理 | 已实现（可选，默认关闭） | Compose profile `embed`，镜像 `masskb-embed:local`。CPU ONNX（fastembed），不进入应用镜像，不进入核心依赖。默认不启动。启用后须同时设置模型与维度，并在新集合上重新入库 |
 | Agent | 已实现（第一版，默认不运行） | `masskb ask` 与 `POST /ask`。模型在最多 3 步内调用已有的 `search` 与 `healthcheck`，再给出带 `chunk_id` 引用的回答。调用方的 `graph_hops` 和 `aliases` 会原样传给内部检索。默认不进入 `search`。没有单独的图谱工具、会话或多用户 |
@@ -308,17 +308,17 @@ curl -sS -X POST http://127.0.0.1:8080/ingest \
 
 这是本机页面，不是公网部署。默认 Compose 把 Qdrant、Neo4j、应用和可选嵌入的宿主机端口都绑在 `127.0.0.1`。服务里的 `POST /ingest` 保持原样，页面不调用它。把 `8080` 暴露到本机以外，会同时暴露无鉴权的路径入库和命中正文。
 
-离线 `pytest` 用 `TestClient` 检查 HTML 和 JSON，不执行页面脚本，不连接 Qdrant、Neo4j 或模型。浏览器对着替身检索结果做的点击，只检查加载、提交、空命中、错误和回答开关，不代表真实检索。真实检索需要已启动的数据库、已入库语料，以及可用的嵌入服务；回答还需要可用的聊天模型。仓库里的公开样例只有 `examples/public/`。没有命中只说明这次请求走通。
+离线 `pytest` 用 `TestClient` 检查 HTML 和 JSON，不执行页面脚本，不连接 Qdrant、Neo4j 或模型。浏览器对着替身检索结果做的点击，只检查加载、提交、空命中、错误和回答开关，不代表真实检索。真实检索需要已启动的数据库、已入库语料，以及可用的嵌入服务；回答还需要可用的聊天模型。随包带的公开样例在 `masskb/samples/`，一共 4 条分块。没有命中只说明这次请求走通。
 
 #### 只读网关
 
 `masskb gate` 是另一个进程，默认监听 `127.0.0.1:8088`，上游默认是 `http://127.0.0.1:8080` 上的现有 `serve`。它不改变 `serve` 的路由，也不改变 CLI 和 `MassKB` 的默认参数。没有新的环境变量。`MassKB` 仍应指向 `serve`；网关的健康检查只有 `ok` 和固定为 false 的 `openai_key_configured`，解析不成客户端的 `Health`。
 
-网关自己返回查询页。它只向上游发出 `GET /health` 和 `POST /search`，不转发浏览器带来的路径、Host 或认证头。默认 Host 只允许 `localhost`、`127.0.0.1` 和 `::1`。将来的真实域名或托管子域用重复的 `--allow-host` 加上，不需要自有域名才能写进白名单。检索正文只重建查询页那一组字段，并且 `answer`、`rerank`、`rewrite`、`graph_hops`、`aliases`、`hybrid` 必须是 false，`top_k` 必须是 5。成功响应只留 `query` 和命中的 `source`、`chunk_id`、`text`。`source` 还必须是 `examples/public/` 里的文件名，绝对路径和其它文档整条丢掉。失败用固定短句，不回传 `graph.error` 或上游异常。
+网关自己返回查询页。它只向上游发出 `GET /health` 和带预置 `doc_id` 的 `POST /search`，不转发浏览器带来的路径、Host、转发头或认证头。默认 Host 只允许 `localhost`、`127.0.0.1` 和 `::1`。将来的真实域名或托管子域用重复的 `--allow-host` 加上。浏览器仍把 `doc_id` 留空，网关改写成 `masskb/samples/` 里那 4 条分块所属的文档 id，每个文档只查一次，失败不重试。成功响应只有 `query` 和命中的 `source`、`chunk_id`、`text`，没有 `answer` 或 `graph`。命中的三个字段必须和包内样例逐字一致，所以同名文件或伪造 payload 不会被显示。这不能把一个混有私密文档的库变成安全库：别的 `doc_id` 根本不会被查询，但样例点一旦被覆盖，公开结果里就不再有那条正文。失败用固定短句。
 
 检索的 20 秒只是网关对浏览器的等候。到点返回「检索超时」，这次上游读取继续，名额要等它结束才释放。健康检查若在这段等候里没有结果，只返回 `ok: false`，不附上游正文。客户端提前断开也一样，不会把已经交给 `serve` 的调用取消。名额默认 2，限制的是网关尚未结束的上游调用，不是 `serve` 里那把锁，也不是它的线程池。上游读取本身还有 120 秒上限；到点网关会放下自己这边的连接并释放名额，`serve` 仍可能把那次调用做完。
 
-公开样例库用独立文件 `docker-compose.public.yml`，不要和默认 Compose 叠在一起。那个文件不发布 Qdrant、Neo4j、嵌入或应用的宿主机端口，网关只发布 `127.0.0.1:8088`。它沿用已有的 `NEO4J_DEV_PASSWORD`：没设置时 `docker compose config` 会失败；值若是 `masskb-dev-pass`，Neo4j 入口脚本拒绝启动。默认 Compose 仍保留这个开发密码，只是端口改到 loopback。样例入库：
+公开样例库用独立文件 `docker-compose.public.yml`。它用 `!override` 清掉合并时可能留下的端口和卷，单独渲染时也不发布 Qdrant、Neo4j、嵌入或应用的宿主机端口，网关只发布 `127.0.0.1:8088`。`docker compose config` 只检查这份渲染，不代表容器已经启动。它沿用已有的 `NEO4J_DEV_PASSWORD`：没设置时渲染会失败；值若是 `masskb-dev-pass`，Neo4j、应用、网关和样例入库在执行自己的命令前都会退出。默认 Compose 仍保留这个开发密码，只是端口改到 loopback。样例入库：
 
 ```bash
 NEO4J_DEV_PASSWORD='已有的非默认密码' docker compose -f docker-compose.public.yml up -d --build
@@ -422,8 +422,7 @@ masskb/
 ├── .dockerignore
 ├── docker-compose.yml          # Qdrant、Neo4j、应用服务，以及可选 profile embed；宿主机端口只绑 127.0.0.1
 ├── docker-compose.public.yml   # 独立样例部署：内部服务不发布端口，网关只绑 127.0.0.1:8088
-├── deploy/public/              # 公开 Neo4j 入口：拒绝空密码和 masskb-dev-pass
-├── examples/public/            # 无密钥的公开检索样例
+├── deploy/public/              # 公开入口脚本：拒绝空密码和 masskb-dev-pass
 ├── embed/                      # 可选 CPU ONNX 嵌入边车；不进入应用镜像
 │   ├── .dockerignore
 │   ├── Dockerfile
@@ -439,6 +438,7 @@ masskb/
 │   ├── __main__.py             # CLI：默认 healthcheck，另有 ingest、search、ask、serve 与 gate
 │   ├── gate.py                 # 可选只读网关：不改 serve 契约，只放出样例检索和安全健康检查
 │   ├── static/index.html       # 本机查询页，打进 wheel 与应用镜像
+│   ├── samples/                # 无密钥的 4 条公开样例分块
 │   ├── api.py                  # 可选本机 HTTP：GET /、GET /health、POST /search、POST /ask、POST /ingest
 │   ├── client.py               # 本机 HTTP 的同步客户端：health、search、ask、ingest
 │   ├── ingest.py               # 本地切分：稳定 id 与字符偏移

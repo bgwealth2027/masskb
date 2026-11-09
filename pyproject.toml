@@ -39,7 +39,7 @@ masskb = "masskb.__main__:main"
 include = ["masskb*"]
 
 [tool.setuptools.package-data]
-masskb = ["static/index.html"]
+masskb = ["static/index.html", "samples/*.md"]
 
 [tool.ruff]
 line-length = 100
