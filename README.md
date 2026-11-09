@@ -303,7 +303,7 @@ curl -sS -X POST http://127.0.0.1:8080/ingest \
 
 在本机打开 `http://127.0.0.1:8080/`。页面是随包装进 wheel 和应用镜像的 `masskb/static/index.html`，由浏览器同源调用现有的 `POST /search`。默认请求里 `answer`、`hybrid`、`rewrite`、`rerank`、`graph_hops`、`aliases` 都是 false，`top_k` 是 5。命中正文、来源、分块 id 和回答都写成文本节点。检索进行时不能再次提交；失败或结束后可以再查。
 
-`GET /health` 的 `openai_key_configured` 只表示配置了真实 Key。为 true 时才显示「生成回答」，并且默认不勾选。勾选后如果回答失败，命中仍然显示，回答区写明失败原因。Key 未配置、健康检查失败或页面连不上服务时，不提供这个开关。
+`GET /health` 的 `openai_key_configured` 只表示配置了真实 Key。为 true 时才显示「生成回答」，并且默认不勾选。勾选后，只有 `answer.ok` 不为 true 时回答区才写「回答失败」，命中仍然显示。模型弃权，或 `error` 为 `no_hits` 时，回答区写「未生成回答」，不写成失败。Key 未配置、健康检查失败或页面连不上服务时，不提供这个开关。
 
 这是本机页面，不是公网部署。Compose 仍只把应用端口发布到 `127.0.0.1:8080`，没有新的公网入口，也没有鉴权系统。服务里的 `POST /ingest` 保持原样，页面不调用它。把 `8080` 暴露到本机以外，会同时暴露无鉴权的路径入库和命中正文。
 

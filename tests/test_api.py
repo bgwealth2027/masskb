@@ -330,7 +330,16 @@ def test_get_root_is_the_packaged_query_page() -> None:
     assert "textContent" in response.text
     assert "没有命中" in response.text
     assert "正在检索" in response.text
+    assert "answer.ok !== true" in response.text
     assert "回答失败：" in response.text
+    assert 'answer.error === "no_hits"' in response.text
+    assert "没有可引用的命中，未生成回答。" in response.text
+    assert ': "未生成回答。"' in response.text
+    assert "doc_id: null" in response.text
+    assert "rerank: false" in response.text
+    assert "rewrite: false" in response.text
+    assert "graph_hops: false" in response.text
+    assert "aliases: false" in response.text
     assert "openai_key_configured === true" in response.text
     assert "配置存在不表示回答会成功" in response.text
     assert 'fetch("/search"' in response.text

@@ -161,17 +161,18 @@
         return true;
       }
       answerSection.hidden = false;
-      var failed = !answer
-        || answer.ok !== true
-        || answer.skipped === true
-        || typeof answer.text !== "string"
-        || answer.text === "";
-      if (failed) {
+      if (!answer || typeof answer !== "object" || answer.ok !== true) {
         var reason = answer && typeof answer.error === "string" && answer.error !== ""
           ? answer.error
           : "未返回回答";
         answerText.textContent = "回答失败：" + reason;
         return false;
+      }
+      if (answer.skipped === true || typeof answer.text !== "string" || answer.text === "") {
+        answerText.textContent = answer.error === "no_hits"
+          ? "没有可引用的命中，未生成回答。"
+          : "未生成回答。";
+        return true;
       }
       answerText.textContent = answer.text;
       var cited = Array.isArray(answer.citations) ? answer.citations : [];
