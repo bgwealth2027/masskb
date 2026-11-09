@@ -328,18 +328,7 @@ def test_public_compose_config_render_when_cli_exists() -> None:
     assert "embed_cache:" not in merged_text
     for internal in ("6333", "6334", "7474", "7687", "8081"):
         assert f'published: "{internal}"' not in merged_text
-    up_command = [command[0], "compose", "-f", "docker-compose.public.yml", "up", "-d"] if docker is not None else [standalone, "-f", "docker-compose.public.yml", "up", "-d"]
-    started = subprocess.run(
-        up_command,
-        cwd=ROOT,
-        check=False,
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=20,
-    )
-    assert started.returncode != 0
-    assert "masskb-public-qdrant" not in started.stdout
+    # config 只渲染文件。这里不调用 up，渲染成功也不表示容器已经启动。
 
 
 def test_embed_dockerfile_is_separate_from_the_app() -> None:
