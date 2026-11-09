@@ -1,10 +1,13 @@
 """OpenAI 兼容的嵌入 HTTP 边车。
 
 `fastembed` 只在进程启动并加载模型时导入。协议函数可以离线测试。
+无参数时监听 0.0.0.0:8080，与容器和 Compose 契约一致。
+`--host` 与 `--port` 可选，不读取新的环境变量。
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import threading
@@ -158,12 +161,45 @@ class EmbedHandler(BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
 
-def main() -> None:
+def _listen_port(value: str) -> int:
+    try:
+        port = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("port 必须是 1 到 65535 的整数") from exc
+    if port < 1 or port > 65535:
+        raise argparse.ArgumentTypeError("port 必须是 1 到 65535 的整数")
+    return port
+
+
+def listen_address(argv: list[str] | None = None) -> tuple[str, int]:
+    """解析监听地址。缺省是 `0.0.0.0:8080`。
+
+    容器健康检查访问容器内的 127.0.0.1:8080，端口发布也要求进程监听所有接口。
+    因此无参数时不能改成 loopback。无 Docker 的本机验收另传
+    `--host 127.0.0.1 --port 8081`，避免和应用的 8080 冲突。
+    """
+    parser = argparse.ArgumentParser(prog="embed-server")
+    parser.add_argument("--host", default="0.0.0.0", help="监听地址（默认 0.0.0.0）")
+    parser.add_argument(
+        "--port",
+        type=_listen_port,
+        default=8080,
+        help="监听端口（默认 8080）",
+    )
+    args = parser.parse_args(argv)
+    host = args.host.strip()
+    if host == "":
+        parser.error("host 为空")
+    return host, args.port
+
+
+def main(argv: list[str] | None = None) -> None:
     model_name = os.environ.get("EMBEDDING_MODEL", _DEFAULT_MODEL).strip()
     if not model_name:
         raise SystemExit("EMBEDDING_MODEL 为空")
+    host, port = listen_address(argv)
     state = ServerState(model_name)
-    server = EmbedHTTPServer(("0.0.0.0", 8080), state)
+    server = EmbedHTTPServer((host, port), state)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
@@ -174,7 +210,10 @@ def main() -> None:
     state.embed = embed
     state.dimensions = dimensions
     state.ready = True
-    print(f"embed ready model={model_name} dimensions={dimensions}", flush=True)
+    print(
+        f"embed ready model={model_name} dimensions={dimensions} host={host} port={port}",
+        flush=True,
+    )
     try:
         thread.join()
     except KeyboardInterrupt:
