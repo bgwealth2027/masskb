@@ -28,6 +28,8 @@ api = [
 dev = [
     "pytest>=8.0.0",
     "ruff>=0.6.0",
+    "setuptools>=77",
+    "wheel",
 ]
 
 [project.scripts]
@@ -35,6 +37,9 @@ masskb = "masskb.__main__:main"
 
 [tool.setuptools.packages.find]
 include = ["masskb*"]
+
+[tool.setuptools.package-data]
+masskb = ["static/index.html"]
 
 [tool.ruff]
 line-length = 100

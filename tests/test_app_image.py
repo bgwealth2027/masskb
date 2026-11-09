@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import os
+import shutil
+import subprocess
+import sys
+import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -119,6 +124,59 @@ def test_compose_embed_profile_is_optional() -> None:
     assert "bge-small-zh" not in blocks["qdrant"]
     assert "bge-small-zh" not in blocks["neo4j"]
     assert "bge-m3" not in text.lower()
+
+
+def test_query_page_ships_in_the_wheel_and_image_context(tmp_path: Path) -> None:
+    page = ROOT / "masskb" / "static" / "index.html"
+    assert page.is_file()
+    assert "static/index.html" in _read("pyproject.toml")
+    dockerfile = _read("Dockerfile")
+    assert "COPY masskb ./masskb" in dockerfile
+    assert '".[api]"' in dockerfile
+    assert "127.0.0.1:8080:8080" in _read("docker-compose.yml")
+
+    project = tmp_path / "project"
+    project.mkdir()
+    for name in ("pyproject.toml", "README.md", "LICENSE"):
+        shutil.copy(ROOT / name, project / name)
+    shutil.copytree(
+        ROOT / "masskb",
+        project / "masskb",
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+    )
+    wheel_dir = tmp_path / "wheel"
+    wheel_dir.mkdir()
+    env = os.environ.copy()
+    env["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
+    env["PIP_NO_INDEX"] = "1"
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "wheel",
+            "--no-deps",
+            "--no-build-isolation",
+            "--no-index",
+            "-w",
+            str(wheel_dir),
+            str(project),
+        ],
+        cwd=project,
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert completed.returncode == 0, completed.stderr
+    wheels = list(wheel_dir.glob("masskb-*.whl"))
+    assert len(wheels) == 1
+    with zipfile.ZipFile(wheels[0]) as archive:
+        html = archive.read("masskb/static/index.html").decode("utf-8")
+        names = archive.namelist()
+    assert html == page.read_text(encoding="utf-8")
+    assert 'id="query"' in html
+    assert not any(name.endswith(".env") or "/.env" in name for name in names)
 
 
 def test_embed_dockerfile_is_separate_from_the_app() -> None:

@@ -1,4 +1,4 @@
-"""本机 HTTP：不连接 Qdrant、Neo4j 或 OpenAI，也不绑定端口。"""
+"""本机 HTTP：不连接 Qdrant、Neo4j 或 OpenAI，也不绑定端口。TestClient 不执行查询页脚本。"""
 
 from __future__ import annotations
 
@@ -313,6 +313,58 @@ def test_health_exception_is_503() -> None:
     assert response.json() == {"detail": "neo4j down"}
 
 
+def test_get_root_is_the_packaged_query_page() -> None:
+    from importlib.resources import files
+
+    pipeline = _Pipeline()
+    packaged = files("masskb").joinpath("static", "index.html").read_text(encoding="utf-8")
+    with TestClient(create_app(pipeline)) as client:  # type: ignore[arg-type]
+        response = client.get("/")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/html")
+    assert response.text == packaged
+    assert 'id="query"' in response.text
+    assert 'id="answer" type="checkbox"' in response.text
+    assert "type=\"checkbox\" checked" not in response.text
+    assert "textContent" in response.text
+    assert "没有命中" in response.text
+    assert "正在检索" in response.text
+    assert "answer.ok !== true" in response.text
+    assert "回答失败：" in response.text
+    assert 'answer.error === "no_hits"' in response.text
+    assert "没有可引用的命中，未生成回答。" in response.text
+    assert ': "未生成回答。"' in response.text
+    assert "doc_id: null" in response.text
+    assert "rerank: false" in response.text
+    assert "rewrite: false" in response.text
+    assert "graph_hops: false" in response.text
+    assert "aliases: false" in response.text
+    assert "openai_key_configured === true" in response.text
+    assert "配置存在不表示回答会成功" in response.text
+    assert 'fetch("/search"' in response.text
+    assert 'fetch("/health"' in response.text
+    assert "answer: wantAnswer" in response.text
+    assert "hybrid: false" in response.text
+    assert "top_k: 5" in response.text
+    policy = response.headers["content-security-policy"]
+    assert "connect-src 'self'" in policy
+    assert "img-src 'none'" in policy
+    for forbidden in (
+        "innerHTML",
+        "outerHTML",
+        "insertAdjacentHTML",
+        "document.write",
+        "eval(",
+        "/ingest",
+        "/ask",
+        "sk-",
+        "OPENAI_API_KEY",
+    ):
+        assert forbidden not in response.text
+    assert pipeline.calls == []
+
+
 def test_ingest_route_methods_and_openapi() -> None:
     pipeline = _Pipeline()
     with TestClient(create_app(pipeline)) as client:  # type: ignore[arg-type]
@@ -326,6 +378,7 @@ def test_ingest_route_methods_and_openapi() -> None:
     assert {"get"} == set(schema["paths"]["/health"].keys())
     assert {"post"} == set(schema["paths"]["/search"].keys())
     assert {"post"} == set(schema["paths"]["/ask"].keys())
+    assert {"get"} == set(schema["paths"]["/"].keys())
     assert pipeline.calls == []
 
 

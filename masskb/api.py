@@ -1,6 +1,7 @@
-"""本机 HTTP：健康检查、检索、默认不运行的工具循环，以及路径入库。
+"""本机 HTTP：查询页、健康检查、检索、默认不运行的工具循环，以及路径入库。
 
 导入本模块只创建 FastAPI 应用，不连接 Qdrant、Neo4j 或 OpenAI。
+`GET /` 只读取包内页面。
 """
 
 from __future__ import annotations
@@ -10,10 +11,11 @@ import threading
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import asdict
+from importlib.resources import files
 from pathlib import Path
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from masskb.agent import MAX_AGENT_STEPS
@@ -131,10 +133,34 @@ class IngestRequest(BaseModel):
         return value
 
 
+_PAGE_HEADERS = {
+    "Content-Security-Policy": (
+        "default-src 'none'; "
+        "script-src 'unsafe-inline'; "
+        "style-src 'unsafe-inline'; "
+        "connect-src 'self'; "
+        "img-src 'none'; "
+        "object-src 'none'; "
+        "base-uri 'none'; "
+        "form-action 'self'; "
+        "frame-ancestors 'none'"
+    ),
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+    "Cache-Control": "no-store",
+}
+
+
+def query_page_html() -> str:
+    """读取打进发行包的查询页。不连接数据库或模型。"""
+    return files("masskb").joinpath("static", "index.html").read_text(encoding="utf-8")
+
+
 def create_app(pipeline: RetrievalPipeline | None = None) -> FastAPI:
     """`pipeline` 为空时，在 lifespan 里构造唯一的 `RetrievalPipeline`。
 
     传入实例时直接复用，并在退出时 `close()` 一次。健康检查、检索、ask 和入库共用一把锁。
+    `GET /` 不占这把锁，也不调用管线。
     `ask` 内部再调用 `search` 与 `healthcheck` 时不再加锁。
     `POST /ingest` 的 dry-run 只调用 `ingest_path`，不调用 `pipeline.ingest`。
     """
@@ -150,6 +176,11 @@ def create_app(pipeline: RetrievalPipeline | None = None) -> FastAPI:
             owned.close()
 
     app = FastAPI(lifespan=lifespan, default_response_class=UTF8JSONResponse)
+
+    @app.get("/", response_class=HTMLResponse)
+    def query_page() -> HTMLResponse:
+        """本机查询页。不调用检索、健康检查或入库。"""
+        return HTMLResponse(query_page_html(), headers=_PAGE_HEADERS)
 
     @app.get("/health")
     def health(request: Request) -> UTF8JSONResponse:
