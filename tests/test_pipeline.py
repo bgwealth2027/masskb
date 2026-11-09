@@ -189,11 +189,11 @@ def _search_pipeline(
     pipeline._complete_answer = complete_answer
     pipeline._complete_rerank = complete_rerank
     pipeline._complete_rewrite = complete_rewrite
-    related_calls: list[tuple[list[str], str | None]] = []
+    related_calls: list[tuple[list[str], str | None, bool]] = []
     payload_calls: list[list[str]] = []
 
-    def related_chunks(chunk_ids, *, doc_id):
-        related_calls.append((list(chunk_ids), doc_id))
+    def related_chunks(chunk_ids, *, doc_id, aliases: bool = False):
+        related_calls.append((list(chunk_ids), doc_id, aliases))
         calls.append("related_chunks")
         if related_error is not None:
             raise related_error
@@ -1970,6 +1970,10 @@ def test_ingest_without_entities_does_not_call_chat(
     assert result.graph_concepts == 0
     assert result.graph_mentions == 0
     assert result.entities_dropped == 0
+    assert result.aliases_skipped is True
+    assert result.aliases_ok is True
+    assert result.graph_aliases == 0
+    assert result.aliases_dropped == 0
 
 
 def test_ingest_entities_extracts_after_skeleton(
@@ -2300,7 +2304,7 @@ def test_search_graph_hops_skips_payloads_outside_the_doc_filter(
     result = pipeline.search("质量", top_k=2, doc_id="keep", graph_hops=True)
     pipeline.close()
 
-    assert pipeline.related_calls == [(["c1", "c2"], "keep")]  # type: ignore[attr-defined]
+    assert pipeline.related_calls == [(["c1", "c2"], "keep", False)]  # type: ignore[attr-defined]
     assert [hit.chunk_id for hit in result.hits] == ["c1", "same"]
     assert result.hits[1].text == "同文档"
     assert result.graph_hops.found == 3
@@ -2483,6 +2487,7 @@ def test_ask_search_then_finish_forwards_defaults_and_filters_citations() -> Non
                 "rerank": False,
                 "rewrite": False,
                 "graph_hops": False,
+                "aliases": False,
             },
         )
     ]
@@ -2546,6 +2551,7 @@ def test_ask_forwards_caller_flags() -> None:
         "rerank": True,
         "rewrite": True,
         "graph_hops": True,
+        "aliases": False,
     }
     pipeline.close()
 
@@ -2831,3 +2837,263 @@ def test_complete_agent_sets_max_tokens(monkeypatch: pytest.MonkeyPatch) -> None
         "max_tokens": 512,
     }
     pipeline.close()
+
+
+def _alias_ingest_pipeline(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    path = tmp_path / "a.txt"
+    path.write_text("孔子又称孔丘。\n", encoding="utf-8")
+    pipeline = _pipeline(monkeypatch, _Embeddings(), _MemoryVectors())
+    mentions: dict[str, object] = {}
+    alias_calls: list[tuple[str, tuple]] = []
+    chats: list[str] = []
+
+    def complete(_self, system: str, user: str, *, max_tokens: int | None = None) -> str:
+        assert max_tokens == 256
+        chats.append(system)
+        if "别名分组器" in system:
+            return '{"persons": [["孔子", "孔丘"]], "concepts": []}'
+        return '{"persons": ["孔子", "孔丘"], "concepts": []}'
+
+    def replace_mentions(doc_id, chunk_ids, items):
+        mentions["doc_id"] = doc_id
+        mentions["chunk_ids"] = list(chunk_ids)
+        mentions["ids"] = [item.entity_id for item in items]
+        mentions["names"] = [item.name for item in items]
+        return (2, 0, len(items))
+
+    def replace_aliases(doc_id, links):
+        alias_calls.append((doc_id, tuple((item.alias_name, item.canonical_name) for item in links)))
+        return len(links)
+
+    monkeypatch.setattr("masskb.answer.ChatClient.complete", complete)
+    pipeline.graph_store.ensure_entity_schema = lambda: None
+    pipeline.graph_store.replace_mentions = replace_mentions
+    pipeline.graph_store.replace_aliases = replace_aliases
+    return path, pipeline, mentions, alias_calls, chats
+
+
+def test_ingest_aliases_keeps_surface_mentions(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path, pipeline, mentions, alias_calls, chats = _alias_ingest_pipeline(tmp_path, monkeypatch)
+
+    result = pipeline.ingest(path, root=tmp_path, entities=True, aliases=True)
+    pipeline.close()
+
+    assert chats[0].startswith("你是实体标注器")
+    assert "别名分组器" in chats[1]
+    assert mentions["names"] == ["孔子", "孔丘"]
+    assert len(set(mentions["ids"])) == 2
+    assert alias_calls == [(mentions["doc_id"], (("孔子", "孔丘"),))]
+    assert result.entities_skipped is False
+    assert result.aliases_skipped is False
+    assert result.aliases_ok is True
+    assert result.aliases_error is None
+    assert result.graph_aliases == 1
+    assert result.graph_mentions == 2
+
+
+def test_ingest_alias_failures_keep_mentions_and_existing_edges(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "a.txt"
+    path.write_text("孔子又称孔丘。\n", encoding="utf-8")
+    pipeline = _pipeline(monkeypatch, _Embeddings(), _MemoryVectors())
+    state = {"mentions": 0, "aliases": 0}
+
+    def complete(_self, system: str, _user: str, *, max_tokens: int | None = None) -> str:
+        if "别名分组器" in system:
+            raise RuntimeError("alias down")
+        return '{"persons": ["孔子", "孔丘"], "concepts": []}'
+
+    def replace_mentions(*_args, **_kwargs):
+        state["mentions"] += 1
+        return (2, 0, 2)
+
+    def replace_aliases(*_args, **_kwargs):
+        state["aliases"] += 1
+        raise AssertionError("模型失败不应改别名边")
+
+    monkeypatch.setattr("masskb.answer.ChatClient.complete", complete)
+    pipeline.graph_store.ensure_entity_schema = lambda: None
+    pipeline.graph_store.replace_mentions = replace_mentions
+    pipeline.graph_store.replace_aliases = replace_aliases
+
+    failed_model = pipeline.ingest(path, root=tmp_path, entities=True, aliases=True)
+    assert failed_model.aliases_ok is False
+    assert "alias down" in (failed_model.aliases_error or "")
+    assert failed_model.graph_aliases == 0
+    assert failed_model.graph_mentions == 2
+    assert state == {"mentions": 1, "aliases": 0}
+
+    def bad_json(_self, system: str, _user: str, *, max_tokens: int | None = None) -> str:
+        if "别名分组器" in system:
+            return "不是 JSON"
+        return '{"persons": ["孔子", "孔丘"], "concepts": []}'
+
+    monkeypatch.setattr("masskb.answer.ChatClient.complete", bad_json)
+    failed_parse = pipeline.ingest(path, root=tmp_path, entities=True, aliases=True)
+    assert failed_parse.aliases_ok is False
+    assert "AliasParseError" in (failed_parse.aliases_error or "")
+    assert state["aliases"] == 0
+    assert state["mentions"] == 2
+
+    def ok(_self, system: str, _user: str, *, max_tokens: int | None = None) -> str:
+        if "别名分组器" in system:
+            return '{"persons": [["孔子", "孔丘"]], "concepts": []}'
+        return '{"persons": ["孔子", "孔丘"], "concepts": []}'
+
+    def boom(*_args, **_kwargs):
+        state["aliases"] += 1
+        raise RuntimeError("bolt")
+
+    monkeypatch.setattr("masskb.answer.ChatClient.complete", ok)
+    pipeline.graph_store.replace_aliases = boom
+    failed_write = pipeline.ingest(path, root=tmp_path, entities=True, aliases=True)
+    pipeline.close()
+
+    assert failed_write.aliases_ok is False
+    assert "bolt" in (failed_write.aliases_error or "")
+    assert failed_write.graph_aliases == 0
+    assert failed_write.graph_mentions == 2
+    assert state["mentions"] == 3
+    assert state["aliases"] == 1
+
+
+def test_ingest_aliases_do_not_import_names_from_another_document(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "a.txt").write_text("孔子又称孔丘。\n", encoding="utf-8")
+    (tmp_path / "b.txt").write_text("孔子讲仁。\n", encoding="utf-8")
+    pipeline = _pipeline(monkeypatch, _Embeddings(), _MemoryVectors())
+    alias_calls: list[tuple[str, tuple]] = []
+
+    def complete(_self, system: str, user: str, *, max_tokens: int | None = None) -> str:
+        if "别名分组器" in system:
+            return '{"persons": [["孔子", "孔丘"]], "concepts": []}'
+        if "孔丘" in user:
+            return '{"persons": ["孔子", "孔丘"], "concepts": []}'
+        return '{"persons": ["孔子"], "concepts": ["仁"]}'
+
+    def replace_mentions(doc_id, _chunk_ids, _items):
+        return (1, 0, 1)
+
+    def replace_aliases(doc_id, links):
+        alias_calls.append((doc_id, tuple(item.alias_name for item in links)))
+        return len(links)
+
+    monkeypatch.setattr("masskb.answer.ChatClient.complete", complete)
+    pipeline.graph_store.ensure_entity_schema = lambda: None
+    pipeline.graph_store.replace_mentions = replace_mentions
+    pipeline.graph_store.replace_aliases = replace_aliases
+
+    result = pipeline.ingest(tmp_path, root=tmp_path, entities=True, aliases=True)
+    pipeline.close()
+
+    assert result.aliases_ok is True
+    assert result.graph_aliases == 1
+    assert len(alias_calls) == 2
+    written = [names for _doc_id, names in alias_calls if names]
+    cleared = [names for _doc_id, names in alias_calls if not names]
+    assert written == [("孔子",)]
+    assert cleared == [()]
+    assert alias_calls[0][0] != alias_calls[1][0]
+
+
+def test_ingest_drop_aliases_skips_the_model(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = tmp_path / "a.txt"
+    path.write_text("孔子又称孔丘。\n", encoding="utf-8")
+    pipeline = _pipeline(monkeypatch, _Embeddings(), _MemoryVectors())
+    seen: list[tuple] = []
+
+    def complete(_self, system: str, _user: str, *, max_tokens: int | None = None) -> str:
+        assert "别名分组器" not in system
+        return '{"persons": ["孔子", "孔丘"], "concepts": []}'
+
+    monkeypatch.setattr("masskb.answer.ChatClient.complete", complete)
+    pipeline.graph_store.ensure_entity_schema = lambda: None
+    pipeline.graph_store.replace_mentions = lambda *_args, **_kwargs: (2, 0, 2)
+    pipeline.graph_store.replace_aliases = lambda doc_id, links: seen.append((doc_id, links)) or 0
+
+    result = pipeline.ingest(path, root=tmp_path, entities=True, drop_aliases=True)
+    pipeline.close()
+
+    assert seen[0][1] == ()
+    assert result.aliases_ok is True
+    assert result.aliases_skipped is False
+    assert result.graph_aliases == 0
+
+
+def test_ingest_alias_flags_fail_before_embedding(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = tmp_path / "a.txt"
+    path.write_text("孔子。\n", encoding="utf-8")
+    pipeline = _pipeline(monkeypatch, _Embeddings(), _MemoryVectors())
+
+    with pytest.raises(ValueError, match="entities"):
+        pipeline.ingest(path, root=tmp_path, aliases=True)
+    with pytest.raises(ValueError, match="同时"):
+        pipeline.ingest(path, root=tmp_path, entities=True, aliases=True, drop_aliases=True)
+    pipeline.close()
+
+
+def test_search_aliases_without_graph_hops_does_not_read_the_graph(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pipeline, calls = _search_pipeline(
+        monkeypatch,
+        _Embeddings(),
+        raw=[_dense(0.5, "c1")],
+        related=(),
+    )
+
+    result = pipeline.search("质量", aliases=True)
+    pipeline.close()
+
+    assert "related_chunks" not in calls
+    assert result.graph_hops.skipped is True
+    assert result.graph_hops.aliases is False
+    assert result.hits[0].chunk_id == "c1"
+
+
+def test_search_alias_hop_can_reach_another_documents_surface_form(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    related = (RelatedChunk(chunk_id="chunk-a", mention_count=1, via_next=False),)
+    pipeline, _calls = _search_pipeline(
+        monkeypatch,
+        _Embeddings(),
+        raw=[_dense(0.9, "chunk-b", doc_id="doc-b"), _dense(0.2, "tail", doc_id="doc-b")],
+        related=related,
+        payloads={"chunk-a": {"chunk_id": "chunk-a", "text": "孔丘在甲篇", "doc_id": "doc-a"}},
+    )
+
+    opened = pipeline.search("孔子", top_k=2, graph_hops=True, aliases=True)
+    filtered = pipeline.search("孔子", top_k=2, doc_id="doc-b", graph_hops=True, aliases=True)
+    pipeline.close()
+
+    assert pipeline.related_calls[0] == (["chunk-b", "tail"], None, True)  # type: ignore[attr-defined]
+    assert pipeline.related_calls[1][1:] == ("doc-b", True)  # type: ignore[attr-defined]
+    assert opened.graph_hops.aliases is True
+    assert opened.hits[-1].chunk_id == "chunk-a"
+    assert opened.hits[-1].doc_id == "doc-a"
+    assert filtered.graph_hops.aliases is True
+    assert filtered.graph_hops.expanded == 0
+    assert [hit.chunk_id for hit in filtered.hits] == ["chunk-b", "tail"]
+
+
+def test_search_alias_lookup_failure_keeps_vector_hits(monkeypatch: pytest.MonkeyPatch) -> None:
+    pipeline, _calls = _search_pipeline(
+        monkeypatch,
+        _Embeddings(),
+        raw=[_dense(0.9, "c1"), _dense(0.2, "c2")],
+        related_error=RuntimeError("bolt"),
+    )
+
+    result = pipeline.search("质量", top_k=2, graph_hops=True, aliases=True)
+    pipeline.close()
+
+    assert [hit.chunk_id for hit in result.hits] == ["c1", "c2"]
+    assert result.graph_hops.ok is False
+    assert result.graph_hops.aliases is False
+    assert result.graph_hops.error == "RuntimeError: bolt"
+    assert pipeline.related_calls == [(["c1", "c2"], None, True)]  # type: ignore[attr-defined]

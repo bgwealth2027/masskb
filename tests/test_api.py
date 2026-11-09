@@ -146,6 +146,7 @@ def test_post_search_matches_cli_json() -> None:
         "rerank": False,
         "rewrite": False,
         "graph_hops": False,
+        "aliases": False,
     }
     assert "steps" not in response.json()
     assert "stopped" not in response.json()
@@ -176,6 +177,7 @@ def test_post_search_forwards_flags_without_trimming_query() -> None:
         "rerank": True,
         "rewrite": True,
         "graph_hops": True,
+        "aliases": False,
     }
     assert response.json()["query"] == " 质量 "
     assert response.json()["doc_id"] == "abc"
@@ -362,6 +364,8 @@ def test_post_ingest_write_matches_asdict(tmp_path: Path) -> None:
         "chunk_size": 800,
         "overlap": 100,
         "entities": False,
+        "aliases": False,
+        "drop_aliases": False,
     }
 
 
@@ -389,6 +393,8 @@ def test_post_ingest_forwards_flags(tmp_path: Path) -> None:
         "chunk_size": 40,
         "overlap": 5,
         "entities": True,
+        "aliases": False,
+        "drop_aliases": False,
     }
 
 
@@ -406,7 +412,13 @@ def test_post_ingest_dry_run_does_not_call_pipeline(tmp_path: Path) -> None:
         response = client.post("/ingest", json=body)
 
     report = ingest_path(target, root=tmp_path)
-    expected = {"dry_run": True, "entities": True, "report": asdict(report)}
+    expected = {
+        "dry_run": True,
+        "entities": True,
+        "aliases": False,
+        "drop_aliases": False,
+        "report": asdict(report),
+    }
     assert response.status_code == 200
     assert response.content == json.dumps(expected, ensure_ascii=False).encode("utf-8")
     assert "质量".encode() in response.content
@@ -527,6 +539,7 @@ def test_post_ask_matches_cli_json_and_defaults() -> None:
         "rewrite": False,
         "rerank": False,
         "graph_hops": False,
+        "aliases": False,
         "max_steps": 3,
     }
 
@@ -541,6 +554,7 @@ def test_post_ask_forwards_flags() -> None:
         "rewrite": True,
         "rerank": True,
         "graph_hops": True,
+        "aliases": False,
         "max_steps": 2,
     }
     with TestClient(create_app(pipeline)) as client:  # type: ignore[arg-type]
@@ -555,6 +569,7 @@ def test_post_ask_forwards_flags() -> None:
         "rewrite": True,
         "rerank": True,
         "graph_hops": True,
+        "aliases": False,
         "max_steps": 2,
     }
     assert "answer" not in pipeline.seen
@@ -620,3 +635,56 @@ def test_ask_hard_failure_is_503_and_closes_once() -> None:
         assert response.status_code == 503
         assert response.json() == {"detail": "缺少真实 OPENAI_API_KEY"}
     assert pipeline.closed == ["closed"]
+
+
+def test_ingest_alias_flags_are_422_before_pipeline() -> None:
+    pipeline = _Pipeline()
+    bodies = [
+        {"path": "a.md", "aliases": True},
+        {"path": "a.md", "drop_aliases": True},
+        {"path": "a.md", "entities": True, "aliases": True, "drop_aliases": True},
+        {"path": "a.md", "dry_run": True, "aliases": True},
+    ]
+    with TestClient(create_app(pipeline)) as client:  # type: ignore[arg-type]
+        statuses = [client.post("/ingest", json=body).status_code for body in bodies]
+
+    assert statuses == [422, 422, 422, 422]
+    assert pipeline.calls == []
+
+
+def test_ingest_alias_soft_failure_stays_200(tmp_path: Path) -> None:
+    target = tmp_path / "a.md"
+    target.write_text("孔子", encoding="utf-8")
+    report = ingest_path(target, root=tmp_path)
+    result = IngestWriteResult(
+        report=report,
+        collection="masskb_chunks",
+        vector_size=1536,
+        points_upserted=1,
+        graph_documents=1,
+        graph_chunks=1,
+        graph_skipped=False,
+        entities_skipped=False,
+        graph_persons=2,
+        graph_concepts=0,
+        graph_mentions=2,
+        aliases_skipped=False,
+        aliases_ok=False,
+        aliases_error="文档 d 的别名未写入：RuntimeError: down",
+        graph_aliases=0,
+        aliases_dropped=0,
+    )
+    pipeline = _Pipeline()
+    pipeline.ingest_result = result
+    with TestClient(create_app(pipeline)) as client:  # type: ignore[arg-type]
+        response = client.post(
+            "/ingest",
+            json={"path": str(target), "root": str(tmp_path), "entities": True, "aliases": True},
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["aliases_ok"] is False
+    assert body["graph_mentions"] == 2
+    assert "down" in body["aliases_error"]
+    assert pipeline.calls == ["ingest"]

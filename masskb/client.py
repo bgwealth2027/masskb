@@ -115,6 +115,7 @@ class GraphHopStatus:
     error: str | None
     found: int | None
     expanded: int | None
+    aliases: bool = False
 
 
 @dataclass(frozen=True)
@@ -210,6 +211,7 @@ class AskResult:
     rewrite: bool
     rerank: bool
     graph_hops: bool
+    aliases: bool = False
 
 
 @dataclass(frozen=True)
@@ -248,6 +250,8 @@ class IngestPreview:
     dry_run: bool
     entities: bool
     report: IngestReportView
+    aliases: bool = False
+    drop_aliases: bool = False
 
 
 @dataclass(frozen=True)
@@ -266,6 +270,11 @@ class IngestWrite:
     graph_concepts: int
     graph_mentions: int
     entities_dropped: int
+    aliases_skipped: bool = True
+    aliases_ok: bool = True
+    aliases_error: str | None = None
+    graph_aliases: int = 0
+    aliases_dropped: int = 0
 
 
 def _where(path: str) -> str:
@@ -369,6 +378,28 @@ def _optional_key_str(data: dict[str, object], key: str, path: str) -> str | Non
     return _expect_str(data[key], full)
 
 
+def _default_bool(data: dict[str, object], key: str, path: str, default: bool) -> bool:
+    """缺字段时用关闭态默认值，便于读取还没有这些字段的旧服务。"""
+    if key not in data:
+        return default
+    full = f"{path}.{key}" if path else key
+    return _expect_bool(data[key], full)
+
+
+def _default_int(data: dict[str, object], key: str, path: str, default: int) -> int:
+    if key not in data:
+        return default
+    full = f"{path}.{key}" if path else key
+    return _expect_int(data[key], full)
+
+
+def _default_optional_str(data: dict[str, object], key: str, path: str) -> str | None:
+    if key not in data or data[key] is None:
+        return None
+    full = f"{path}.{key}" if path else key
+    return _expect_str(data[key], full)
+
+
 def _optional_key_int(data: dict[str, object], key: str, path: str) -> int | None:
     if key not in data or data[key] is None:
         return None
@@ -431,6 +462,7 @@ def _parse_graph_hops(data: dict[str, object], path: str) -> GraphHopStatus:
         error=_optional_str(raw, "error", prefix),
         found=_optional_int(raw, "found", prefix),
         expanded=_optional_int(raw, "expanded", prefix),
+        aliases=_default_bool(raw, "aliases", prefix, False),
     )
 
 
@@ -566,6 +598,7 @@ def _parse_ask(value: object) -> AskResult:
         rewrite=_required_bool(raw, "rewrite", ""),
         rerank=_required_bool(raw, "rerank", ""),
         graph_hops=_required_bool(raw, "graph_hops", ""),
+        aliases=_default_bool(raw, "aliases", "", False),
     )
 
 
@@ -613,6 +646,8 @@ def _parse_ingest_preview(raw: dict[str, object]) -> IngestPreview:
         dry_run=True,
         entities=_required_bool(raw, "entities", ""),
         report=_parse_ingest_report(_require(raw, "report", ""), "report"),
+        aliases=_default_bool(raw, "aliases", "", False),
+        drop_aliases=_default_bool(raw, "drop_aliases", "", False),
     )
 
 
@@ -630,6 +665,11 @@ def _parse_ingest_write(raw: dict[str, object]) -> IngestWrite:
         graph_concepts=_required_int(raw, "graph_concepts", ""),
         graph_mentions=_required_int(raw, "graph_mentions", ""),
         entities_dropped=_required_int(raw, "entities_dropped", ""),
+        aliases_skipped=_default_bool(raw, "aliases_skipped", "", True),
+        aliases_ok=_default_bool(raw, "aliases_ok", "", True),
+        aliases_error=_default_optional_str(raw, "aliases_error", ""),
+        graph_aliases=_default_int(raw, "graph_aliases", "", 0),
+        aliases_dropped=_default_int(raw, "aliases_dropped", "", 0),
     )
 
 
@@ -747,6 +787,7 @@ class MassKB:
         rerank: bool = False,
         rewrite: bool = False,
         graph_hops: bool = False,
+        aliases: bool = False,
     ) -> SearchResult:
         """``POST /search``。字段与 CLI 相同。
 
@@ -761,6 +802,7 @@ class MassKB:
             "rerank": rerank,
             "rewrite": rewrite,
             "graph_hops": graph_hops,
+            "aliases": aliases,
         }
         response = self._send("POST", "/search", payload)
         body = _read_body(response)
@@ -777,6 +819,7 @@ class MassKB:
         rewrite: bool = False,
         rerank: bool = False,
         graph_hops: bool = False,
+        aliases: bool = False,
         max_steps: int = 3,
     ) -> AskResult:
         """``POST /ask``。不发送 ``answer``。``max_steps`` 默认 3。"""
@@ -788,6 +831,7 @@ class MassKB:
             "rewrite": rewrite,
             "rerank": rerank,
             "graph_hops": graph_hops,
+            "aliases": aliases,
             "max_steps": max_steps,
         }
         response = self._send("POST", "/ask", payload)
@@ -804,6 +848,8 @@ class MassKB:
         overlap: int = 100,
         dry_run: bool = False,
         entities: bool = False,
+        aliases: bool = False,
+        drop_aliases: bool = False,
     ) -> IngestPreview | IngestWrite:
         """``POST /ingest``。字段与 CLI 的写入参数相同，不含 ``preview``。
 
@@ -817,6 +863,8 @@ class MassKB:
             "overlap": overlap,
             "dry_run": dry_run,
             "entities": entities,
+            "aliases": aliases,
+            "drop_aliases": drop_aliases,
         }
         response = self._send("POST", "/ingest", payload)
         body = _read_body(response)

@@ -26,7 +26,7 @@ SYSTEM_PROMPT = (
     "只能依据观察里的分块回答。citations 里的 chunk_id 必须来自这些分块。\n"
     "不要补充观察之外的事实。回答使用问题所用的语言。\n"
     "检索参数已由调用方固定。不要在 JSON 里添加 top_k、doc_id、hybrid、rewrite、rerank、"
-    "answer、graph_hops。\n"
+    "answer、graph_hops、aliases。\n"
     "search 不会再生成回答。不要输出多个动作。"
 )
 
@@ -56,6 +56,7 @@ def build_agent_messages(
     rewrite: bool,
     rerank: bool,
     graph_hops: bool,
+    aliases: bool = False,
 ) -> tuple[str, str]:
     """系统提示词和用户消息。用户问题原样放入。"""
     lines = [
@@ -68,6 +69,7 @@ def build_agent_messages(
         f"rewrite：{_flag(rewrite)}",
         f"rerank：{_flag(rerank)}",
         f"graph_hops：{_flag(graph_hops)}",
+        f"aliases：{_flag(aliases)}",
         "",
         "已有观察：",
     ]

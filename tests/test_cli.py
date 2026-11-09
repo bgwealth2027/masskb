@@ -234,8 +234,12 @@ def test_ingest_without_dry_run_writes_and_closes(
             chunk_size: int = 800,
             overlap: int = 100,
             entities: bool = False,
+            aliases: bool = False,
+            drop_aliases: bool = False,
         ):
             assert entities is False
+            assert aliases is False
+            assert drop_aliases is False
             from masskb.ingest import ingest_path
 
             report = ingest_path(source, root=root, chunk_size=chunk_size, overlap=overlap)
@@ -386,6 +390,8 @@ def test_ingest_help(capsys: pytest.CaptureFixture[str]) -> None:
     out = capsys.readouterr().out
     assert "--dry-run" in out
     assert "--entities" in out
+    assert "--aliases" in out
+    assert "--drop-aliases" in out
     assert "chunk-size" in out
     assert "文档骨架" in out
 
@@ -409,6 +415,7 @@ def test_search_prints_json_and_closes(
             rerank: bool = False,
             rewrite: bool = False,
             graph_hops: bool = False,
+            aliases: bool = False,
         ) -> SearchResult:
             seen["query"] = query
             seen["top_k"] = top_k
@@ -418,6 +425,7 @@ def test_search_prints_json_and_closes(
             seen["rerank"] = rerank
             seen["rewrite"] = rewrite
             seen["graph_hops"] = graph_hops
+            seen["aliases"] = aliases
             return SearchResult(
                 query=query,
                 top_k=top_k,
@@ -513,6 +521,7 @@ def test_search_prints_json_and_closes(
             "error": None,
             "found": None,
             "expanded": None,
+            "aliases": False,
         },
     }
     assert seen == {
@@ -524,6 +533,7 @@ def test_search_prints_json_and_closes(
         "rerank": False,
         "rewrite": False,
         "graph_hops": False,
+        "aliases": False,
     }
     assert closed == ["closed"]
 
@@ -544,6 +554,7 @@ def test_search_empty_hits_exit_zero(
             rerank: bool = False,
             rewrite: bool = False,
             graph_hops: bool = False,
+            aliases: bool = False,
         ) -> SearchResult:
             return SearchResult(
                 query=query,
@@ -605,6 +616,7 @@ def test_search_help(capsys: pytest.CaptureFixture[str]) -> None:
     assert "--rerank" in out
     assert "--rewrite" in out
     assert "--graph-hops" in out
+    assert "--aliases" in out
     assert "--max-steps" not in out
     assert "chunk_id" in out
 
@@ -637,6 +649,7 @@ def test_search_graph_hops_flag_is_forwarded(
     assert main(["search", "质量", "--graph-hops"]) == 0
     assert seen["query"] == "质量"
     assert seen["graph_hops"] is True
+    assert seen["aliases"] is False
     assert seen["rerank"] is False
     assert capsys.readouterr().err == ""
 
@@ -879,10 +892,14 @@ def test_ingest_entities_prints_counts(
             chunk_size: int = 800,
             overlap: int = 100,
             entities: bool = False,
+            aliases: bool = False,
+            drop_aliases: bool = False,
         ):
             from masskb.ingest import ingest_path
 
             seen["entities"] = entities
+            seen["aliases"] = aliases
+            seen["drop_aliases"] = drop_aliases
             report = ingest_path(source, root=root, chunk_size=chunk_size, overlap=overlap)
             return IngestWriteResult(
                 report=report,
@@ -908,6 +925,8 @@ def test_ingest_entities_prints_counts(
 
     out = capsys.readouterr().out
     assert seen["entities"] is True
+    assert seen["aliases"] is False
+    assert seen["drop_aliases"] is False
     assert seen["closed"] is True
     assert "entities: on" in out
     assert "graph_persons: 1" in out
@@ -1129,6 +1148,7 @@ def test_ask_prints_json_and_closes(
             rewrite: bool = False,
             rerank: bool = False,
             graph_hops: bool = False,
+            aliases: bool = False,
             max_steps: int = 3,
         ) -> AskResult:
             seen["query"] = query
@@ -1138,6 +1158,7 @@ def test_ask_prints_json_and_closes(
             seen["rewrite"] = rewrite
             seen["rerank"] = rerank
             seen["graph_hops"] = graph_hops
+            seen["aliases"] = aliases
             seen["max_steps"] = max_steps
             return expected
 
@@ -1164,6 +1185,7 @@ def test_ask_prints_json_and_closes(
         "rewrite": False,
         "rerank": False,
         "graph_hops": False,
+        "aliases": False,
         "max_steps": 3,
     }
     assert closed == ["closed"]
@@ -1213,6 +1235,7 @@ def test_ask_forwards_flags(
         "rewrite": True,
         "rerank": True,
         "graph_hops": True,
+        "aliases": False,
         "max_steps": 2,
     }
     assert capsys.readouterr().err == ""
@@ -1310,6 +1333,7 @@ def test_ask_help_and_rejected_flags(capsys: pytest.CaptureFixture[str]) -> None
     assert "--rewrite" in out
     assert "--rerank" in out
     assert "--graph-hops" in out
+    assert "--aliases" in out
     assert "--max-steps" in out
     assert "--answer" not in out
 
@@ -1320,3 +1344,69 @@ def test_ask_help_and_rejected_flags(capsys: pytest.CaptureFixture[str]) -> None
     with pytest.raises(SystemExit) as answer:
         main(["ask", "质量", "--answer"])
     assert answer.value.code == 2
+
+
+def test_ingest_alias_flags_fail_before_pipeline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    path = tmp_path / "a.txt"
+    path.write_text("孔子\n", encoding="utf-8")
+
+    class FakePipeline:
+        def __init__(self) -> None:
+            raise AssertionError("不应构造管线")
+
+    monkeypatch.setattr("masskb.__main__.RetrievalPipeline", FakePipeline)
+
+    assert main(["ingest", str(path), "--aliases"]) == 1
+    assert "entities" in capsys.readouterr().err
+    assert main(["ingest", str(path), "--dry-run", "--drop-aliases"]) == 1
+    assert "entities" in capsys.readouterr().err
+    assert main(["ingest", str(path), "--entities", "--aliases", "--drop-aliases"]) == 1
+    assert "同时" in capsys.readouterr().err
+
+
+def test_ingest_alias_soft_failure_exits_zero(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    path = tmp_path / "a.txt"
+    path.write_text("孔子\n", encoding="utf-8")
+
+    class FakePipeline:
+        def ingest(self, *_args, **_kwargs):
+            from masskb.ingest import ingest_path
+
+            report = ingest_path(_args[0] if _args else path)
+            return IngestWriteResult(
+                report=report,
+                collection="masskb_chunks",
+                vector_size=1536,
+                points_upserted=1,
+                graph_documents=1,
+                graph_chunks=1,
+                graph_skipped=False,
+                entities_skipped=False,
+                graph_persons=1,
+                graph_concepts=0,
+                graph_mentions=1,
+                aliases_skipped=False,
+                aliases_ok=False,
+                aliases_error="文档 d 的别名未写入：RuntimeError: down",
+            )
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr("masskb.__main__.RetrievalPipeline", FakePipeline)
+
+    assert main(["ingest", str(path), "--entities", "--aliases"]) == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert "aliases: on" in captured.out
+    assert "graph_aliases: 0" in captured.out
+    assert "别名未写入" in captured.out
+    assert "entities: on" in captured.out
